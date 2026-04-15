@@ -13,6 +13,7 @@ CATALOG = os.getenv("CATALOG", "genie_training")
 SCHEMA = os.getenv("SCHEMA", "genie_discovery")
 TABLE = f"{CATALOG}.{SCHEMA}.discovery"
 WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "ad1dd0025031919f")
+COE_GROUP = os.getenv("COE_GROUP_NAME", "genie-coe-reviewers")
 
 w = WorkspaceClient()
 
@@ -20,11 +21,22 @@ w = WorkspaceClient()
 SESSION_COLS = {
     1: ["business_context", "pain_points", "existing_reports"],
     2: ["question_bank", "vocabulary_metrics"],
-    3: ["term_classifications", "sql_expressions", "text_instructions", "data_gaps", "scope_boundaries"],
-    4: ["prototype_results", "fixes_log", "benchmarks", "phrasing_notes"],
+    3: ["term_classifications", "sql_expressions", "text_instructions",
+        "data_gaps", "scope_boundaries", "metric_view_yaml"],
+    4: ["analyst_commentary", "auto_summary", "data_plan",
+        "coe_approval_status", "coe_approval_notes", "coe_reviewer_email"],
+    5: ["genie_space_id", "genie_space_config"],
+    6: ["prototype_results", "fixes_log", "benchmarks", "phrasing_notes"],
 }
 
-# All JSON section columns
+# Columns that store plain strings (not JSON arrays)
+SCALAR_COLS = {
+    "metric_view_yaml", "analyst_commentary", "auto_summary",
+    "coe_approval_status", "coe_approval_notes", "coe_reviewer_email",
+    "genie_space_id", "genie_space_config",
+}
+
+# All section columns
 ALL_SECTION_COLS = sorted(set(col for cols in SESSION_COLS.values() for col in cols))
 
 
@@ -91,19 +103,22 @@ def parse_row(row):
     eng = {}
     for k, v in row.items():
         if k in ALL_SECTION_COLS:
-            try:
-                eng[k] = json.loads(v) if v else []
-            except (json.JSONDecodeError, TypeError):
-                eng[k] = []
+            if k in SCALAR_COLS:
+                eng[k] = v or ""
+            else:
+                try:
+                    eng[k] = json.loads(v) if v else []
+                except (json.JSONDecodeError, TypeError):
+                    eng[k] = []
         else:
             eng[k] = v
 
-    eng["sessions"] = {
-        "1": {c: eng.get(c, []) for c in SESSION_COLS[1]},
-        "2": {c: eng.get(c, []) for c in SESSION_COLS[2]},
-        "3": {c: eng.get(c, []) for c in SESSION_COLS[3]},
-        "4": {c: eng.get(c, []) for c in SESSION_COLS[4]},
-    }
+    eng["sessions"] = {}
+    for snum, cols in SESSION_COLS.items():
+        session = {}
+        for c in cols:
+            session[c] = eng.get(c, "" if c in SCALAR_COLS else [])
+        eng["sessions"][str(snum)] = session
     return eng
 
 
@@ -112,7 +127,7 @@ def parse_row(row):
 # ---------------------------------------------------------------------------
 
 def ensure_columns():
-    """Add any missing JSON columns to the discovery table."""
+    """Add any missing columns to the discovery table."""
     try:
         rows = sql_exec(f"DESCRIBE TABLE {TABLE}")
         existing = {r.get("col_name", "") for r in rows}
@@ -134,6 +149,21 @@ def api_user():
     return jsonify({"email": get_current_user()})
 
 
+@app.route("/api/user/coe-member")
+def api_user_coe_member():
+    """Check if current user is a member of the COE reviewer group."""
+    email = get_current_user()
+    try:
+        groups = list(w.groups.list(filter=f'displayName eq "{COE_GROUP}"'))
+        if groups and groups[0].members:
+            for m in groups[0].members:
+                if m.display and m.display.lower() == email.lower():
+                    return jsonify({"is_member": True})
+        return jsonify({"is_member": False})
+    except Exception:
+        return jsonify({"is_member": False})
+
+
 # ---------------------------------------------------------------------------
 # API: Engagements CRUD
 # ---------------------------------------------------------------------------
@@ -148,30 +178,66 @@ def list_engagements():
     return jsonify(rows)
 
 
+@app.route("/api/engagements/check-name")
+def check_engagement_name():
+    """Check if an engagement name is already taken."""
+    name = request.args.get("name", "").strip()
+    if not name:
+        return jsonify({"available": False})
+    rows = sql_exec(
+        f"SELECT COUNT(*) AS cnt FROM {TABLE} WHERE genie_space_name = :name",
+        {"name": name},
+    )
+    count = int(rows[0]["cnt"]) if rows else 0
+    return jsonify({"available": count == 0})
+
+
 @app.route("/api/engagements", methods=["POST"])
 def create_engagement():
     data = request.json
+    # Validate required fields
+    missing = []
+    for field in ["genie_space_name", "business_owner_name", "business_owner_email", "analyst_name"]:
+        if not data.get(field, "").strip():
+            missing.append(field)
+    if missing:
+        return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
+
+    # Check uniqueness
+    name = data["genie_space_name"].strip()
+    existing = sql_exec(
+        f"SELECT COUNT(*) AS cnt FROM {TABLE} WHERE genie_space_name = :name",
+        {"name": name},
+    )
+    if existing and int(existing[0]["cnt"]) > 0:
+        return jsonify({"error": "An engagement with this name already exists"}), 409
+
     eid = str(uuid.uuid4())
     ts = now_ts()
-    empty = "[]"
     section_cols_sql = ", ".join(ALL_SECTION_COLS)
-    section_vals_sql = ", ".join([":empty"] * len(ALL_SECTION_COLS))
+    section_defaults = []
+    section_params = {}
+    for col in ALL_SECTION_COLS:
+        param_name = f"default_{col}"
+        section_defaults.append(f":{param_name}")
+        section_params[param_name] = "" if col in SCALAR_COLS else "[]"
+
     sql_run(
         f"INSERT INTO {TABLE} "
         f"(engagement_id, genie_space_name, business_owner_name, business_owner_email, "
         f"analyst_name, analyst_email, current_session, status, created_at, updated_at, "
         f"{section_cols_sql}) "
         f"VALUES (:eid, :space_name, :bo_name, :bo_email, :a_name, :a_email, "
-        f"1, 'draft', :ts, :ts, {section_vals_sql})",
+        f"1, 'draft', :ts, :ts, {', '.join(section_defaults)})",
         {
             "eid": eid,
-            "space_name": data.get("genie_space_name", ""),
-            "bo_name": data.get("business_owner_name", ""),
-            "bo_email": data.get("business_owner_email", ""),
-            "a_name": data.get("analyst_name", ""),
-            "a_email": data.get("analyst_email", ""),
+            "space_name": name,
+            "bo_name": data.get("business_owner_name", "").strip(),
+            "bo_email": data.get("business_owner_email", "").strip(),
+            "a_name": data.get("analyst_name", "").strip(),
+            "a_email": data.get("analyst_email", "").strip(),
             "ts": ts,
-            "empty": empty,
+            **section_params,
         },
     )
     return jsonify({"engagement_id": eid}), 201
@@ -229,13 +295,16 @@ def save_session(eid, session_num, data):
 
     for col in cols:
         set_parts.append(f"{col} = :{col}")
-        params[col] = json.dumps(data.get(col, []))
+        if col in SCALAR_COLS:
+            params[col] = data.get(col, "")
+        else:
+            params[col] = json.dumps(data.get(col, []))
 
-    if session_num < 4:
+    if session_num < 6:
         set_parts.append(f"current_session = GREATEST(current_session, {session_num + 1})")
         set_parts.append("status = 'in_progress'")
     else:
-        set_parts.append("current_session = 4")
+        set_parts.append("current_session = 6")
         set_parts.append("status = 'complete'")
 
     set_parts.append("updated_at = :ts")
@@ -266,6 +335,116 @@ def save_session_3(eid):
 def save_session_4(eid):
     save_session(eid, 4, request.json)
     return jsonify({"success": True})
+
+
+@app.route("/api/engagements/<eid>/sessions/5", methods=["PUT"])
+def save_session_5(eid):
+    save_session(eid, 5, request.json)
+    return jsonify({"success": True})
+
+
+@app.route("/api/engagements/<eid>/sessions/6", methods=["PUT"])
+def save_session_6(eid):
+    save_session(eid, 6, request.json)
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# API: COE Approval
+# ---------------------------------------------------------------------------
+
+@app.route("/api/engagements/<eid>/coe-approve", methods=["PUT"])
+def coe_approve(eid):
+    """Set COE approval status. Only COE group members should call this."""
+    data = request.json
+    status = data.get("status", "")
+    notes = data.get("notes", "")
+    reviewer = get_current_user()
+    ts = now_ts()
+    sql_run(
+        f"UPDATE {TABLE} SET "
+        f"coe_approval_status = :status, coe_approval_notes = :notes, "
+        f"coe_reviewer_email = :reviewer, updated_at = :ts "
+        f"WHERE engagement_id = :eid",
+        {"eid": eid, "status": status, "notes": notes, "reviewer": reviewer, "ts": ts},
+    )
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# API: Auto-summary (structured, no LLM)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/engagements/<eid>/auto-summary")
+def auto_summary(eid):
+    """Generate a structured summary of sessions 1-3."""
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        return jsonify({"summary": ""}), 404
+    eng = parse_row(rows[0])
+    s1 = eng["sessions"]["1"]
+    s2 = eng["sessions"]["2"]
+    s3 = eng["sessions"]["3"]
+
+    parts = []
+    parts.append(f"## Engagement: {eng.get('genie_space_name', 'Untitled')}")
+    parts.append(f"**Business Owner:** {eng.get('business_owner_name', '')} ({eng.get('business_owner_email', '')})")
+    parts.append(f"**Analyst:** {eng.get('analyst_name', '')} ({eng.get('analyst_email', '')})")
+    parts.append("")
+
+    # Session 1
+    pain_points = s1.get("pain_points", [])
+    reports = s1.get("existing_reports", [])
+    parts.append("### Session 1: Business Context")
+    if pain_points:
+        parts.append(f"**Pain Points:** {len(pain_points)}")
+        for pp in pain_points:
+            parts.append(f"- {pp.get('description', '')}")
+    if reports:
+        parts.append(f"**Existing Reports:** {len(reports)}")
+        for r in reports:
+            parts.append(f"- {r.get('report_name', '')}: {r.get('what_it_shows', '')}")
+    parts.append("")
+
+    # Session 2
+    questions = s2.get("question_bank", [])
+    vocab = s2.get("vocabulary_metrics", [])
+    parts.append("### Session 2: Questions & Vocabulary")
+    parts.append(f"**Questions Captured:** {len(questions)}")
+    parts.append(f"**Vocabulary Terms:** {len(vocab)}")
+    if vocab:
+        terms_list = ", ".join(v.get("business_term", "") for v in vocab[:10])
+        parts.append(f"**Terms:** {terms_list}")
+    parts.append("")
+
+    # Session 3
+    classifications = s3.get("term_classifications", [])
+    sql_exprs = s3.get("sql_expressions", [])
+    text_instrs = s3.get("text_instructions", [])
+    data_gaps = s3.get("data_gaps", [])
+    scope = s3.get("scope_boundaries", [])
+    parts.append("### Session 3: Technical Design")
+    parts.append(f"**Classified Terms:** {len(classifications)}")
+    parts.append(f"**SQL Expressions (Metrics):** {len(sql_exprs)}")
+    if sql_exprs:
+        for e in sql_exprs:
+            parts.append(f"- {e.get('metric_name', '')}: `{e.get('uc_table', '')}`")
+    parts.append(f"**Text Instructions:** {len(text_instrs)}")
+    parts.append(f"**Data Gaps:** {len(data_gaps)}")
+    parts.append(f"**Scope Boundaries:** {len(scope)}")
+
+    # Tables identified
+    tables = set()
+    for e in sql_exprs:
+        t = e.get("uc_table", "")
+        if t and len(t.split(".")) == 3:
+            tables.add(t)
+    if tables:
+        parts.append(f"\n**Tables Identified ({len(tables)}):**")
+        for t in sorted(tables):
+            parts.append(f"- `{t}`")
+
+    return jsonify({"summary": "\n".join(parts)})
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +488,6 @@ def uc_columns():
         rows = sql_exec(f"DESCRIBE TABLE `{catalog}`.`{schema}`.`{table}`")
         if not rows:
             return jsonify([])
-        # Detect key names dynamically -- different environments return different keys
         first = rows[0]
         name_key = next((k for k in ("col_name", "column_name", "name") if k in first), "col_name")
         type_key = next((k for k in ("data_type", "type", "Type") if k in first), "data_type")

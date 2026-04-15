@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Box, Typography, Button, Card, CardContent, CardActions, Grid2 as Grid,
@@ -11,7 +11,10 @@ import VisibilityIcon from "@mui/icons-material/Visibility";
 import EditIcon from "@mui/icons-material/Edit";
 import { api } from "../api";
 
-const SESSION_LABELS = ["Business Context", "Questions & Metrics", "Data Mapping", "Prototype Review"];
+const SESSION_LABELS = [
+  "Business Context", "Questions & Vocabulary", "Technical Design",
+  "COE Review", "Configure Space", "Prototype Review",
+];
 
 const STATUS_COLORS: Record<string, "default" | "warning" | "success"> = {
   draft: "default",
@@ -26,6 +29,10 @@ export default function Home() {
   const [userEmail, setUserEmail] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState("");
+  const [nameAvailable, setNameAvailable] = useState<boolean | null>(null);
+  const [checkingName, setCheckingName] = useState(false);
+  const nameCheckTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [form, setForm] = useState({
     genie_space_name: "",
     business_owner_name: "",
@@ -49,12 +56,34 @@ export default function Home() {
 
   useEffect(() => { load(); }, []);
 
+  // Debounced name uniqueness check
+  const checkName = (name: string) => {
+    if (nameCheckTimer.current) clearTimeout(nameCheckTimer.current);
+    if (!name.trim()) {
+      setNameAvailable(null);
+      return;
+    }
+    setCheckingName(true);
+    nameCheckTimer.current = setTimeout(async () => {
+      try {
+        const res = await api.checkNameAvailable(name.trim());
+        setNameAvailable(res.available);
+      } catch {
+        setNameAvailable(null);
+      }
+      setCheckingName(false);
+    }, 500);
+  };
+
   const handleCreate = async () => {
     setCreating(true);
+    setCreateError("");
     try {
       const res = await api.createEngagement(form);
       setDialogOpen(false);
       nav(`/engagement/${res.engagement_id}`);
+    } catch (err: any) {
+      setCreateError(err.message || "Failed to create engagement");
     } finally {
       setCreating(false);
     }
@@ -66,6 +95,13 @@ export default function Home() {
     load();
   };
 
+  const isFormValid =
+    form.genie_space_name.trim() &&
+    form.business_owner_name.trim() &&
+    form.business_owner_email.trim() &&
+    form.analyst_name.trim() &&
+    nameAvailable !== false;
+
   return (
     <Box sx={{ maxWidth: 1100, mx: "auto", p: 4 }}>
       <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 4 }}>
@@ -75,7 +111,11 @@ export default function Home() {
             Manage discovery engagements for new Genie Spaces
           </Typography>
         </Box>
-        <Button variant="contained" startIcon={<AddIcon />} onClick={() => setDialogOpen(true)}>
+        <Button variant="contained" startIcon={<AddIcon />} onClick={() => {
+          setDialogOpen(true);
+          setCreateError("");
+          setNameAvailable(null);
+        }}>
           New Engagement
         </Button>
       </Box>
@@ -108,7 +148,7 @@ export default function Home() {
                       color={STATUS_COLORS[e.status] || "default"}
                     />
                     <Chip
-                      label={`Session ${e.current_session || 1}: ${SESSION_LABELS[Number(e.current_session || 1) - 1]}`}
+                      label={`Session ${e.current_session || 1}: ${SESSION_LABELS[Number(e.current_session || 1) - 1] || ""}`}
                       size="small"
                       variant="outlined"
                     />
@@ -136,29 +176,44 @@ export default function Home() {
       <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>New Discovery Engagement</DialogTitle>
         <DialogContent sx={{ display: "flex", flexDirection: "column", gap: 2, pt: "16px !important" }}>
+          {createError && <Alert severity="error">{createError}</Alert>}
           <TextField
             label="Genie Space Name"
             value={form.genie_space_name}
-            onChange={(e) => setForm({ ...form, genie_space_name: e.target.value })}
-            fullWidth required
+            onChange={(e) => {
+              setForm({ ...form, genie_space_name: e.target.value });
+              checkName(e.target.value);
+            }}
+            fullWidth
+            required
+            error={nameAvailable === false}
+            helperText={
+              checkingName ? "Checking availability..." :
+              nameAvailable === false ? "This name is already taken" :
+              nameAvailable === true ? "Name is available" : ""
+            }
+            color={nameAvailable === true ? "success" : undefined}
           />
           <TextField
             label="Business Owner Name"
             value={form.business_owner_name}
             onChange={(e) => setForm({ ...form, business_owner_name: e.target.value })}
             fullWidth
+            required
           />
           <TextField
             label="Business Owner Email"
             value={form.business_owner_email}
             onChange={(e) => setForm({ ...form, business_owner_email: e.target.value })}
             fullWidth
+            required
           />
           <TextField
             label="Analyst Name"
             value={form.analyst_name}
             onChange={(e) => setForm({ ...form, analyst_name: e.target.value })}
             fullWidth
+            required
           />
           <TextField
             label="Analyst Email"
@@ -169,7 +224,7 @@ export default function Home() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
-          <Button variant="contained" onClick={handleCreate} disabled={!form.genie_space_name || creating}>
+          <Button variant="contained" onClick={handleCreate} disabled={!isFormValid || creating}>
             {creating ? "Creating..." : "Create"}
           </Button>
         </DialogActions>

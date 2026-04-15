@@ -2,7 +2,7 @@ import { useEffect, useState, useMemo } from "react";
 import {
   Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert, Chip,
   Paper, Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
-  Select, MenuItem, Checkbox, ListItemText, LinearProgress,
+  Select, MenuItem, Checkbox, ListItemText, LinearProgress, TextField,
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import TableChartIcon from "@mui/icons-material/TableChart";
@@ -36,11 +36,11 @@ const SCOPE_COLS: ColumnDef[] = [
   { key: "notes", label: "Notes / Redirect" },
 ];
 
-const TERM_TYPES = ["Metric", "Filter", "Date Logic"];
+const TERM_TYPES = ["Metric", "Synonym", "Filter", "Date Logic"];
 
 interface Props {
   data: Record<string, any>;
-  onChange: (section: string, rows: any[]) => void;
+  onChange: (section: string, value: any) => void;
   readOnly?: boolean;
   session1Data?: Record<string, any>;
   session2Data?: Record<string, any>;
@@ -127,6 +127,9 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
     let exprsChanged = false;
     let instrsChanged = false;
 
+    // Types that create text instructions
+    const INSTR_TYPES = ["Filter", "Date Logic", "Synonym"];
+
     // Add rows for newly selected types
     for (const type of addedTypes) {
       if (type === "Metric" && !exprs.some((e: any) => e.metric_name === termName)) {
@@ -136,10 +139,14 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
         });
         exprsChanged = true;
       } else if (
-        (type === "Filter" || type === "Date Logic") &&
+        INSTR_TYPES.includes(type) &&
         !instrs.some((i: any) => i.title === termName)
       ) {
-        instrs.push({ title: termName, instruction: "" });
+        const synonymList = vocab?.synonyms || "";
+        const prefill = type === "Synonym" && synonymList
+          ? `When users say "${synonymList.split(",").map((s: string) => s.trim()).join('" or "')}", they mean "${termName}".`
+          : "";
+        instrs.push({ title: termName, instruction: prefill });
         instrsChanged = true;
       }
     }
@@ -150,10 +157,10 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
         const before = exprs.length;
         exprs = exprs.filter((e: any) => e.metric_name !== termName);
         if (exprs.length !== before) exprsChanged = true;
-      } else if (type === "Filter" || type === "Date Logic") {
-        // Only remove if neither Filter nor Date Logic is still selected
-        const stillHasFilterOrDateLogic = newTypes.includes("Filter") || newTypes.includes("Date Logic");
-        if (!stillHasFilterOrDateLogic) {
+      } else if (INSTR_TYPES.includes(type)) {
+        // Only remove if no instruction-producing type is still selected
+        const stillHasInstrType = newTypes.some((t) => INSTR_TYPES.includes(t));
+        if (!stillHasInstrType) {
           const before = instrs.length;
           instrs = instrs.filter((i: any) => i.title !== termName);
           if (instrs.length !== before) instrsChanged = true;
@@ -270,6 +277,7 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
               Here are the business terms from Session 2. Classify each one (a term can have multiple types).
               Selecting a type auto-populates it into the matching section below.
               <strong> Metric</strong> = SQL expression.{" "}
+              <strong>Synonym</strong> = text instruction (entity matching).{" "}
               <strong>Filter / Date Logic</strong> = text instruction.
             </Typography>
 
@@ -516,6 +524,81 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
           />
         </AccordionDetails>
       </Accordion>
+
+      {/* ---- Metric View YAML Recommendation ---- */}
+      {(data.sql_expressions || []).length > 0 && (
+        <Accordion defaultExpanded>
+          <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+            <Typography variant="h6">Recommended Metric View</Typography>
+          </AccordionSummary>
+          <AccordionDetails>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              Based on your SQL expressions, here is a suggested metric view YAML definition.
+              You can edit this and use it to create a metric view in your workspace.
+              This will carry forward to the COE Review in Session 4.
+            </Typography>
+            {!readOnly && !data.metric_view_yaml && (
+              <Alert severity="info" sx={{ mb: 2 }}>
+                Click "Generate YAML" to create a recommendation based on your SQL expressions,
+                or write your own below.
+              </Alert>
+            )}
+            <TextField
+              multiline
+              minRows={10}
+              fullWidth
+              placeholder={generateMetricViewYaml(data.sql_expressions || [], selectedTables)}
+              value={data.metric_view_yaml || ""}
+              onChange={(e) => onChange("metric_view_yaml", e.target.value)}
+              disabled={readOnly}
+              sx={{ fontFamily: "monospace", fontSize: 13, "& .MuiInputBase-input": { fontFamily: "monospace" } }}
+            />
+            {!readOnly && (
+              <Box sx={{ mt: 1 }}>
+                <button
+                  onClick={() => onChange("metric_view_yaml", generateMetricViewYaml(data.sql_expressions || [], selectedTables))}
+                  style={{ cursor: "pointer", padding: "6px 16px", borderRadius: 4, border: "1px solid #ccc", background: "#fff" }}
+                >
+                  Generate YAML
+                </button>
+              </Box>
+            )}
+          </AccordionDetails>
+        </Accordion>
+      )}
     </Box>
   );
+}
+
+function cleanYamlStr(s: string): string {
+  return (s || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function generateMetricViewYaml(sqlExprs: any[], tables: string[]): string {
+  if (sqlExprs.length === 0) return "";
+  const lines: string[] = [];
+  lines.push("# Recommended Metric View Definition");
+  lines.push("# Edit this YAML then create the metric view in your workspace");
+  lines.push("");
+  lines.push("name: <your_metric_view_name>");
+  lines.push("catalog: <catalog>");
+  lines.push("schema: <schema>");
+  lines.push("");
+  lines.push("# Source tables");
+  lines.push("tables:");
+  for (const t of tables) {
+    lines.push(`  - ${t}`);
+  }
+  lines.push("");
+  lines.push("# Measures (from your SQL expressions)");
+  lines.push("measures:");
+  for (const e of sqlExprs) {
+    lines.push(`  - name: ${cleanYamlStr(e.metric_name) || "unnamed"}`);
+    if (e.sql_code) lines.push(`    expression: "${cleanYamlStr(e.sql_code)}"`);
+    if (e.uc_table) lines.push(`    source_table: ${e.uc_table}`);
+    if (e.synonyms) lines.push(`    synonyms: [${cleanYamlStr(e.synonyms)}]`);
+    if (e.instructions) lines.push(`    description: "${cleanYamlStr(e.instructions)}"`);
+    lines.push("");
+  }
+  return lines.join("\n");
 }

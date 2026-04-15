@@ -21,6 +21,8 @@ export interface SessionData {
   "2": Session2Data;
   "3": Session3Data;
   "4": Session4Data;
+  "5": Session5Data;
+  "6": Session6Data;
 }
 
 /* Session 1: Business Context Discovery */
@@ -103,9 +105,33 @@ export interface Session3Data {
   text_instructions: TextInstruction[];
   data_gaps: DataGap[];
   scope_boundaries: ScopeBoundary[];
+  metric_view_yaml: string;
 }
 
-/* Session 4: Prototype Review */
+/* Session 4: COE Review */
+export interface DataPlanEntry {
+  table_or_view: string;
+  type: string;
+  include_in_space: string;
+  notes: string;
+}
+
+export interface Session4Data {
+  analyst_commentary: string;
+  auto_summary: string;
+  data_plan: DataPlanEntry[];
+  coe_approval_status: string;
+  coe_approval_notes: string;
+  coe_reviewer_email: string;
+}
+
+/* Session 5: Configure Genie Space */
+export interface Session5Data {
+  genie_space_id: string;
+  genie_space_config: string;
+}
+
+/* Session 6: Prototype Review */
 export interface PrototypeResult {
   question_asked: string;
   result: string;
@@ -135,7 +161,7 @@ export interface PhrasingNote {
   rephrased_to: string;
 }
 
-export interface Session4Data {
+export interface Session6Data {
   prototype_results: PrototypeResult[];
   fixes_log: FixEntry[];
   benchmarks: Benchmark[];

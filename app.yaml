@@ -8,3 +8,5 @@ env:
     value: "genie_training"
   - name: SCHEMA
     value: "genie_discovery"
+  - name: COE_GROUP_NAME
+    value: "genie-coe-reviewers"

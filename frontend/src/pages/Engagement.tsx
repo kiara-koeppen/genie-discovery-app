@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Box, Typography, Tabs, Tab, Button, CircularProgress, Alert, Snackbar,
-  Chip, IconButton, Paper,
+  Chip, IconButton, Paper, Tooltip,
 } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import LockIcon from "@mui/icons-material/Lock";
@@ -11,12 +11,16 @@ import Session1Form from "../sessions/Session1Form";
 import Session2Form from "../sessions/Session2Form";
 import Session3Form from "../sessions/Session3Form";
 import Session4Form from "../sessions/Session4Form";
+import Session5Form from "../sessions/Session5Form";
+import Session6Form from "../sessions/Session6Form";
 
 const SESSION_LABELS = [
   "1: Business Context",
   "2: Questions & Vocabulary",
   "3: Technical Design",
-  "4: Prototype Review",
+  "4: COE Review",
+  "5: Configure Space",
+  "6: Prototype Review",
 ];
 
 interface Props {
@@ -32,19 +36,26 @@ export default function Engagement({ readOnly = false }: Props) {
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState("");
   const [sessionDrafts, setSessionDrafts] = useState<Record<number, any>>({});
+  const [isCoeMember, setIsCoeMember] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) return;
     setLoading(true);
     try {
-      const eng: any = await api.getEngagement(id);
+      const [eng, coe] = await Promise.all([
+        api.getEngagement(id) as Promise<any>,
+        api.checkCoeMembership(),
+      ]);
       setData(eng);
+      setIsCoeMember(coe.is_member);
       const s = eng.sessions || {};
       setSessionDrafts({
         1: s["1"] || {},
         2: s["2"] || {},
         3: s["3"] || {},
         4: s["4"] || {},
+        5: s["5"] || {},
+        6: s["6"] || {},
       });
     } catch {
       setData(null);
@@ -67,10 +78,10 @@ export default function Engagement({ readOnly = false }: Props) {
     setSaving(false);
   };
 
-  const updateDraft = (sessionNum: number, section: string, rows: any[]) => {
+  const updateDraft = (sessionNum: number, section: string, value: any) => {
     setSessionDrafts((prev) => ({
       ...prev,
-      [sessionNum]: { ...prev[sessionNum], [section]: rows },
+      [sessionNum]: { ...prev[sessionNum], [section]: value },
     }));
   };
 
@@ -92,9 +103,13 @@ export default function Engagement({ readOnly = false }: Props) {
 
   const sessionProps = (num: number) => ({
     data: sessionDrafts[num] || {},
-    onChange: (section: string, rows: any[]) => updateDraft(num, section, rows),
+    onChange: (section: string, value: any) => updateDraft(num, section, value),
     readOnly,
   });
+
+  // COE approval gating
+  const coeApprovalStatus = sessionDrafts[4]?.coe_approval_status || "";
+  const isApproved = coeApprovalStatus === "approved";
 
   return (
     <Box sx={{ maxWidth: 1200, mx: "auto", p: 3 }}>
@@ -123,9 +138,25 @@ export default function Engagement({ readOnly = false }: Props) {
       {/* Session Tabs */}
       <Paper sx={{ mb: 2 }}>
         <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="fullWidth">
-          {SESSION_LABELS.map((label, i) => (
-            <Tab key={i} label={label} />
-          ))}
+          {SESSION_LABELS.map((label, i) => {
+            const locked = (i === 4 || i === 5) && !isApproved;
+            return (
+              <Tab
+                key={i}
+                label={
+                  locked ? (
+                    <Tooltip title="Requires COE approval">
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, opacity: 0.5 }}>
+                        <LockIcon sx={{ fontSize: 14 }} />
+                        {label}
+                      </Box>
+                    </Tooltip>
+                  ) : label
+                }
+                disabled={locked}
+              />
+            );
+          })}
         </Tabs>
       </Paper>
 
@@ -140,7 +171,25 @@ export default function Engagement({ readOnly = false }: Props) {
             session2Data={sessionDrafts[2]}
           />
         )}
-        {tab === 3 && <Session4Form {...sessionProps(4)} />}
+        {tab === 3 && (
+          <Session4Form
+            {...sessionProps(4)}
+            session1Data={sessionDrafts[1]}
+            session2Data={sessionDrafts[2]}
+            session3Data={sessionDrafts[3]}
+            engagementId={id}
+            isCoeMember={isCoeMember}
+          />
+        )}
+        {tab === 4 && (
+          <Session5Form
+            {...sessionProps(5)}
+            session3Data={sessionDrafts[3]}
+            session4Data={sessionDrafts[4]}
+            engagementId={id}
+          />
+        )}
+        {tab === 5 && <Session6Form {...sessionProps(6)} />}
       </Box>
 
       {/* Save Button */}

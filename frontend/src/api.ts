@@ -5,14 +5,22 @@ async function json<T>(url: string, opts?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json" },
     ...opts,
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `${res.status} ${res.statusText}`);
+  }
   return res.json();
 }
 
 export const api = {
   getUser: () => json<{ email: string }>("/user"),
 
+  checkCoeMembership: () => json<{ is_member: boolean }>("/user/coe-member"),
+
   listEngagements: () => json<Record<string, string>[]>("/engagements"),
+
+  checkNameAvailable: (name: string) =>
+    json<{ available: boolean }>(`/engagements/check-name?name=${encodeURIComponent(name)}`),
 
   createEngagement: (data: Record<string, string>) =>
     json<{ engagement_id: string }>("/engagements", {
@@ -32,9 +40,18 @@ export const api = {
   deleteEngagement: (id: string) =>
     json<{ success: boolean }>(`/engagements/${id}`, { method: "DELETE" }),
 
-  saveSession: (id: string, sessionNum: number, data: Record<string, unknown[]>) =>
+  saveSession: (id: string, sessionNum: number, data: Record<string, unknown>) =>
     json<{ success: boolean }>(`/engagements/${id}/sessions/${sessionNum}`, {
       method: "PUT",
       body: JSON.stringify(data),
     }),
+
+  coeApprove: (id: string, data: { status: string; notes: string }) =>
+    json<{ success: boolean }>(`/engagements/${id}/coe-approve`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+
+  getAutoSummary: (id: string) =>
+    json<{ summary: string }>(`/engagements/${id}/auto-summary`),
 };
