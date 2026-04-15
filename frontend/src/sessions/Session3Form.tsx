@@ -525,29 +525,30 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
         </AccordionDetails>
       </Accordion>
 
-      {/* ---- Metric View YAML Recommendation ---- */}
+      {/* ---- Metric View Reference (Optional) ---- */}
       {(data.sql_expressions || []).length > 0 && (
         <Accordion defaultExpanded>
           <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-            <Typography variant="h6">Recommended Metric View</Typography>
+            <Typography variant="h6">Metric View Reference (Optional)</Typography>
           </AccordionSummary>
           <AccordionDetails>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-              Based on your SQL expressions, here is a suggested metric view YAML definition.
-              You can edit this and use it to create a metric view in your workspace.
+              Your SQL expressions can be added to the Genie Space directly as sample queries.
+              If you prefer to create a metric view instead, generate the YAML below.
+              Edit as needed, then create the metric view in your workspace.
               This will carry forward to the COE Review in Session 4.
             </Typography>
             {!readOnly && !data.metric_view_yaml && (
               <Alert severity="info" sx={{ mb: 2 }}>
-                Click "Generate YAML" to create a recommendation based on your SQL expressions,
-                or write your own below.
+                Click "Generate YAML" to create a metric view definition based on your SQL expressions,
+                or write your own below. This is optional -- not every space needs a metric view.
               </Alert>
             )}
             <TextField
               multiline
               minRows={10}
               fullWidth
-              placeholder={generateMetricViewYaml(data.sql_expressions || [], selectedTables)}
+              placeholder={generateMetricViewYaml(data.sql_expressions || [], selectedTables, joins)}
               value={data.metric_view_yaml || ""}
               onChange={(e) => onChange("metric_view_yaml", e.target.value)}
               disabled={readOnly}
@@ -556,7 +557,7 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
             {!readOnly && (
               <Box sx={{ mt: 1 }}>
                 <button
-                  onClick={() => onChange("metric_view_yaml", generateMetricViewYaml(data.sql_expressions || [], selectedTables))}
+                  onClick={() => onChange("metric_view_yaml", generateMetricViewYaml(data.sql_expressions || [], selectedTables, joins))}
                   style={{ cursor: "pointer", padding: "6px 16px", borderRadius: 4, border: "1px solid #ccc", background: "#fff" }}
                 >
                   Generate YAML
@@ -574,30 +575,65 @@ function cleanYamlStr(s: string): string {
   return (s || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function generateMetricViewYaml(sqlExprs: any[], tables: string[]): string {
+function generateMetricViewYaml(
+  sqlExprs: any[],
+  tables: string[],
+  detectedJoins: { table: string; keys: string }[],
+): string {
   if (sqlExprs.length === 0) return "";
   const lines: string[] = [];
-  lines.push("# Recommended Metric View Definition");
+  lines.push("# Metric View Definition (Optional)");
   lines.push("# Edit this YAML then create the metric view in your workspace");
+  lines.push("# Ref: docs.databricks.com/en/metric-views/yaml-ref");
   lines.push("");
-  lines.push("name: <your_metric_view_name>");
-  lines.push("catalog: <catalog>");
-  lines.push("schema: <schema>");
+  lines.push("version: 1.1");
+
+  // Primary source table
+  const primaryTable = tables[0] || "<catalog.schema.table>";
+  lines.push(`source: ${primaryTable}`);
   lines.push("");
-  lines.push("# Source tables");
-  lines.push("tables:");
-  for (const t of tables) {
-    lines.push(`  - ${t}`);
+
+  // Joins for additional tables, using detected PK/FK when available
+  if (tables.length > 1) {
+    // Build a lookup from table name to detected join keys
+    const joinKeyMap = new Map<string, string>();
+    for (const j of detectedJoins) {
+      joinKeyMap.set(j.table, j.keys);
+    }
+
+    lines.push("joins:");
+    for (let i = 1; i < tables.length; i++) {
+      const alias = tables[i].split(".").pop() || `table_${i}`;
+      const detectedKeys = joinKeyMap.get(tables[i]);
+      lines.push(`  - name: ${alias}`);
+      lines.push(`    source: ${tables[i]}`);
+      if (detectedKeys) {
+        lines.push(`    on: "${detectedKeys}"`);
+      } else {
+        lines.push(`    on: "<join_condition>"`);
+      }
+    }
+    lines.push("");
   }
+
+  // Dimensions placeholder
+  lines.push("# dimensions:");
+  lines.push("#   - name: <column_name>");
+  lines.push("#     expr: <column_expression>");
   lines.push("");
-  lines.push("# Measures (from your SQL expressions)");
+
+  // Measures from SQL expressions
   lines.push("measures:");
   for (const e of sqlExprs) {
-    lines.push(`  - name: ${cleanYamlStr(e.metric_name) || "unnamed"}`);
-    if (e.sql_code) lines.push(`    expression: "${cleanYamlStr(e.sql_code)}"`);
-    if (e.uc_table) lines.push(`    source_table: ${e.uc_table}`);
-    if (e.synonyms) lines.push(`    synonyms: [${cleanYamlStr(e.synonyms)}]`);
-    if (e.instructions) lines.push(`    description: "${cleanYamlStr(e.instructions)}"`);
+    const name = (cleanYamlStr(e.metric_name) || "unnamed").toLowerCase().replace(/\s+/g, "_");
+    lines.push(`  - name: ${name}`);
+    if (e.sql_code) lines.push(`    expr: "${cleanYamlStr(e.sql_code)}"`);
+    if (e.metric_name) lines.push(`    display_name: "${cleanYamlStr(e.metric_name)}"`);
+    if (e.synonyms) {
+      const syns = cleanYamlStr(e.synonyms).split(",").map((s: string) => `"${s.trim()}"`).join(", ");
+      lines.push(`    synonyms: [${syns}]`);
+    }
+    if (e.instructions) lines.push(`    comment: "${cleanYamlStr(e.instructions)}"`);
     lines.push("");
   }
   return lines.join("\n");
