@@ -194,18 +194,18 @@ Databricks Apps read the end user's OAuth scopes from a CLI-only setting — **t
 databricks apps update genie-discovery --profile <profile> --json '{
   "name": "genie-discovery",
   "user_api_scopes": [
-    "iam.current-user:read",
-    "iam.access-control:read",
     "sql",
+    "catalog.tables:read",
     "dashboards.genie"
   ]
 }'
 ```
 
+> `iam.current-user:read` and `iam.access-control:read` are added to every app's effective scopes by the platform — you do not list them explicitly (the CLI rejects them). Only the app-specific scopes go in this list.
+
 What each scope unlocks:
-- `iam.current-user:read` — resolve the logged-in user for audit trails.
-- `iam.access-control:read` — check COE group membership for Session 4 approval gating.
 - `sql` — list warehouses, run `DESCRIBE TABLE` / `SHOW CREATE TABLE` for schema grounding, execute benchmark SQL.
+- `catalog.tables:read` — read UC table constraints (PK/FK) for the Session 5 joins section via `tables.get()`. Without this, the joins table will be empty and users will have to define every join manually.
 - `dashboards.genie` — create/update Genie Spaces via the Genie REST API on the user's behalf.
 
 After updating scopes, existing users will see an OAuth re-consent prompt on next load. If a user reports the warehouse dropdown is empty and the app returns "reauth_required", have them sign out (or open the app URL in a private window) to trigger the new-scope consent flow.
