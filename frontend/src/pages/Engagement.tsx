@@ -221,6 +221,7 @@ export default function Engagement({ readOnly = false }: Props) {
             {...sessionProps(3)}
             session1Data={sessionDrafts[1]}
             session2Data={sessionDrafts[2]}
+            engagementId={id}
           />
         )}
         {tab === 3 && (

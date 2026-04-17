@@ -7,6 +7,22 @@ command:
   - python
   - app.py
 
+# NOTE: OAuth scopes for the end-user OBO token are NOT set in app.yaml (the
+# key is silently ignored). Configure them once via the CLI:
+#   databricks apps update genie-discovery --json '{
+#     "name": "genie-discovery",
+#     "user_api_scopes": [
+#       "iam.current-user:read",
+#       "iam.access-control:read",
+#       "sql",
+#       "dashboards.genie"
+#     ]
+#   }'
+# Or via the app's "User authorization" section in the Databricks UI.
+# Required scopes for this app:
+#   - sql              → list warehouses (Session 5 dropdown)
+#   - dashboards.genie → create/update Genie Spaces via /api/2.0/genie/spaces
+
 env:
   # SQL Warehouse used for all UC metadata queries and engagement storage.
   # Find this in your workspace: SQL > SQL Warehouses > (select warehouse) >
@@ -30,3 +46,12 @@ env:
   # add your COE reviewers as members, then put the group name here.
   - name: COE_GROUP_NAME
     value: "genie-coe-reviewers"  # CHANGE ME
+
+  # Model Serving endpoint used by Session 5's "Generate Plan" button to
+  # synthesize Genie Space configuration from Sessions 1-4.
+  # Default is the HIPAA-eligible pay-per-token Claude endpoint on Azure.
+  # The app's service principal needs CAN QUERY on this endpoint.
+  # Alternatives: databricks-claude-3-7-sonnet, databricks-gpt-oss-120b,
+  # or any custom chat-completion-compatible served model.
+  - name: LLM_ENDPOINT_NAME
+    value: "databricks-claude-sonnet-4-6"  # CHANGE ME if needed

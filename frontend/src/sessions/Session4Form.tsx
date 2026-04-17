@@ -1,15 +1,19 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import {
   Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert,
-  TextField, Button, Chip, Paper, Divider,
+  TextField, Button, Chip, Paper, Divider, Stack, IconButton, MenuItem, Select,
+  Checkbox, CircularProgress, Tooltip,
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import PendingIcon from "@mui/icons-material/Pending";
 import ErrorIcon from "@mui/icons-material/Error";
+import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
+import AddIcon from "@mui/icons-material/Add";
+import DeleteIcon from "@mui/icons-material/Delete";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
-import { api } from "../api";
+import { api, BenchmarkQuestion } from "../api";
 import type { ColumnDef } from "../types";
 
 const DATA_PLAN_COLS: ColumnDef[] = [
@@ -36,8 +40,16 @@ export default function Session4Form({
   const [summary, setSummary] = useState("");
   const [loadingSummary, setLoadingSummary] = useState(false);
   const [approvalNotes, setApprovalNotes] = useState("");
+  const [draftingBenchmarks, setDraftingBenchmarks] = useState(false);
+  const [draftingSqlIdx, setDraftingSqlIdx] = useState<number | null>(null);
+  const [draftingAllSql, setDraftingAllSql] = useState(false);
 
   const approvalStatus = data.coe_approval_status || "pending";
+  const benchmarks: BenchmarkQuestion[] = data.benchmark_questions || [];
+  const approvedBenchmarkCount = benchmarks.filter(
+    (b) => b.bo_approved && b.question?.trim() && b.expected_sql?.trim(),
+  ).length;
+  const canApprove = approvedBenchmarkCount >= 5;
 
   // Pre-populate data plan from Session 3 tables
   const session3Tables = useMemo(() => {
@@ -48,17 +60,27 @@ export default function Session4Form({
     return Array.from(tables);
   }, [session3Data]);
 
-  // On first load, seed data plan from Session 3 if empty
+  // Seed data plan from Session 3 tables on first mount, only if the analyst
+  // hasn't put a real table in any row yet. Ref guard prevents clobbering
+  // later edits when session3Tables re-computes.
+  const seeded = useRef(false);
   useEffect(() => {
-    if ((data.data_plan || []).length === 0 && session3Tables.length > 0) {
-      const plan = session3Tables.map((t) => ({
-        table_or_view: t,
-        type: "Table",
-        include_in_space: "Yes",
-        notes: "",
-      }));
-      onChange("data_plan", plan);
+    if (seeded.current) return;
+    if (session3Tables.length === 0) return;
+    const currentRows = data.data_plan || [];
+    const hasRealData = currentRows.some((r: any) => r.table_or_view);
+    if (hasRealData) {
+      seeded.current = true;
+      return;
     }
+    const plan = session3Tables.map((t) => ({
+      table_or_view: t,
+      type: "Table",
+      include_in_space: "Yes",
+      notes: "",
+    }));
+    onChange("data_plan", plan);
+    seeded.current = true;
   }, [session3Tables]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Fetch auto-summary
@@ -82,6 +104,63 @@ export default function Session4Form({
       fetchSummary();
     }
   }, [engagementId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Benchmark handlers
+  const updateBenchmark = (idx: number, field: keyof BenchmarkQuestion, value: any) => {
+    const next = [...benchmarks];
+    next[idx] = { ...next[idx], [field]: value };
+    onChange("benchmark_questions", next);
+  };
+  const removeBenchmark = (idx: number) =>
+    onChange("benchmark_questions", benchmarks.filter((_, i) => i !== idx));
+  const addBenchmark = () =>
+    onChange("benchmark_questions", [
+      ...benchmarks,
+      { question: "", category: "Core", difficulty: "Medium", expected_sql: "", notes: "", bo_approved: false },
+    ]);
+  const draftAllBenchmarks = async () => {
+    if (!engagementId) return;
+    setDraftingBenchmarks(true);
+    try {
+      const res = await api.draftBenchmarks(engagementId);
+      onChange("benchmark_questions", [...benchmarks, ...res.benchmarks]);
+    } catch (err) {
+      // surface via notes on first row if nothing else
+      console.error(err);
+    }
+    setDraftingBenchmarks(false);
+  };
+  const draftSqlForRow = async (idx: number) => {
+    if (!engagementId) return;
+    const q = benchmarks[idx]?.question?.trim();
+    if (!q) return;
+    setDraftingSqlIdx(idx);
+    try {
+      const res = await api.draftBenchmarkSql(engagementId, q);
+      updateBenchmark(idx, "expected_sql", res.sql);
+    } catch (err) {
+      console.error(err);
+    }
+    setDraftingSqlIdx(null);
+  };
+  const draftAllSql = async () => {
+    if (!engagementId) return;
+    setDraftingAllSql(true);
+    const next = [...benchmarks];
+    for (let i = 0; i < next.length; i++) {
+      const b = next[i];
+      const q = b.question?.trim();
+      if (!q || b.expected_sql?.trim()) continue; // skip blanks and already-filled rows
+      try {
+        const res = await api.draftBenchmarkSql(engagementId, q);
+        next[i] = { ...next[i], expected_sql: res.sql };
+        onChange("benchmark_questions", [...next]);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+    setDraftingAllSql(false);
+  };
 
   const handleApproval = async (status: string) => {
     if (!engagementId) return;
@@ -206,6 +285,177 @@ export default function Session4Form({
         </AccordionDetails>
       </Accordion>
 
+      {/* Benchmark Questions */}
+      <Accordion defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Stack direction="row" alignItems="center" spacing={1}>
+            <Typography variant="h6">Benchmark Questions</Typography>
+            <Chip label={`${benchmarks.length} drafted`} size="small" variant="outlined" />
+            <Chip
+              label={`${approvedBenchmarkCount} BO-approved`}
+              size="small"
+              color={approvedBenchmarkCount >= 5 ? "success" : "default"}
+            />
+          </Stack>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Alert severity="info" sx={{ mb: 2 }}>
+            These are the <strong>acceptance-test questions</strong> the Genie Space will be scored
+            against (target &gt;80% pass rate). The analyst, business owner, and COE reviewer must
+            agree on these before the space is built. They will NOT be pushed as sample questions
+            or example queries — the whole point is to measure whether Genie can answer them from
+            the other configured context. Minimum 5 BO-approved to unlock COE approval.
+          </Alert>
+
+          {!readOnly && (
+            <Stack direction="row" spacing={1} sx={{ mb: 2, flexWrap: "wrap" }}>
+              <Button
+                variant="outlined"
+                size="small"
+                startIcon={draftingBenchmarks ? <CircularProgress size={14} /> : <AutoAwesomeIcon />}
+                onClick={draftAllBenchmarks}
+                disabled={draftingBenchmarks}
+              >
+                {draftingBenchmarks ? "Drafting..." : "Draft Benchmarks from Sessions 1-3"}
+              </Button>
+              <Button
+                variant="outlined"
+                size="small"
+                color="secondary"
+                startIcon={draftingAllSql ? <CircularProgress size={14} /> : <AutoAwesomeIcon />}
+                onClick={draftAllSql}
+                disabled={draftingAllSql || benchmarks.filter((b) => b.question?.trim() && !b.expected_sql?.trim()).length === 0}
+              >
+                {draftingAllSql ? "Drafting SQL..." : "Draft All Expected SQL"}
+              </Button>
+              <Button size="small" startIcon={<AddIcon />} onClick={addBenchmark}>
+                Add blank row
+              </Button>
+            </Stack>
+          )}
+          {!readOnly && (
+            <Alert severity="warning" sx={{ mb: 2 }} variant="outlined">
+              LLM-drafted SQL is a starting point only. <strong>Verify every query</strong> runs
+              against your data and returns what the question asks before marking it BO-approved.
+            </Alert>
+          )}
+
+          {benchmarks.length > 0 && (
+            <Stack spacing={2}>
+              {benchmarks.map((b, i) => (
+                <Paper key={i} variant="outlined" sx={{ p: 2 }}>
+                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+                    <Chip label={`#${i + 1}`} size="small" />
+                    <Select
+                      size="small"
+                      value={b.category || "Core"}
+                      onChange={(e) => updateBenchmark(i, "category", e.target.value)}
+                      disabled={readOnly}
+                      sx={{ minWidth: 120 }}
+                    >
+                      <MenuItem value="Core">Core</MenuItem>
+                      <MenuItem value="Edge Case">Edge Case</MenuItem>
+                    </Select>
+                    <Select
+                      size="small"
+                      value={b.difficulty || "Medium"}
+                      onChange={(e) => updateBenchmark(i, "difficulty", e.target.value)}
+                      disabled={readOnly}
+                      sx={{ minWidth: 110 }}
+                    >
+                      <MenuItem value="Easy">Easy</MenuItem>
+                      <MenuItem value="Medium">Medium</MenuItem>
+                      <MenuItem value="Hard">Hard</MenuItem>
+                    </Select>
+                    <Box sx={{ flex: 1 }} />
+                    <Tooltip
+                      title={
+                        !b.question?.trim() || !b.expected_sql?.trim()
+                          ? "Question and SQL required before BO approval"
+                          : "BO approved"
+                      }
+                    >
+                      <span>
+                        <Stack direction="row" alignItems="center" spacing={0.5}>
+                          <Checkbox
+                            size="small"
+                            checked={!!b.bo_approved}
+                            onChange={(e) => updateBenchmark(i, "bo_approved", e.target.checked)}
+                            disabled={readOnly || !b.question?.trim() || !b.expected_sql?.trim()}
+                          />
+                          <Typography variant="caption">BO approved</Typography>
+                        </Stack>
+                      </span>
+                    </Tooltip>
+                    {!readOnly && (
+                      <IconButton size="small" onClick={() => removeBenchmark(i)}>
+                        <DeleteIcon fontSize="small" />
+                      </IconButton>
+                    )}
+                  </Stack>
+
+                  <TextField
+                    fullWidth multiline size="small"
+                    label="Question"
+                    value={b.question || ""}
+                    onChange={(e) => updateBenchmark(i, "question", e.target.value)}
+                    disabled={readOnly}
+                    sx={{ mb: 1.5 }}
+                  />
+
+                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
+                    <Typography variant="caption" color="text.secondary">
+                      Expected SQL
+                    </Typography>
+                    {!readOnly && (
+                      <Tooltip title="Draft SQL for this row with AI">
+                        <span>
+                          <IconButton
+                            size="small"
+                            onClick={() => draftSqlForRow(i)}
+                            disabled={draftingSqlIdx === i || !b.question?.trim()}
+                          >
+                            {draftingSqlIdx === i ? <CircularProgress size={14} /> : <AutoAwesomeIcon fontSize="small" />}
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                    )}
+                  </Stack>
+                  <ExpandableTextField
+                    value={b.expected_sql || ""}
+                    onChange={(v) => updateBenchmark(i, "expected_sql", v)}
+                    placeholder="SELECT ..."
+                    disabled={readOnly}
+                    minRows={4}
+                    monospace
+                    dialogTitle={`Expected SQL — Benchmark #${i + 1}`}
+                  />
+
+                  <Box sx={{ mt: 1.5 }}>
+                    <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5, display: "block" }}>
+                      Notes
+                    </Typography>
+                    <ExpandableTextField
+                      value={b.notes || ""}
+                      onChange={(v) => updateBenchmark(i, "notes", v)}
+                      placeholder="Clarifications, edge-case assumptions, acceptance notes..."
+                      disabled={readOnly}
+                      minRows={2}
+                      dialogTitle={`Notes — Benchmark #${i + 1}`}
+                    />
+                  </Box>
+                </Paper>
+              ))}
+            </Stack>
+          )}
+          {benchmarks.length === 0 && (
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+              No benchmarks yet. Click "Draft Benchmarks from Sessions 1-3" to seed a starting set.
+            </Typography>
+          )}
+        </AccordionDetails>
+      </Accordion>
+
       {/* Metric View YAML */}
       <Accordion defaultExpanded={!!metricViewYaml}>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
@@ -255,14 +505,24 @@ export default function Session4Form({
                 onChange={(e) => setApprovalNotes(e.target.value)}
                 sx={{ mb: 2 }}
               />
+              {!canApprove && (
+                <Alert severity="warning" sx={{ mb: 2 }}>
+                  Approval is blocked until at least 5 benchmark questions are BO-approved and have expected SQL. Currently {approvedBenchmarkCount} of 5 required.
+                </Alert>
+              )}
               <Box sx={{ display: "flex", gap: 2 }}>
-                <Button
-                  variant="contained"
-                  color="success"
-                  onClick={() => handleApproval("approved")}
-                >
-                  Approve
-                </Button>
+                <Tooltip title={canApprove ? "" : "Requires >=5 BO-approved benchmarks"}>
+                  <span>
+                    <Button
+                      variant="contained"
+                      color="success"
+                      onClick={() => handleApproval("approved")}
+                      disabled={!canApprove}
+                    >
+                      Approve
+                    </Button>
+                  </span>
+                </Tooltip>
                 <Button
                   variant="outlined"
                   color="warning"

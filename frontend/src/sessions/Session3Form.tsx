@@ -2,12 +2,18 @@ import { useEffect, useState, useMemo } from "react";
 import {
   Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert, Chip,
   Paper, Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
-  Select, MenuItem, Checkbox, ListItemText, LinearProgress, TextField,
+  Select, MenuItem, Checkbox, ListItemText, LinearProgress, TextField, Button,
+  CircularProgress, Stack, FormControl, InputLabel,
+  Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import TableChartIcon from "@mui/icons-material/TableChart";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
+import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import EditableTable from "../components/EditableTable";
+import ExpandableTextField from "../components/ExpandableTextField";
+import { api } from "../api";
 import type { ColumnDef } from "../types";
 
 const SQL_EXPR_COLS: ColumnDef[] = [
@@ -15,7 +21,6 @@ const SQL_EXPR_COLS: ColumnDef[] = [
   { key: "uc_table", label: "Table", type: "uc_table" },
   { key: "sql_code", label: "SQL Code", type: "textarea" },
   { key: "synonyms", label: "Synonyms" },
-  { key: "instructions", label: "Genie Instructions", type: "textarea" },
 ];
 
 const TEXT_INSTR_COLS: ColumnDef[] = [
@@ -44,11 +49,27 @@ interface Props {
   readOnly?: boolean;
   session1Data?: Record<string, any>;
   session2Data?: Record<string, any>;
+  engagementId?: string;
 }
 
-export default function Session3Form({ data, onChange, readOnly, session1Data, session2Data }: Props) {
+export default function Session3Form({ data, onChange, readOnly, session1Data, session2Data, engagementId }: Props) {
   const [joins, setJoins] = useState<{ table: string; keys: string }[]>([]);
   const [metricViews, setMetricViews] = useState<string[]>([]);
+
+  // Metric View builder state
+  const [mvCatalogs, setMvCatalogs] = useState<string[]>([]);
+  const [mvSchemas, setMvSchemas] = useState<string[]>([]);
+  const [mvWarehouses, setMvWarehouses] = useState<{ id: string; name: string }[]>([]);
+  const [mvCatalog, setMvCatalog] = useState<string>("");
+  const [mvSchema, setMvSchema] = useState<string>("");
+  const [mvName, setMvName] = useState<string>("");
+  const [mvWarehouseId, setMvWarehouseId] = useState<string>("");
+  const [mvDrafting, setMvDrafting] = useState(false);
+  const [mvCreating, setMvCreating] = useState(false);
+  const [mvError, setMvError] = useState<string>("");
+  const [mvSuccess, setMvSuccess] = useState<string>("");
+  const [mvWarnings, setMvWarnings] = useState<string[]>([]);
+  const [mvConflict, setMvConflict] = useState<{ fqn: string; owner: string | null } | null>(null);
 
   // Session 2 vocabulary
   const vocabTerms = useMemo(
@@ -135,7 +156,7 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
       if (type === "Metric" && !exprs.some((e: any) => e.metric_name === termName)) {
         exprs.push({
           metric_name: termName, uc_table: "", sql_code: "",
-          synonyms: vocab?.synonyms || "", instructions: "",
+          synonyms: vocab?.synonyms || "",
         });
         exprsChanged = true;
       } else if (
@@ -171,6 +192,102 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
     if (exprsChanged) onChange("sql_expressions", exprs);
     if (instrsChanged) onChange("text_instructions", instrs);
   };
+
+  // Load catalogs + warehouses once for the MV builder
+  useEffect(() => {
+    api.listCatalogs().then(setMvCatalogs).catch(() => setMvCatalogs([]));
+    api.listWarehouses()
+      .then((ws) => setMvWarehouses(ws.map((w) => ({ id: w.id, name: w.name }))))
+      .catch(() => setMvWarehouses([]));
+  }, []);
+
+  useEffect(() => {
+    if (!mvCatalog) { setMvSchemas([]); return; }
+    api.listSchemas(mvCatalog).then(setMvSchemas).catch(() => setMvSchemas([]));
+  }, [mvCatalog]);
+
+  // Pre-fill MV name from first selected table, if empty
+  useEffect(() => {
+    if (!mvName && selectedTables[0]) {
+      const parts = selectedTables[0].split(".");
+      if (parts.length === 3) setMvName(`${parts[2]}_mv`);
+    }
+  }, [selectedTables, mvName]);
+
+  // Seed a single warehouse if only one available
+  useEffect(() => {
+    if (!mvWarehouseId && mvWarehouses.length > 0) setMvWarehouseId(mvWarehouses[0].id);
+  }, [mvWarehouses, mvWarehouseId]);
+
+  const handleDraftMvYaml = async () => {
+    if (!engagementId) return;
+    setMvDrafting(true);
+    setMvError("");
+    setMvSuccess("");
+    setMvWarnings([]);
+    try {
+      const res = await api.draftMetricViewYaml(engagementId, mvWarehouseId);
+      onChange("metric_view_yaml", res.yaml);
+      if (res.suggested_name && !mvName) setMvName(res.suggested_name);
+      if (res.warnings && res.warnings.length > 0) setMvWarnings(res.warnings);
+    } catch (e: any) {
+      setMvError(e.message || String(e));
+    } finally {
+      setMvDrafting(false);
+    }
+  };
+
+  const submitCreateMv = async (overwrite: boolean) => {
+    if (!engagementId) return;
+    setMvCreating(true);
+    try {
+      const res = await api.createMetricView(engagementId, {
+        catalog: mvCatalog,
+        schema: mvSchema,
+        name: mvName,
+        yaml: data.metric_view_yaml,
+        warehouse_id: mvWarehouseId,
+        overwrite,
+      });
+      if (res.success) {
+        onChange("metric_view_fqn", res.fqn);
+        setMvSuccess(`${overwrite ? "Overwrote" : "Created"} ${res.fqn}`);
+        setMvConflict(null);
+      } else {
+        // 409 exists
+        setMvConflict({ fqn: res.fqn, owner: res.owner });
+      }
+    } catch (e: any) {
+      setMvError(e.message || String(e));
+    } finally {
+      setMvCreating(false);
+    }
+  };
+
+  const handleCreateMv = async () => {
+    if (!engagementId) return;
+    setMvError("");
+    setMvSuccess("");
+    setMvConflict(null);
+    if (!mvCatalog || !mvSchema || !mvName || !mvWarehouseId || !data.metric_view_yaml) {
+      setMvError("Pick a catalog, schema, warehouse, and name, and make sure the YAML isn't empty.");
+      return;
+    }
+    await submitCreateMv(false);
+  };
+
+  const handleConfirmOverwrite = async () => {
+    setMvError("");
+    setMvSuccess("");
+    await submitCreateMv(true);
+  };
+
+  // Enable the "Generate YAML with AI" button once the analyst has done real data mapping
+  const mvReady = useMemo(() => {
+    const exprs = data.sql_expressions || [];
+    const withTable = exprs.filter((e: any) => e.uc_table && e.sql_code);
+    return withTable.length >= 1 && selectedTables.length >= 1;
+  }, [data.sql_expressions, selectedTables]);
 
   // Reference data
   const questions = session2Data?.question_bank || [];
@@ -347,6 +464,37 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
         </Alert>
       )}
 
+      {/* ---- Global Filter ---- */}
+      <Accordion defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="h6">Global Filter</Typography>
+            {data.global_filter && (
+              <Chip label="Set" size="small" color="success" variant="outlined" />
+            )}
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            A SQL boolean expression applied to every metric. Use for row-level
+            exclusions that apply across the board — e.g., excluding test rows,
+            voided records, or out-of-scope categories. This becomes the metric
+            view's top-level <code>filter:</code> and is included in the generate-plan prompt.
+            Leave blank if none apply.
+          </Typography>
+          <TextField
+            fullWidth
+            multiline
+            minRows={2}
+            placeholder="voided_flag = 'N' AND test_flag = 'N' AND claim_type IN ('Professional', 'Facility')"
+            value={data.global_filter || ""}
+            onChange={(e) => onChange("global_filter", e.target.value)}
+            disabled={readOnly}
+            sx={{ "& .MuiInputBase-input": { fontFamily: "monospace", fontSize: 13 } }}
+          />
+        </AccordionDetails>
+      </Accordion>
+
       {/* ---- SQL Expressions (Metrics) ---- */}
       <Accordion defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
@@ -359,11 +507,11 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
         </AccordionSummary>
         <AccordionDetails>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Each metric maps to a Genie Space "Common SQL Expression." Pick the UC table,
+            Each metric becomes a measure on the generated metric view. Pick the UC table,
             then write SQL using table-qualified column names (e.g., <code>claims.initial_decision</code>).
-            <strong> Genie Instructions</strong> tells Genie when/how to use this metric
-            (e.g., "Use this metric when the user asks about denial rates. Always filter to completed claims only.").
-            Rows are auto-added when you classify a term as Metric above.
+            Put business-rule filters that apply to every metric (e.g., "exclude voided claims") in
+            <strong> Global Filter</strong> above — not per row. Rows are auto-added when you classify
+            a term as Metric above.
           </Typography>
           <EditableTable
             columns={SQL_EXPR_COLS}
@@ -525,116 +673,186 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
         </AccordionDetails>
       </Accordion>
 
-      {/* ---- Metric View Reference (Optional) ---- */}
-      {(data.sql_expressions || []).length > 0 && (
-        <Accordion defaultExpanded>
-          <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-            <Typography variant="h6">Metric View Reference (Optional)</Typography>
-          </AccordionSummary>
-          <AccordionDetails>
-            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-              Your SQL expressions can be added to the Genie Space directly as sample queries.
-              If you prefer to create a metric view instead, generate the YAML below.
-              Edit as needed, then create the metric view in your workspace.
-              This will carry forward to the COE Review in Session 4.
+      {/* ---- Metric View Builder (LLM-driven) ---- */}
+      <Accordion defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="h6">Metric View (Recommended)</Typography>
+            {data.metric_view_fqn && (
+              <Chip
+                icon={<CheckCircleIcon />}
+                label={data.metric_view_fqn}
+                size="small"
+                color="success"
+                variant="outlined"
+                sx={{ fontFamily: "monospace", fontSize: 12 }}
+              />
+            )}
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Alert severity="info" sx={{ mb: 2 }}>
+            <strong>Why metric views?</strong> They give Genie a reusable, governed semantic
+            layer so the same measure is calculated the same way everywhere. Finish mapping
+            your data above first, then draft a metric view from that work.
+          </Alert>
+
+          {!mvReady && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              Fill in at least one SQL expression with a UC table before drafting a metric view.
+              You know the data best - that mapping is what the LLM uses as context.
+            </Alert>
+          )}
+
+          <Stack direction="row" spacing={1} sx={{ mb: 2, flexWrap: "wrap" }}>
+            <Button
+              variant="contained"
+              startIcon={mvDrafting ? <CircularProgress size={16} /> : <AutoAwesomeIcon />}
+              onClick={handleDraftMvYaml}
+              disabled={readOnly || !mvReady || mvDrafting || !engagementId}
+            >
+              {data.metric_view_yaml ? "Redraft YAML with AI" : "Generate YAML with AI"}
+            </Button>
+            <Typography variant="caption" color="text.secondary" sx={{ alignSelf: "center" }}>
+              Uses Sessions 1-3 as context. Always review before creating.
             </Typography>
-            {!readOnly && !data.metric_view_yaml && (
-              <Alert severity="info" sx={{ mb: 2 }}>
-                Click "Generate YAML" to create a metric view definition based on your SQL expressions,
-                or write your own below. This is optional -- not every space needs a metric view.
-              </Alert>
-            )}
-            <TextField
-              multiline
-              minRows={10}
-              fullWidth
-              placeholder={generateMetricViewYaml(data.sql_expressions || [], selectedTables, joins)}
-              value={data.metric_view_yaml || ""}
-              onChange={(e) => onChange("metric_view_yaml", e.target.value)}
-              disabled={readOnly}
-              sx={{ fontFamily: "monospace", fontSize: 13, "& .MuiInputBase-input": { fontFamily: "monospace" } }}
-            />
-            {!readOnly && (
-              <Box sx={{ mt: 1 }}>
-                <button
-                  onClick={() => onChange("metric_view_yaml", generateMetricViewYaml(data.sql_expressions || [], selectedTables, joins))}
-                  style={{ cursor: "pointer", padding: "6px 16px", borderRadius: 4, border: "1px solid #ccc", background: "#fff" }}
-                >
-                  Generate YAML
-                </button>
+          </Stack>
+
+          <ExpandableTextField
+            value={data.metric_view_yaml || ""}
+            onChange={(v) => onChange("metric_view_yaml", v)}
+            label="Metric View YAML"
+            placeholder="version: 1.1\nsource: catalog.schema.table\n..."
+            disabled={readOnly}
+            minRows={12}
+            monospace
+            dialogTitle="Edit Metric View YAML"
+          />
+
+          {mvWarnings.length > 0 && (
+            <Alert severity="warning" sx={{ mt: 2 }}>
+              <strong>Sanity-check flagged these issues in the draft YAML:</strong>
+              <Box component="ul" sx={{ mb: 0, mt: 0.5, pl: 2 }}>
+                {mvWarnings.map((w, i) => <li key={i}>{w}</li>)}
               </Box>
-            )}
-          </AccordionDetails>
-        </Accordion>
-      )}
+            </Alert>
+          )}
+
+          {data.metric_view_yaml && !readOnly && (
+            <Box sx={{ mt: 3 }}>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Create this Metric View in Unity Catalog
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Pick a catalog and schema you have <code>CREATE TABLE</code> permission on.
+                This runs <code>CREATE OR REPLACE VIEW ... WITH METRICS LANGUAGE YAML</code> as
+                you, so your UC permissions apply.
+              </Typography>
+
+              <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: "wrap" }}>
+                <FormControl size="small" sx={{ minWidth: 200 }}>
+                  <InputLabel>Catalog</InputLabel>
+                  <Select
+                    label="Catalog"
+                    value={mvCatalog}
+                    onChange={(e) => { setMvCatalog(e.target.value); setMvSchema(""); }}
+                  >
+                    {mvCatalogs.map((c) => <MenuItem key={c} value={c}>{c}</MenuItem>)}
+                  </Select>
+                </FormControl>
+
+                <FormControl size="small" sx={{ minWidth: 200 }} disabled={!mvCatalog}>
+                  <InputLabel>Schema</InputLabel>
+                  <Select
+                    label="Schema"
+                    value={mvSchema}
+                    onChange={(e) => setMvSchema(e.target.value)}
+                  >
+                    {mvSchemas.map((s) => <MenuItem key={s} value={s}>{s}</MenuItem>)}
+                  </Select>
+                </FormControl>
+
+                <TextField
+                  size="small"
+                  label="View Name"
+                  value={mvName}
+                  onChange={(e) => setMvName(e.target.value.replace(/[^a-zA-Z0-9_]/g, "_"))}
+                  sx={{ minWidth: 200 }}
+                />
+
+                <FormControl size="small" sx={{ minWidth: 220 }}>
+                  <InputLabel>Warehouse</InputLabel>
+                  <Select
+                    label="Warehouse"
+                    value={mvWarehouseId}
+                    onChange={(e) => setMvWarehouseId(e.target.value)}
+                  >
+                    {mvWarehouses.map((w) => (
+                      <MenuItem key={w.id} value={w.id}>{w.name}</MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              </Stack>
+
+              <Button
+                variant="contained"
+                color="primary"
+                onClick={handleCreateMv}
+                disabled={mvCreating || !mvCatalog || !mvSchema || !mvName || !mvWarehouseId}
+                startIcon={mvCreating ? <CircularProgress size={16} /> : null}
+              >
+                {mvCreating ? "Creating..." : "Create Metric View"}
+              </Button>
+
+              {mvSuccess && (
+                <Alert severity="success" sx={{ mt: 2 }}>
+                  {mvSuccess}. It has been added to your Session 4 data plan as a Metric View.
+                </Alert>
+              )}
+              {mvError && (
+                <Alert severity="error" sx={{ mt: 2 }}>
+                  {mvError}
+                </Alert>
+              )}
+            </Box>
+          )}
+        </AccordionDetails>
+      </Accordion>
+
+      <Dialog open={!!mvConflict} onClose={() => setMvConflict(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>Metric view already exists</DialogTitle>
+        <DialogContent>
+          <DialogContentText component="div">
+            <Box sx={{ mb: 1 }}>
+              <code>{mvConflict?.fqn}</code> already exists
+              {mvConflict?.owner ? (
+                <> — owned by <code>{mvConflict.owner}</code></>
+              ) : null}
+              .
+            </Box>
+            <Box sx={{ mb: 1 }}>
+              Overwriting will replace its YAML definition with the draft above.
+              You need <strong>MANAGE</strong> or ownership on the view for this
+              to succeed. If you don't have permission, the overwrite will fail
+              with a UC permissions error.
+            </Box>
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setMvConflict(null)} disabled={mvCreating}>
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            color="warning"
+            onClick={handleConfirmOverwrite}
+            disabled={mvCreating}
+            startIcon={mvCreating ? <CircularProgress size={16} /> : null}
+          >
+            Overwrite
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
-}
-
-function cleanYamlStr(s: string): string {
-  return (s || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function generateMetricViewYaml(
-  sqlExprs: any[],
-  tables: string[],
-  detectedJoins: { table: string; keys: string }[],
-): string {
-  if (sqlExprs.length === 0) return "";
-  const lines: string[] = [];
-  lines.push("# Metric View Definition (Optional)");
-  lines.push("# Edit this YAML then create the metric view in your workspace");
-  lines.push("# Ref: docs.databricks.com/en/metric-views/yaml-ref");
-  lines.push("");
-  lines.push("version: 1.1");
-
-  // Primary source table
-  const primaryTable = tables[0] || "<catalog.schema.table>";
-  lines.push(`source: ${primaryTable}`);
-  lines.push("");
-
-  // Joins for additional tables, using detected PK/FK when available
-  if (tables.length > 1) {
-    // Build a lookup from table name to detected join keys
-    const joinKeyMap = new Map<string, string>();
-    for (const j of detectedJoins) {
-      joinKeyMap.set(j.table, j.keys);
-    }
-
-    lines.push("joins:");
-    for (let i = 1; i < tables.length; i++) {
-      const alias = tables[i].split(".").pop() || `table_${i}`;
-      const detectedKeys = joinKeyMap.get(tables[i]);
-      lines.push(`  - name: ${alias}`);
-      lines.push(`    source: ${tables[i]}`);
-      if (detectedKeys) {
-        lines.push(`    on: "${detectedKeys}"`);
-      } else {
-        lines.push(`    on: "<join_condition>"`);
-      }
-    }
-    lines.push("");
-  }
-
-  // Dimensions placeholder
-  lines.push("# dimensions:");
-  lines.push("#   - name: <column_name>");
-  lines.push("#     expr: <column_expression>");
-  lines.push("");
-
-  // Measures from SQL expressions
-  lines.push("measures:");
-  for (const e of sqlExprs) {
-    const name = (cleanYamlStr(e.metric_name) || "unnamed").toLowerCase().replace(/\s+/g, "_");
-    lines.push(`  - name: ${name}`);
-    if (e.sql_code) lines.push(`    expr: "${cleanYamlStr(e.sql_code)}"`);
-    if (e.metric_name) lines.push(`    display_name: "${cleanYamlStr(e.metric_name)}"`);
-    if (e.synonyms) {
-      const syns = cleanYamlStr(e.synonyms).split(",").map((s: string) => `"${s.trim()}"`).join(", ");
-      lines.push(`    synonyms: [${syns}]`);
-    }
-    if (e.instructions) lines.push(`    comment: "${cleanYamlStr(e.instructions)}"`);
-    lines.push("");
-  }
-  return lines.join("\n");
 }

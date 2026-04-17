@@ -4,5 +4,6 @@ __pycache__/
 node_modules/
 frontend/node_modules/
 frontend/dist/
+frontend/tsconfig.tsbuildinfo
 static/
 .DS_Store

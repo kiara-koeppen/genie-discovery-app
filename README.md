@@ -10,7 +10,7 @@ The app walks analyst-business owner pairs through 6 sessions:
 2. **Questions & Vocabulary** (Analyst + BO) -- question bank and vocabulary terms
 3. **Technical Design** (Analyst solo) -- classify terms, write SQL expressions, text instructions, data gaps, scope boundaries, optional metric view YAML
 4. **COE Review** (COE group) -- analyst commentary, auto-summary of Sessions 1-3, data plan, approve/request changes (gates Sessions 5 & 6)
-5. **Configure Genie Space** (Analyst) -- locked until COE approval; select Space, config preview
+5. **Configure Genie Space** (Analyst) -- locked until COE approval; AI-generated plan (general instructions + sample questions), editable preview, push to existing Genie Space via the Genie REST API
 6. **Prototype Review** (Analyst + BO) -- locked until COE approval; scorecard, fixes log, benchmarks, phrasing notes
 
 Each engagement is persisted to a Delta table, allowing multiple sessions over time with save/resume.
@@ -82,16 +82,17 @@ A customer can deploy this app by following these four steps.
 
 ### Step 1 -- Pick your workspace resources
 
-You need to decide four things before editing any config:
+You need to decide five things before editing any config:
 
 1. **SQL Warehouse ID** -- In Databricks, go to SQL > SQL Warehouses > select your warehouse > Connection details. The ID is the trailing segment of the HTTP Path (e.g., `/sql/1.0/warehouses/<THIS_PART>`).
 2. **Catalog** -- Where the app should store engagement data. The app's service principal must have `CREATE TABLE` on this catalog/schema.
 3. **Schema** -- Under that catalog. The schema must already exist; the Delta table inside it is auto-created on first run.
 4. **COE group name** -- Create a Databricks group (Account Console > User management > Groups) whose members are allowed to approve engagements in Session 4. Add your COE reviewers to it.
+5. **Model Serving endpoint** -- The name of a chat-completion-compatible served model used by Session 5's "Generate Plan" button. Defaults to `databricks-claude-sonnet-4-6` (HIPAA-eligible, pay-per-token, on Azure). The app's service principal must have `CAN QUERY` on this endpoint.
 
 ### Step 2 -- Update `app.yaml`
 
-Open `app.yaml` and replace the four `# CHANGE ME` values with your picks from Step 1:
+Open `app.yaml` and replace the `# CHANGE ME` values with your picks from Step 1:
 
 ```yaml
 env:
@@ -103,9 +104,22 @@ env:
     value: "<your-schema>"
   - name: COE_GROUP_NAME
     value: "<your-coe-group-name>"
+  - name: LLM_ENDPOINT_NAME
+    value: "databricks-claude-sonnet-4-6"  # or whatever endpoint you have CAN QUERY on
 ```
 
 No other file needs editing. Everything else (UC catalog/schema/table picking, metric view detection, PK/FK join detection) resolves dynamically against whatever the app's service principal can see in your workspace.
+
+**Permissions required on the app's service principal:**
+- `CREATE TABLE` on `<CATALOG>.<SCHEMA>` (for engagement storage)
+- `CAN USE` on the SQL warehouse
+- `CAN QUERY` on the Model Serving endpoint named in `LLM_ENDPOINT_NAME`
+
+**Permissions required on each end user (not the SP):**
+- Membership in the COE group (for Session 4 approval; non-members can view but not approve)
+- `CAN MANAGE` on the target Genie Space (for Session 5 push; the push runs on the user's behalf via OBO, so user permissions govern it)
+
+**Prod pattern for Genie Spaces:** Have your ops team create each space ahead of time (owned by a service principal for durability), grant each analyst `CAN MANAGE`, then drop the space ID into Session 5. The "Create New Space" toggle in Session 5 is for dev/testing only.
 
 ### Step 3 -- Build the frontend
 
@@ -180,6 +194,7 @@ All config lives in `app.yaml`:
 | `CATALOG` | UC catalog for the engagement Delta table |
 | `SCHEMA` | UC schema under `CATALOG` (must exist; table auto-created) |
 | `COE_GROUP_NAME` | Databricks group whose members gate Session 4 approval |
+| `LLM_ENDPOINT_NAME` | Model Serving endpoint used by Session 5's "Generate Plan" button (chat-completion-compatible) |
 
 The app auto-adds any missing Delta columns on startup via `ensure_columns()`, so schema migrations happen transparently when you pull updates.
 
@@ -194,11 +209,11 @@ Work in progress. Functional today:
 - Engagement creation with unique-name validation
 - COE Review with analyst commentary, auto-summary, data plan, approve/request-changes
 - Session 5 & 6 locked until COE approval
+- AI-generated Genie Space plan (Session 5): reads Sessions 1-4, calls the configured LLM endpoint, returns consolidated general instructions, curated sample questions, and a plan narrative
+- Push to Genie Space (Session 5): create-new and update-existing via the Genie REST API, OBO-authed as the end user, with tables from Session 4 and measures from Session 3 folded in
 
 Pending:
 
-- "Push to Genie Space" button in Session 5 (currently a shell)
-- Metric view picker integration in Session 5
-- Sample-question mapping from Session 2 at Space creation time
-- Warehouse ID capture per engagement (today it's app-level only)
+- Example SQL generation for curated questions (today only measures + free-text instructions push)
+- Explicit join spec push (today relies on Genie's PK/FK auto-detection)
 - Convert to Databricks Asset Bundle for one-command deploy

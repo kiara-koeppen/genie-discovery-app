@@ -1,11 +1,15 @@
 import json
 import os
+import secrets
+import traceback
 import uuid
 from datetime import datetime, timezone
 
+import requests
 from flask import Flask, request, jsonify, send_from_directory
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementParameterListItem
+from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 
@@ -14,6 +18,7 @@ SCHEMA = os.getenv("SCHEMA", "genie_discovery")
 TABLE = f"{CATALOG}.{SCHEMA}.discovery"
 WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "ad1dd0025031919f")
 COE_GROUP = os.getenv("COE_GROUP_NAME", "genie-coe-reviewers")
+LLM_ENDPOINT = os.getenv("LLM_ENDPOINT_NAME", "databricks-claude-sonnet-4-6")
 
 w = WorkspaceClient()
 
@@ -22,18 +27,26 @@ SESSION_COLS = {
     1: ["business_context", "pain_points", "existing_reports"],
     2: ["question_bank", "vocabulary_metrics"],
     3: ["term_classifications", "sql_expressions", "text_instructions",
-        "data_gaps", "scope_boundaries", "metric_view_yaml"],
-    4: ["analyst_commentary", "auto_summary", "data_plan",
+        "data_gaps", "scope_boundaries", "global_filter",
+        "metric_view_yaml", "metric_view_fqn"],
+    4: ["analyst_commentary", "auto_summary", "data_plan", "benchmark_questions",
         "coe_approval_status", "coe_approval_notes", "coe_reviewer_email"],
-    5: ["genie_space_id", "genie_space_config"],
+    5: ["genie_space_id", "genie_space_config",
+        "plan_general_instructions", "plan_sample_questions", "plan_narrative",
+        "plan_sql_filters", "plan_sql_dimensions", "plan_sql_measures",
+        "plan_example_queries", "plan_joins",
+        "plan_warehouse_id", "genie_space_url", "genie_space_pushed_at"],
     6: ["prototype_results", "fixes_log", "benchmarks", "phrasing_notes"],
 }
 
 # Columns that store plain strings (not JSON arrays)
 SCALAR_COLS = {
-    "metric_view_yaml", "analyst_commentary", "auto_summary",
+    "global_filter",
+    "metric_view_yaml", "metric_view_fqn", "analyst_commentary", "auto_summary",
     "coe_approval_status", "coe_approval_notes", "coe_reviewer_email",
     "genie_space_id", "genie_space_config",
+    "plan_general_instructions", "plan_narrative", "plan_warehouse_id",
+    "genie_space_url", "genie_space_pushed_at",
 }
 
 # All section columns
@@ -163,6 +176,29 @@ def _user_workspace_client():
     from databricks.sdk.core import Config
     cfg = Config(host=w.config.host, token=user_token, auth_type="pat")
     return WC(config=cfg)
+
+
+@app.route("/api/warehouses")
+def api_warehouses():
+    """List SQL warehouses visible to the current user (OBO)."""
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "No user access token"}), 401
+    try:
+        whs = list(user_w.warehouses.list())
+    except Exception as e:
+        return jsonify({"error": f"Failed to list warehouses: {e}"}), 500
+    out = []
+    for wh in whs:
+        out.append({
+            "id": wh.id,
+            "name": wh.name,
+            "state": str(wh.state) if wh.state else "",
+            "size": wh.cluster_size or "",
+            "type": str(wh.warehouse_type) if wh.warehouse_type else "",
+        })
+    out.sort(key=lambda x: x["name"].lower())
+    return jsonify(out)
 
 
 @app.route("/api/user/coe-member")
@@ -485,6 +521,1456 @@ def auto_summary(eid):
             parts.append(f"- `{t}`")
 
     return jsonify({"summary": "\n".join(parts)})
+
+
+# ---------------------------------------------------------------------------
+# API: LLM-generated plan (Session 5)
+# ---------------------------------------------------------------------------
+
+def _gen_hex_id():
+    """Generate a 32-character lowercase hex ID (Genie requirement)."""
+    return secrets.token_hex(16)
+
+
+def _fetch_uc_joins(table_fqns, client=None):
+    """For each table, pull declared PK/FK constraints from UC and build join specs.
+    Returns a list of {left_table, left_cols, right_table, right_cols, relationship_type, source}.
+    Only returns joins where BOTH tables are in the provided list (intra-space joins).
+
+    `client` defaults to the SP workspace client; pass a user-OBO client when the
+    SP may not have BROWSE on the source tables.
+    """
+    c_client = client or w
+    in_scope = set(table_fqns)
+    joins = []
+    seen = set()
+    for fqn in table_fqns:
+        try:
+            info = c_client.tables.get(fqn)
+        except Exception as e:
+            print(f"[joins] tables.get({fqn}) failed: {e}", flush=True)
+            continue
+        constraints = getattr(info, "table_constraints", None) or []
+        print(f"[joins] {fqn}: {len(constraints)} constraint(s)", flush=True)
+        for c in constraints:
+            fk = getattr(c, "foreign_key_constraint", None)
+            if not fk:
+                continue
+            parent_fqn = getattr(fk, "parent_table", None)
+            if not parent_fqn or parent_fqn not in in_scope:
+                print(f"[joins] FK on {fqn} references {parent_fqn} (out of scope)", flush=True)
+                continue
+            child_cols = list(getattr(fk, "child_columns", []) or [])
+            parent_cols = list(getattr(fk, "parent_columns", []) or [])
+            key = (fqn, tuple(child_cols), parent_fqn, tuple(parent_cols))
+            if key in seen:
+                continue
+            seen.add(key)
+            joins.append({
+                "left_table": fqn,
+                "left_columns": child_cols,
+                "right_table": parent_fqn,
+                "right_columns": parent_cols,
+                "relationship_type": "MANY_TO_ONE",
+                "source": "uc_foreign_key",
+            })
+    return joins
+
+
+def _normalize_question(s):
+    """Lowercase, strip punctuation, collapse whitespace — for overlap checking."""
+    import re
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", (s or "").lower())).strip()
+
+
+def _question_overlaps(candidate, benchmarks, threshold=0.8):
+    """Return True if candidate question shares >=threshold token overlap with any benchmark."""
+    cand = _normalize_question(candidate)
+    if not cand:
+        return False
+    cand_tokens = set(cand.split())
+    if not cand_tokens:
+        return False
+    for b in benchmarks:
+        b_tokens = set(_normalize_question(b).split())
+        if not b_tokens:
+            continue
+        jaccard = len(cand_tokens & b_tokens) / len(cand_tokens | b_tokens)
+        if jaccard >= threshold:
+            return True
+    return False
+
+
+def _strip_benchmark_overlap(questions, benchmarks):
+    """Filter out questions that overlap heavily with any benchmark."""
+    return [q for q in questions if not _question_overlaps(q, benchmarks)]
+
+
+def _build_plan_prompt(eng):
+    """Build the LLM prompt from sessions 1-4 discovery data."""
+    s1 = eng["sessions"]["1"]
+    s2 = eng["sessions"]["2"]
+    s3 = eng["sessions"]["3"]
+    s4 = eng["sessions"]["4"]
+
+    lines = []
+    lines.append(f"# Genie Space: {eng.get('genie_space_name', '')}")
+    lines.append(f"Business Owner: {eng.get('business_owner_name', '')}")
+    lines.append(f"Analyst: {eng.get('analyst_name', '')}")
+    lines.append("")
+
+    lines.append("## Session 1: Business Context")
+    for pp in s1.get("pain_points", []):
+        lines.append(f"- Pain point: {pp.get('description', '')}")
+    for r in s1.get("existing_reports", []):
+        lines.append(f"- Existing report '{r.get('report_name','')}': {r.get('what_it_shows','')}")
+    lines.append("")
+
+    lines.append("## Session 2: Questions & Vocabulary")
+    lines.append("### Question Bank (candidates for sample questions)")
+    for q in s2.get("question_bank", []):
+        text = q.get("question") or q.get("text") or ""
+        lines.append(f"- {text}")
+    lines.append("### Vocabulary & Metric Definitions")
+    for v in s2.get("vocabulary_metrics", []):
+        term = v.get("business_term", "")
+        defn = v.get("definition") or v.get("description") or ""
+        lines.append(f"- **{term}**: {defn}")
+    lines.append("")
+
+    lines.append("## Session 3: Technical Design")
+    lines.append("### SQL Expressions / Measures")
+    for e in s3.get("sql_expressions", []):
+        lines.append(
+            f"- **{e.get('metric_name','')}** on `{e.get('uc_table','')}`: "
+            f"`{e.get('sql_code','')}` (display: {e.get('display_name','')}, "
+            f"synonyms: {e.get('synonyms','')})"
+        )
+    lines.append("### Analyst Text Instructions (MUST be consolidated into one general_instructions)")
+    for t in s3.get("text_instructions", []):
+        lines.append(f"- **{t.get('title','')}**: {t.get('instruction','')}")
+    lines.append("### Data Gaps")
+    for g in s3.get("data_gaps", []):
+        lines.append(f"- {g.get('gap_description','')}")
+    lines.append("### Scope Boundaries")
+    for s in s3.get("scope_boundaries", []):
+        item = s.get("item") or s.get("topic") or ""
+        lines.append(f"- {item}: {s.get('notes','')}")
+    lines.append("")
+
+    lines.append("## Session 4: COE-Approved Data Plan")
+    if s4.get("analyst_commentary"):
+        lines.append(f"### Analyst Commentary\n{s4.get('analyst_commentary','')}")
+    lines.append("### Tables & Views in scope")
+    for d in s4.get("data_plan", []):
+        if d.get("include_in_space") == "Yes":
+            lines.append(f"- `{d.get('table_or_view','')}` ({d.get('type','')}): {d.get('notes','')}")
+
+    # Collect benchmark questions for the negative rule
+    benchmark_qs = [
+        (b.get("question") or "").strip()
+        for b in s4.get("benchmark_questions", [])
+        if (b.get("question") or "").strip()
+    ]
+
+    discovery = "\n".join(lines)
+
+    benchmarks_block = ""
+    if benchmark_qs:
+        joined = "\n".join(f"- {q}" for q in benchmark_qs)
+        benchmarks_block = f"""
+<benchmark_questions>
+These are the acceptance-test questions the space will be evaluated against. Do NOT include them verbatim or near-verbatim in sample_questions, example_queries, or sql_snippets — the whole point is to measure whether Genie can answer them using the OTHER configured context. Example queries should still teach the same analytical patterns, but with different wording, scope, or slice.
+{joined}
+</benchmark_questions>
+"""
+
+    prompt = f"""You are a Databricks Genie Space configuration expert. An analyst just completed 4 sessions of discovery with a business owner. Use this discovery to populate every instruction surface Genie supports.
+
+<discovery_data>
+{discovery}
+</discovery_data>
+{benchmarks_block}
+Genie Space instruction surfaces (in order of preference per Databricks best practices):
+1. SQL Expressions (Filters / Dimensions / Measures) — reusable business concepts attached to a table
+2. Example SQL queries — full SQL for complex or frequent questions
+3. Text instructions — LAST RESORT for rules that can't live in data/SQL
+
+A single high-quality SQL example teaches Genie more than 20 lines of text instruction. Push logic INTO the data where you can; use text instructions only for things that cannot be expressed as SQL.
+
+Produce a JSON object with exactly these fields:
+
+1. "general_instructions" (string): Short bulleted text (~400-800 chars, 15 bullets max) that will be the space's ONLY text_instruction. Include ONLY:
+   - Space scope/purpose (1 bullet)
+   - Business-jargon → data mappings not captured as SQL expressions
+   - Global response/formatting standards (date format, rounding, required columns)
+   - Clarification triggers ("if user asks X without a date range, ask them to specify")
+   - Terminology synonyms not captured elsewhere
+   Do NOT restate metric definitions — those belong in sql_measures. Do NOT describe table/column semantics — those belong in UC descriptions. Use short atomic bullets starting with "- ". No markdown headers.
+
+2. "sample_questions" (array of 5-8 strings): Curated, reworded sample questions from the question bank. Clear, natural phrasing, covering main use cases. Shown to users when they open the space.
+
+IMPORTANT SQL qualification rule for snippets below: Genie infers the table from qualified column references in the SQL. Every column reference in snippet SQL MUST be prefixed with the SHORT table name (the last segment of the FQN). Example: for table `genie_training.claims_analytics.claims`, write `claims.initial_decision`, NOT `initial_decision` and NOT `genie_training.claims_analytics.claims.initial_decision`. The `table` field in each entry is metadata for the analyst UI and is NOT pushed to Genie.
+
+3. "sql_filters" (array): Reusable WHERE-clause expressions. Each: {{"name": "snake_case_id", "sql": "short_table.column = 'value'", "table": "catalog.schema.table", "display_name": "Friendly Name", "synonyms": ["..."], "description": "..."}}. Example: {{"name": "denied_claims", "sql": "claims.initial_decision = 'DENIED'", "table": "genie_training.claims_analytics.claims", "display_name": "Denied Claims"}}
+
+4. "sql_dimensions" (array): Reusable grouping/SELECT column expressions. Same shape as sql_filters. Example: {{"name": "claim_year", "sql": "YEAR(claims.receipt_date)", "table": "genie_training.claims_analytics.claims", "display_name": "Claim Year"}}
+
+5. "sql_measures" (array): Reusable aggregate expressions (COUNT/SUM/AVG/etc). Same shape. Seed from the analyst's Session 3 SQL Expressions — classify each as filter/dimension/measure based on its SQL (aggregates → measure; WHERE-style predicates → filter; plain column exprs → dimension). Validate syntax and rewrite column references to use the short table prefix (e.g., rewrite `COUNT(CASE WHEN initial_decision = 'DENIED' THEN 1 END) * 100.0 / COUNT(*)` on table `genie_training.claims_analytics.claims` to `COUNT(CASE WHEN claims.initial_decision = 'DENIED' THEN 1 END) * 100.0 / COUNT(claims.*)`).
+
+6. "example_queries" (array, 3-6 items): Full SQL examples for complex/common questions from the question bank. Each: {{"question": "...", "sql": "...", "draft": true, "usage_guidance": "..."}}. SQL MUST use fully qualified `catalog.schema.table` references because example queries are standalone. Only include questions where you can write reasonably confident SQL given the tables in scope — skip speculative ones. Always set "draft": true so analyst reviews.
+
+7. "narrative" (string): 2-4 sentences explaining what this space does, who it serves, and what was configured. Shown to the analyst before push.
+
+Return ONLY the JSON object. No markdown fences, no preamble, no trailing commentary. Begin with {{ and end with }}."""
+
+    return prompt
+
+
+def _call_llm(prompt):
+    """Call the Databricks serving endpoint with the prompt. Returns parsed JSON."""
+    resp = w.serving_endpoints.query(
+        name=LLM_ENDPOINT,
+        messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+        max_tokens=16000,
+        temperature=0.2,
+    )
+    # Response shape varies: SDK object, dict, or OpenAI-style object
+    if isinstance(resp, dict):
+        d = resp
+    elif hasattr(resp, "as_dict"):
+        d = resp.as_dict()
+    else:
+        d = {"choices": [{"message": {"content": resp.choices[0].message.content}}]}
+    content = d["choices"][0]["message"]["content"]
+
+    # Strip markdown fences if model ignored the instruction
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text
+        if text.endswith("```"):
+            text = text.rsplit("\n", 1)[0] if "\n" in text else text[:-3]
+        text = text.strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+
+    return json.loads(text)
+
+
+@app.route("/api/engagements/<eid>/generate-plan", methods=["POST"])
+def generate_plan(eid):
+    """Use the configured LLM to synthesize a Genie Space configuration plan."""
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        return jsonify({"error": "Not found"}), 404
+    eng = parse_row(rows[0])
+
+    try:
+        prompt = _build_plan_prompt(eng)
+        plan = _call_llm(prompt)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[generate-plan] ERROR: {e}\n{tb}", flush=True)
+        return jsonify({
+            "error": f"{type(e).__name__}: {e}",
+            "endpoint": LLM_ENDPOINT,
+            "traceback": tb.splitlines()[-5:],
+        }), 500
+
+    # Normalize shape
+    def _norm_list(v):
+        return v if isinstance(v, list) else []
+
+    general_instructions = str(plan.get("general_instructions", "")).strip()
+    sample_questions = [str(q).strip() for q in _norm_list(plan.get("sample_questions")) if str(q).strip()]
+    sql_filters = _norm_list(plan.get("sql_filters"))
+    sql_dimensions = _norm_list(plan.get("sql_dimensions"))
+    sql_measures = _norm_list(plan.get("sql_measures"))
+    example_queries = _norm_list(plan.get("example_queries"))
+    narrative = str(plan.get("narrative", "")).strip()
+
+    # Belt-and-suspenders: strip any sample_questions / example_queries that
+    # overlap with Session 4 benchmark questions. Benchmarks are the acceptance
+    # test — they MUST NOT appear as configured answers, otherwise Genie just
+    # memorizes them and we lose drift-detection.
+    s4 = eng["sessions"]["4"]
+    benchmark_qs = [
+        (b.get("question") or "").strip()
+        for b in s4.get("benchmark_questions", [])
+        if (b.get("question") or "").strip()
+    ]
+    if benchmark_qs:
+        sample_questions = _strip_benchmark_overlap(sample_questions, benchmark_qs)
+        example_queries = [
+            eq for eq in example_queries
+            if not _question_overlaps(eq.get("question", ""), benchmark_qs)
+        ]
+
+    # Fetch UC PK/FK joins for tables in Session 4's data plan (NOT LLM-generated)
+    scope_tables = [
+        d.get("table_or_view", "")
+        for d in s4.get("data_plan", [])
+        if d.get("include_in_space") == "Yes" and d.get("type") != "Metric View"
+    ]
+    scope_tables = [t for t in scope_tables if t and t.count(".") == 2]
+    # Use the user's OBO client so we respect their table-browse permissions
+    # (the SP may not have BROWSE on customer data tables).
+    user_w = _user_workspace_client()
+    try:
+        joins = _fetch_uc_joins(scope_tables, client=user_w or w)
+    except Exception as e:
+        print(f"[generate-plan] UC join fetch failed: {e}", flush=True)
+        joins = []
+
+    # Persist to session 5
+    ts = now_ts()
+    sql_run(
+        f"UPDATE {TABLE} SET "
+        f"plan_general_instructions = :gi, plan_sample_questions = :sq, "
+        f"plan_sql_filters = :sf, plan_sql_dimensions = :sd, plan_sql_measures = :sm, "
+        f"plan_example_queries = :eq, plan_joins = :jn, "
+        f"plan_narrative = :nar, updated_at = :ts "
+        f"WHERE engagement_id = :eid",
+        {
+            "eid": eid,
+            "gi": general_instructions,
+            "sq": json.dumps(sample_questions),
+            "sf": json.dumps(sql_filters),
+            "sd": json.dumps(sql_dimensions),
+            "sm": json.dumps(sql_measures),
+            "eq": json.dumps(example_queries),
+            "jn": json.dumps(joins),
+            "nar": narrative,
+            "ts": ts,
+        },
+    )
+
+    return jsonify({
+        "general_instructions": general_instructions,
+        "sample_questions": sample_questions,
+        "sql_filters": sql_filters,
+        "sql_dimensions": sql_dimensions,
+        "sql_measures": sql_measures,
+        "example_queries": example_queries,
+        "joins": joins,
+        "narrative": narrative,
+    })
+
+
+# ---------------------------------------------------------------------------
+# API: Benchmark drafting (Session 4)
+# ---------------------------------------------------------------------------
+
+def _build_benchmark_draft_prompt(eng):
+    """Draft benchmark questions from Sessions 1-3 context."""
+    s1 = eng["sessions"]["1"]
+    s2 = eng["sessions"]["2"]
+    s3 = eng["sessions"]["3"]
+    s4 = eng["sessions"]["4"]
+
+    lines = []
+    lines.append(f"Genie Space: {eng.get('genie_space_name', '')}")
+    lines.append("Pain Points:")
+    for pp in s1.get("pain_points", []):
+        lines.append(f"- {pp.get('description', '')}")
+    lines.append("Question Bank (from business owner):")
+    for q in s2.get("question_bank", []):
+        lines.append(f"- {q.get('question') or q.get('text') or ''}")
+    lines.append("Key Metrics / SQL Expressions:")
+    for e in s3.get("sql_expressions", []):
+        lines.append(f"- {e.get('metric_name','')} ({e.get('display_name','')}): `{e.get('sql_code','')}` on {e.get('uc_table','')}")
+    lines.append("Tables in scope:")
+    for d in s4.get("data_plan", []):
+        if d.get("include_in_space") == "Yes":
+            lines.append(f"- {d.get('table_or_view','')}")
+    context = "\n".join(lines)
+
+    return f"""You are drafting benchmark questions for a Databricks Genie Space. Benchmarks are the acceptance-test set — the space will be measured by how many it answers correctly (>80% target). They represent what a business user would actually ask.
+
+<engagement_context>
+{context}
+</engagement_context>
+
+Draft 10-15 benchmark questions. Return a JSON array. Each item:
+{{
+  "question": "Natural-language question a business user would ask",
+  "category": "Core" or "Edge Case",
+  "difficulty": "Easy" or "Medium" or "Hard"
+}}
+
+Rules:
+- About 70% Core (realistic questions from the question bank, pain points, or metrics), 30% Edge Case (ambiguous phrasing, boundary conditions, synonym tests, trick wording).
+- Difficulty reflects SQL complexity: Easy = single table, simple filter; Medium = aggregation + group by; Hard = multi-table joins or subqueries.
+- Cover the core metrics and key pain points. Use the business owner's own vocabulary where possible.
+- Include a mix of time-bound questions (last quarter, YTD) and aggregation styles.
+- Do NOT draft SQL — just the questions. SQL will be drafted per-row later.
+
+Return ONLY the JSON array. No markdown fences, no preamble."""
+
+
+@app.route("/api/engagements/<eid>/draft-benchmarks", methods=["POST"])
+def draft_benchmarks(eid):
+    """Draft benchmark questions from Sessions 1-3 context."""
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        return jsonify({"error": "Not found"}), 404
+    eng = parse_row(rows[0])
+
+    try:
+        prompt = _build_benchmark_draft_prompt(eng)
+        result = _call_llm(prompt)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[draft-benchmarks] ERROR: {e}\n{tb}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+    # Normalize — LLM might return a dict with "benchmarks" key or a raw array
+    if isinstance(result, dict):
+        items = result.get("benchmarks") or result.get("questions") or []
+    else:
+        items = result or []
+
+    drafted = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        q = str(item.get("question", "")).strip()
+        if not q:
+            continue
+        cat = str(item.get("category", "Core")).strip()
+        if cat not in ("Core", "Edge Case"):
+            cat = "Core"
+        diff = str(item.get("difficulty", "Medium")).strip()
+        if diff not in ("Easy", "Medium", "Hard"):
+            diff = "Medium"
+        drafted.append({
+            "question": q,
+            "category": cat,
+            "difficulty": diff,
+            "expected_sql": "",
+            "notes": "",
+            "bo_approved": False,
+        })
+
+    return jsonify({"benchmarks": drafted})
+
+
+@app.route("/api/engagements/<eid>/draft-benchmark-sql", methods=["POST"])
+def draft_benchmark_sql(eid):
+    """Draft SQL for a single benchmark question using Session 3 technical context."""
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        return jsonify({"error": "Not found"}), 404
+    eng = parse_row(rows[0])
+
+    body = request.json or {}
+    question = (body.get("question") or "").strip()
+    if not question:
+        return jsonify({"error": "question is required"}), 400
+
+    s3 = eng["sessions"]["3"]
+    s4 = eng["sessions"]["4"]
+
+    ctx_lines = ["Tables in scope (use these fully qualified):"]
+    for d in s4.get("data_plan", []):
+        if d.get("include_in_space") == "Yes":
+            ctx_lines.append(f"- {d.get('table_or_view','')}")
+    ctx_lines.append("Known SQL expressions / metrics:")
+    for e in s3.get("sql_expressions", []):
+        ctx_lines.append(f"- {e.get('metric_name','')}: `{e.get('sql_code','')}` on {e.get('uc_table','')}")
+    ctx = "\n".join(ctx_lines)
+
+    prompt = f"""Draft the expected SQL answer for one benchmark question. This is the ground-truth SQL that the Genie Space will be scored against.
+
+<context>
+{ctx}
+</context>
+
+Benchmark question:
+{question}
+
+Rules:
+- Use fully qualified table references (catalog.schema.table) — example queries are standalone.
+- Reuse the known SQL expressions where they apply.
+- Return SQL only. No markdown fences, no preamble. If you need CTEs, use WITH. Single statement only."""
+
+    try:
+        resp = w.serving_endpoints.query(
+            name=LLM_ENDPOINT,
+            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+            max_tokens=2000,
+            temperature=0.2,
+        )
+        if isinstance(resp, dict):
+            d = resp
+        elif hasattr(resp, "as_dict"):
+            d = resp.as_dict()
+        else:
+            d = {"choices": [{"message": {"content": resp.choices[0].message.content}}]}
+        sql_text = d["choices"][0]["message"]["content"].strip()
+        # Strip code fences if any
+        if sql_text.startswith("```"):
+            sql_text = sql_text.split("\n", 1)[1] if "\n" in sql_text else sql_text
+            if sql_text.endswith("```"):
+                sql_text = sql_text.rsplit("\n", 1)[0] if "\n" in sql_text else sql_text[:-3]
+            sql_text = sql_text.strip()
+            if sql_text.lower().startswith("sql"):
+                sql_text = sql_text[3:].lstrip()
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+    return jsonify({"sql": sql_text})
+
+
+# ---------------------------------------------------------------------------
+# API: Metric View authoring (Session 3)
+# ---------------------------------------------------------------------------
+
+def _describe_table_columns(fqn, user_w=None, warehouse_id=None):
+    """Return a list of (column_name, data_type) for a three-part UC table.
+
+    When `user_w` + `warehouse_id` are provided, run DESCRIBE via OBO so we
+    inherit the USER's UC grants (required for personal catalogs the app SP
+    can't see). Otherwise fall back to the SP client for back-compat paths.
+    """
+    parts = fqn.split(".")
+    if len(parts) != 3:
+        return []
+    stmt = f"DESCRIBE TABLE `{parts[0]}`.`{parts[1]}`.`{parts[2]}`"
+    rows = []
+    try:
+        if user_w is not None and warehouse_id:
+            resp = user_w.statement_execution.execute_statement(
+                warehouse_id=warehouse_id, statement=stmt,
+            )
+            state = str(resp.status.state) if resp.status else ""
+            if "SUCCEEDED" in state and resp.result and resp.result.data_array and resp.manifest:
+                cols = [c.name for c in resp.manifest.schema.columns]
+                rows = [dict(zip(cols, r)) for r in resp.result.data_array]
+        else:
+            rows = sql_exec(stmt)
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        name = r.get("col_name") or r.get("column_name") or r.get("name") or ""
+        if not name or name.startswith("#"):
+            continue
+        out.append((name, r.get("data_type") or r.get("type") or ""))
+    return out
+
+
+def _collect_engagement_schemas(eng, user_w=None, warehouse_id=None):
+    """Return {fqn: [(col, type), ...]} for every table referenced in Session 3."""
+    tables = set()
+    for e in eng["sessions"]["3"].get("sql_expressions", []):
+        t = (e.get("uc_table") or "").strip()
+        if t and t.count(".") == 2:
+            tables.add(t)
+    for d in eng["sessions"]["4"].get("data_plan", []):
+        t = (d.get("table_or_view") or "").strip()
+        if t and t.count(".") == 2 and d.get("type") != "Metric View":
+            tables.add(t)
+    return {t: _describe_table_columns(t, user_w, warehouse_id) for t in sorted(tables)}
+
+
+def _build_mv_yaml_prompt(eng, user_w=None, warehouse_id=None):
+    """Build the LLM prompt to draft a UC Metric View YAML from Sessions 1-3."""
+    s1 = eng["sessions"]["1"]
+    s2 = eng["sessions"]["2"]
+    s3 = eng["sessions"]["3"]
+
+    schemas = _collect_engagement_schemas(eng, user_w, warehouse_id)
+
+    lines = []
+    lines.append(f"Genie Space: {eng.get('genie_space_name', '')}")
+    lines.append("")
+
+    # S1 business context
+    bc = s1.get("business_context", [])
+    if bc:
+        lines.append("## Business Context (S1)")
+        for b in bc:
+            if isinstance(b, dict):
+                lines.append(f"- **{b.get('topic','')}**: {b.get('detail') or b.get('description') or ''}")
+            else:
+                lines.append(f"- {b}")
+        lines.append("")
+
+    lines.append("## Pain Points (S1)")
+    for pp in s1.get("pain_points", []):
+        lines.append(f"- {pp.get('description', '')}")
+    lines.append("")
+
+    er = s1.get("existing_reports", [])
+    if er:
+        lines.append("## Existing Reports (S1) — metrics analysts already produce today")
+        for r in er:
+            if isinstance(r, dict):
+                lines.append(f"- **{r.get('report_name') or r.get('name','')}**: {r.get('description') or r.get('key_metrics') or ''}")
+            else:
+                lines.append(f"- {r}")
+        lines.append("")
+
+    lines.append("## Business Questions (S2)")
+    for q in s2.get("question_bank", []):
+        lines.append(f"- {q.get('question') or q.get('text') or ''}")
+    lines.append("")
+    lines.append("## Vocabulary & Metric Definitions (S2)")
+    for v in s2.get("vocabulary_metrics", []):
+        lines.append(f"- **{v.get('business_term','')}**: {v.get('definition') or v.get('description') or ''}")
+    lines.append("")
+
+    tc = s3.get("term_classifications", [])
+    if tc:
+        lines.append("## Term Classifications (S3) — how each business term was categorized")
+        for t in tc:
+            if isinstance(t, dict):
+                lines.append(f"- **{t.get('term','')}** → {t.get('classification','')}: {t.get('rationale') or ''}")
+        lines.append("")
+
+    sb = s3.get("scope_boundaries", [])
+    if sb:
+        lines.append("## Scope Boundaries (S3) — what is IN/OUT of scope")
+        for b in sb:
+            if isinstance(b, dict):
+                lines.append(f"- **{b.get('topic','')}** ({b.get('status','')}): {b.get('rationale') or b.get('description') or ''}")
+            else:
+                lines.append(f"- {b}")
+        lines.append("")
+
+    dg = s3.get("data_gaps", [])
+    if dg:
+        lines.append("## Data Gaps (S3) — things the analyst could NOT map; do NOT try to express these")
+        for g in dg:
+            if isinstance(g, dict):
+                lines.append(f"- **{g.get('gap') or g.get('topic','')}**: {g.get('description') or g.get('detail') or ''}")
+            else:
+                lines.append(f"- {g}")
+        lines.append("")
+
+    gf = (s3.get("global_filter") or "").strip()
+    if gf:
+        lines.append("## Global Filter (S3) — THE ANALYST SPECIFIED THIS FILTER APPLIES TO EVERY METRIC")
+        lines.append(f"```\n{gf}\n```")
+        lines.append("Copy this verbatim into the metric view's top-level `filter:` key. Do NOT attempt to restructure or reinterpret it.")
+        lines.append("")
+
+    lines.append("## Table Schemas (authoritative column list — do NOT reference columns not listed here)")
+    for fqn, cols in schemas.items():
+        if not cols:
+            lines.append(f"- `{fqn}`: (schema unavailable — be extra careful, only use columns the analyst explicitly mapped)")
+            continue
+        col_str = ", ".join(f"{c} {t}" for c, t in cols)
+        lines.append(f"- `{fqn}`: {col_str}")
+    lines.append("")
+    lines.append("## Analyst-mapped SQL Expressions (THE CORE INPUT)")
+    for e in s3.get("sql_expressions", []):
+        lines.append(
+            f"- **{e.get('metric_name','')}** on `{e.get('uc_table','')}`: "
+            f"`{e.get('sql_code','')}` "
+            f"(display: {e.get('display_name','')}, synonyms: {e.get('synonyms','')})"
+        )
+    lines.append("")
+    lines.append("## Analyst Text Instructions / Rules (S3)")
+    for t in s3.get("text_instructions", []):
+        lines.append(f"- **{t.get('title','')}**: {t.get('instruction','')}")
+
+    context = "\n".join(lines)
+
+    return f"""You are a Databricks Unity Catalog Metric View expert. An analyst has mapped all the business terms, metrics, and rules. Synthesize a complete, spec-compliant metric view YAML (v1.1) from this discovery.
+
+<engagement_context>
+{context}
+</engagement_context>
+
+<metric_view_yaml_spec>
+Valid TOP-LEVEL keys (and ONLY these):
+- `version: 1.1` (required, literal)
+- `comment` (optional string): description of the metric view
+- `source` (required string): the fact/base table as a three-part UC name (`catalog.schema.table`), OR a SQL query string
+- `filter` (optional string): a SQL boolean expression applied to every query
+- `joins` (optional array): star/snowflake schema joins
+- `dimensions` (array): column definitions usable in SELECT/WHERE/GROUP BY (non-aggregates)
+- `measures` (array): aggregate expression definitions
+- `materialization` (optional): query acceleration config — OMIT unless the analyst explicitly requested it
+
+DO NOT invent keys. There is NO `instructions` key, NO `text_instructions` key, NO `glossary` key. Business rules that are not expressible as a `filter`, dimension, or measure belong on the Genie Space (NOT in the metric view YAML).
+
+DIMENSION fields:
+- `name` (required): the dimension alias. Use snake_case identifiers (lowercase letters, digits, underscores). This is how queries reference the dimension. Do NOT use spaces in `name`.
+- `expr` (required): SQL expression, scalar, NO aggregate functions
+- `comment` (optional): description, appears in Unity Catalog
+- `display_name` (optional, <=255 chars): human-readable label for visualization tools (THIS is where you put "Claim ID", "Receipt Date", etc.)
+- `synonyms` (optional array, up to 10 strings, each <=255 chars): alternative names for LLM tools. PUT ALL SYNONYMS HERE instead of as separate instructions.
+
+MEASURE fields:
+- `name` (required): snake_case identifier. Referenced via `MEASURE(name)` in queries. Do NOT use spaces.
+- `expr` (required): aggregate SQL expression (must include COUNT/SUM/AVG/MAX/MIN/etc). Supports FILTER (WHERE ...) clauses.
+- `comment`, `display_name`, `synonyms`: same as dimensions
+
+JOIN fields:
+- `name` (required): alias for the joined table
+- `source` (required): three-part name of the joined table
+- `on` OR `using` (one required): join condition. Use `source` prefix to refer to the metric view's base source: `on: source.l_orderkey = orders.o_orderkey`
+- `joins` (optional): nested joins for snowflake schemas
+
+FORMATTING rules:
+- Column names with spaces or special chars must be escaped with backticks. If the expression starts with a backtick, wrap the whole value in double quotes.
+- YAML interprets unquoted colons as key-value separators — wrap any expression containing a colon in double quotes.
+- Use `|` block scalar for multi-line expressions.
+
+NAMING convention that has proven reliable:
+- `name`: `snake_case_identifier` — no spaces, no quotes needed
+- `display_name`: `'Human Readable Label'` — quoted, spaces allowed
+- `synonyms`: `['alt1', 'alt2']` — short list
+
+EXAMPLE (follow this structure exactly):
+```
+version: 1.1
+comment: "Claims analytics metric view"
+source: catalog.schema.claims
+filter: voided_flag = 'N' AND test_flag = 'N'
+
+dimensions:
+  - name: claim_id
+    expr: claim_id
+    display_name: 'Claim ID'
+  - name: claim_quarter
+    expr: CONCAT('Q', QUARTER(receipt_date), ' ', YEAR(receipt_date))
+    display_name: 'Claim Quarter'
+    comment: 'Calendar quarter of claim receipt'
+  - name: initial_decision
+    expr: initial_decision
+    display_name: 'Initial Decision'
+    synonyms: ['denial status', 'decision', 'outcome']
+
+measures:
+  - name: total_claims
+    expr: COUNT(1)
+    display_name: 'Total Claims'
+  - name: denied_claims_count
+    expr: COUNT(1) FILTER (WHERE initial_decision = 'DENIED')
+    display_name: 'Denied Claims'
+    synonyms: ['denials', 'rejections']
+  - name: denial_rate_pct
+    expr: COUNT(1) FILTER (WHERE initial_decision = 'DENIED') * 100.0 / COUNT(1)
+    display_name: 'Denial Rate'
+    comment: 'Percent of claims denied on initial adjudication'
+  # Notice: measure name (denial_rate_pct) does NOT collide with any column
+  # referenced in expr (initial_decision). The suffix _pct / _count makes this safe.
+  - name: first_pass_rate_pct
+    expr: COUNT(1) FILTER (WHERE first_pass_flag = 'Y') * 100.0 / COUNT(1)
+    display_name: 'First-Pass Rate'
+```
+</metric_view_yaml_spec>
+
+<rules>
+1. Classify each analyst SQL expression:
+   - Aggregate function (COUNT/SUM/AVG/MAX/MIN/...) in the expression → `measures`
+   - No aggregate (plain column, CASE WHEN, DATE_TRUNC, etc.) → `dimensions`
+2. Rewrite column references to be UNQUALIFIED (no table prefix). The MV already knows its source. Turn `claims.initial_decision` into `initial_decision`. Only keep a prefix if the reference targets a JOINED table via the join's alias.
+3. Put business-term synonyms from the vocabulary into the matching dimension/measure `synonyms:` array. Do NOT emit them as an `instructions` key (that key does not exist).
+4. If the analyst supplied a `## Global Filter` section above, copy that SQL verbatim into the top-level `filter:` key — it is the authoritative filter. If a text instruction adds another data-level predicate (e.g., "exclude test claims" → `test_flag = 'N'`), AND the global filter, combine them with `AND`. Skip text instructions that aren't data filters — those belong on the Genie Space, not the MV.
+5. `name` is a snake_case identifier. `display_name` is the human label.
+6. Prefer `COUNT(1) FILTER (WHERE ...)` over `COUNT(CASE WHEN ... THEN 1 END)` — cleaner and idiomatic.
+7. Pick ONE source table as the primary `source`. Join others via `joins:` with `on:` using `source.<col>` to reference the primary. If there's only one table, omit `joins:` entirely.
+
+CRITICAL: NAME-COLLISION SAFETY (this breaks the view if you get it wrong)
+8. A measure's or dimension's `name` MUST NOT exactly match any column name referenced inside its own `expr`. If it does, Spark resolves the column reference back to the aggregate itself and throws INVALID_AGGREGATE_FILTER.CONTAINS_AGGREGATE.
+   - BAD:  `- name: first_pass_rate`  with `expr: COUNT(1) FILTER (WHERE first_pass_rate = 'Y') * 100.0 / COUNT(1)`
+   - GOOD: `- name: first_pass_rate_pct` with `expr: COUNT(1) FILTER (WHERE first_pass_rate = 'Y') * 100.0 / COUNT(1)`
+   - Rule of thumb: rates/percentages get a `_rate` or `_pct` suffix; counts get a `_count`; sums get a `_total`. Pick a suffix that reads naturally given the analyst's metric name. Derive `display_name` from the analyst's label so the UI still shows the human name.
+9. Two measures/dimensions cannot share the same `name`. A dimension and a measure also cannot share the same name.
+
+SQL LITERAL SAFETY
+10. Always quote string literals in SQL expressions (`'Y'`, `'N'`, `'DENIED'`). Do not emit bare `Y`/`N` — YAML 1.1 parses unquoted `Y`/`N` as booleans and Spark will also misinterpret them as identifiers.
+11. When writing a filter predicate like `claim_type IN ('Professional', 'Facility')`, keep the string literals quoted with single quotes inside the SQL. If the whole YAML value contains colons or backticks, wrap the value in double quotes.
+
+COLUMN EXISTENCE (do NOT hallucinate)
+12. Every bare column reference in any `expr` or `filter` or join `on` MUST be a real column listed under <## Table Schemas> above (or a valid alias from a `joins` block). Do NOT invent columns even if the business vocabulary implies one — if the analyst didn't map it and it's not in the schema list, omit that measure/dimension entirely rather than guessing.
+13. Before emitting the final JSON, mentally walk each `expr` you wrote and verify every bare identifier is either (a) a SQL keyword/function, (b) a literal, or (c) a column present in the source table's schema. If it fails, drop or correct that field.
+</rules>
+
+<self_check>
+After drafting, review your own YAML ONCE before returning it:
+- Every column referenced exists in <## Table Schemas>? Replace or drop any that don't.
+- Every measure name is distinct from all column names it references in its expr? Add `_pct` / `_count` / `_total` suffix if not.
+- All string literals quoted with single quotes? No bare `Y`/`N`?
+- Only the allowed top-level keys (version/comment/source/filter/joins/dimensions/measures/materialization)? No `instructions` key?
+Only after these checks pass, output the final JSON.
+</self_check>
+
+Produce JSON with exactly these fields:
+{{
+  "yaml": "the complete YAML document as a string, starting with 'version: 1.1'",
+  "source_table": "the catalog.schema.table used as the metric view source",
+  "suggested_name": "short_snake_case_mv_name"
+}}
+
+Return ONLY the JSON. No markdown fences, no prose."""
+
+
+def _strip_yaml_fences(yaml_text):
+    yaml_text = (yaml_text or "").strip()
+    if yaml_text.startswith("```"):
+        yaml_text = yaml_text.split("\n", 1)[1] if "\n" in yaml_text else yaml_text
+        if yaml_text.endswith("```"):
+            yaml_text = yaml_text.rsplit("\n", 1)[0] if "\n" in yaml_text else yaml_text[:-3]
+        yaml_text = yaml_text.strip()
+        if yaml_text.lower().startswith("yaml"):
+            yaml_text = yaml_text[4:].lstrip()
+    return yaml_text
+
+
+# SQL keywords / functions the LLM commonly emits as bare tokens. Anything not in
+# here that looks like an identifier is treated as a possible column reference.
+_SQL_KEYWORDS = {
+    "select", "from", "where", "and", "or", "not", "in", "is", "null", "case",
+    "when", "then", "else", "end", "as", "on", "using", "between", "like",
+    "distinct", "filter", "order", "by", "group", "having", "asc", "desc",
+    "cast", "try_cast", "interval", "date", "timestamp", "true", "false",
+    "count", "sum", "avg", "min", "max", "median", "any", "every", "some",
+    "first", "last", "collect_list", "collect_set", "approx_count_distinct",
+    "year", "quarter", "month", "day", "week", "dayofweek", "dayofyear", "hour",
+    "minute", "second", "concat", "coalesce", "nullif", "ifnull", "if",
+    "date_trunc", "date_add", "date_sub", "datediff", "date_format", "to_date",
+    "to_timestamp", "current_date", "current_timestamp", "substring", "substr",
+    "length", "upper", "lower", "trim", "ltrim", "rtrim", "replace", "regexp",
+    "regexp_replace", "regexp_extract", "split", "abs", "round", "floor",
+    "ceil", "ceiling", "greatest", "least", "measure",
+}
+
+
+def _extract_bare_identifiers(expr):
+    """Return lowercase identifiers from an expression that could be column refs."""
+    import re
+    if not expr:
+        return set()
+    # Remove string literals and backtick-escaped names so we only see bare refs
+    cleaned = re.sub(r"'[^']*'", " ", expr)
+    cleaned = re.sub(r"`[^`]*`", " ", cleaned)
+    # Tokens: letters/digits/underscore, but drop pure numbers
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", cleaned)
+    out = set()
+    for t in tokens:
+        tl = t.lower()
+        if tl in _SQL_KEYWORDS:
+            continue
+        # Drop dotted prefixes - we care about final segment for unqualified refs
+        out.add(tl)
+    return out
+
+
+def _validate_yaml_columns(yaml_text, schemas):
+    """
+    Return list of column references that don't exist in the source/join tables.
+    schemas is {fqn: [(col, type), ...]}. Best-effort — returns [] on parse failure.
+    """
+    try:
+        import yaml as pyyaml
+    except Exception:
+        return []
+    try:
+        doc = pyyaml.safe_load(yaml_text)
+    except Exception:
+        return []
+    if not isinstance(doc, dict):
+        return []
+
+    # Build the pool of valid unqualified column names: primary source + all joined tables
+    primary_src = (doc.get("source") or "").strip()
+    join_sources = []
+    for j in (doc.get("joins") or []):
+        if isinstance(j, dict) and j.get("source"):
+            join_sources.append(j["source"].strip())
+
+    valid_cols = set()
+    have_real_schema = False
+    for fqn in [primary_src] + join_sources:
+        if fqn in schemas and schemas[fqn]:
+            have_real_schema = True
+            for c, _t in schemas[fqn]:
+                valid_cols.add(c.lower())
+
+    # If we couldn't fetch schema for ANY of the referenced tables (permissions,
+    # missing warehouse, etc.), skip validation entirely — otherwise every real
+    # column would get flagged as hallucinated.
+    if not have_real_schema:
+        return []
+
+    # Also valid: join aliases (used in "alias.col" prefix form)
+    for j in (doc.get("joins") or []):
+        if isinstance(j, dict) and j.get("name"):
+            valid_cols.add(str(j["name"]).lower())
+    # Special "source" alias used in join ON clauses to refer to the base source
+    valid_cols.add("source")
+    # DO NOT add dimension/measure names — dim/measure exprs resolve against the
+    # source table columns, NOT against sibling dim/measure names. Adding them
+    # creates a false negative where `name: payer_name / expr: payer_name` passes
+    # validation even though `payer_name` is not a real source column.
+
+    missing = set()
+    # Scan every expr and filter
+    def scan(expr):
+        for ident in _extract_bare_identifiers(expr):
+            if ident not in valid_cols:
+                missing.add(ident)
+
+    scan(doc.get("filter") or "")
+    for d in (doc.get("dimensions") or []):
+        if isinstance(d, dict):
+            scan(d.get("expr") or "")
+    for m in (doc.get("measures") or []):
+        if isinstance(m, dict):
+            scan(m.get("expr") or "")
+    for j in (doc.get("joins") or []):
+        if isinstance(j, dict):
+            scan(j.get("on") or "")
+
+    return sorted(missing)
+
+
+@app.route("/api/engagements/<eid>/mv-prompt-preview", methods=["GET"])
+def mv_prompt_preview(eid):
+    """Debug: return the fully-assembled MV YAML prompt for this engagement."""
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        return jsonify({"error": "Not found"}), 404
+    eng = parse_row(rows[0])
+    try:
+        prompt = _build_mv_yaml_prompt(eng)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[mv-prompt-preview] ERROR: {e}\n{tb}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify({"prompt": prompt})
+
+
+@app.route("/api/engagements/<eid>/draft-metric-view-yaml", methods=["POST"])
+def draft_metric_view_yaml(eid):
+    """Draft a UC Metric View YAML from Sessions 1-3."""
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        return jsonify({"error": "Not found"}), 404
+    eng = parse_row(rows[0])
+
+    body = request.json or {}
+    user_w = _user_workspace_client()
+    warehouse_id = (body.get("warehouse_id") or "").strip()
+
+    try:
+        prompt = _build_mv_yaml_prompt(eng, user_w, warehouse_id)
+        result = _call_llm(prompt)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[draft-mv-yaml] ERROR: {e}\n{tb}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+    yaml_text = _strip_yaml_fences(str(result.get("yaml", "")))
+    source_table = str(result.get("source_table", "")).strip()
+    suggested_name = str(result.get("suggested_name", "")).strip()
+
+    # Post-draft sanity check: verify every bare column reference exists.
+    # If any are missing, retry once with a targeted correction prompt.
+    schemas = _collect_engagement_schemas(eng, user_w, warehouse_id)
+    missing = _validate_yaml_columns(yaml_text, schemas)
+    warnings = []
+    if missing:
+        print(f"[draft-mv-yaml] validation found missing columns: {missing}", flush=True)
+        schema_lines = []
+        for fqn, cols in schemas.items():
+            if cols:
+                schema_lines.append(f"- `{fqn}`: {', '.join(c for c, _ in cols)}")
+        fix_prompt = f"""You drafted this metric view YAML, but it references columns that don't exist in the underlying tables.
+
+<your_yaml>
+{yaml_text}
+</your_yaml>
+
+<missing_columns>
+{', '.join(missing)}
+</missing_columns>
+
+<authoritative_schema>
+{chr(10).join(schema_lines)}
+</authoritative_schema>
+
+Rewrite the YAML so every bare column reference in any `expr`, `filter`, or join `on` clause is a column that actually exists in the authoritative schema above. If a missing column represents a concept that cannot be expressed with real columns, DROP that dimension/measure entirely rather than inventing a column. Keep every other rule from the original task (snake_case name fields, no name-column collisions, quoted string literals, only allowed top-level keys).
+
+Return JSON with exactly: {{"yaml": "...", "source_table": "...", "suggested_name": "..."}}. No markdown fences."""
+        try:
+            result2 = _call_llm(fix_prompt)
+            yaml_text2 = _strip_yaml_fences(str(result2.get("yaml", "")))
+            missing2 = _validate_yaml_columns(yaml_text2, schemas)
+            if yaml_text2 and len(missing2) < len(missing):
+                yaml_text = yaml_text2
+                source_table = str(result2.get("source_table", source_table)).strip() or source_table
+                suggested_name = str(result2.get("suggested_name", suggested_name)).strip() or suggested_name
+                if missing2:
+                    warnings.append(
+                        f"Retry still has {len(missing2)} unresolved column(s): {', '.join(missing2)}. "
+                        f"Review the YAML before creating."
+                    )
+            else:
+                warnings.append(
+                    f"Columns referenced in YAML that don't exist in the source table: "
+                    f"{', '.join(missing)}. Fix these before creating the metric view."
+                )
+        except Exception as e:
+            print(f"[draft-mv-yaml] retry failed: {e}", flush=True)
+            warnings.append(
+                f"Columns referenced in YAML that don't exist in the source table: "
+                f"{', '.join(missing)}. Fix these before creating the metric view."
+            )
+
+    return jsonify({
+        "yaml": yaml_text,
+        "source_table": source_table,
+        "suggested_name": suggested_name,
+        "warnings": warnings,
+    })
+
+
+def _sql_exec_obo(user_w, query, warehouse_id, catalog=None, schema=None):
+    """Run a SQL statement using the user's OBO client against their chosen warehouse."""
+    kwargs = {"warehouse_id": warehouse_id, "statement": query}
+    if catalog:
+        kwargs["catalog"] = catalog
+    if schema:
+        kwargs["schema"] = schema
+    resp = user_w.statement_execution.execute_statement(**kwargs)
+    state = resp.status.state if resp.status else None
+    if str(state) not in ("StatementState.SUCCEEDED", "SUCCEEDED"):
+        err = resp.status.error.message if (resp.status and resp.status.error) else "Unknown error"
+        raise RuntimeError(f"Statement failed ({state}): {err}")
+    return resp
+
+
+def _describe_existing_mv_obo(user_w, fqn_quoted, warehouse_id):
+    """Return (exists, owner_or_none) for a view, using the user's OBO creds.
+
+    Owner comes from DESCRIBE TABLE EXTENDED. If the user can't DESCRIBE the
+    object we treat it as non-existent from their perspective (they can't
+    overwrite what they can't see anyway — the CREATE OR REPLACE will still
+    surface the real permission error).
+    """
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id,
+            statement=f"DESCRIBE TABLE EXTENDED {fqn_quoted}",
+        )
+    except Exception:
+        return False, None
+    state = str(resp.status.state) if resp.status else ""
+    if "SUCCEEDED" not in state:
+        return False, None
+    if not (resp.result and resp.result.data_array and resp.manifest):
+        return True, None
+    cols = [c.name for c in resp.manifest.schema.columns]
+    try:
+        col_name_idx = cols.index("col_name")
+        data_type_idx = cols.index("data_type")
+    except ValueError:
+        return True, None
+    owner = None
+    for row in resp.result.data_array:
+        label = (row[col_name_idx] or "").strip()
+        if label.lower() == "owner":
+            owner = (row[data_type_idx] or "").strip() or None
+            break
+    return True, owner
+
+
+@app.route("/api/engagements/<eid>/create-metric-view", methods=["POST"])
+def create_metric_view(eid):
+    """Create (or replace) a UC Metric View from YAML via the user's OBO creds."""
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "No user access token"}), 401
+
+    data = request.json or {}
+    catalog_name = (data.get("catalog") or "").strip()
+    schema_name = (data.get("schema") or "").strip()
+    mv_name = (data.get("name") or "").strip()
+    yaml_body = (data.get("yaml") or "").strip()
+    warehouse_id = (data.get("warehouse_id") or "").strip()
+    overwrite = bool(data.get("overwrite", False))
+
+    if not all([catalog_name, schema_name, mv_name, yaml_body, warehouse_id]):
+        return jsonify({
+            "error": "catalog, schema, name, yaml, and warehouse_id are all required",
+        }), 400
+
+    # Identifier safety: backtick each segment
+    fqn = f"`{catalog_name}`.`{schema_name}`.`{mv_name}`"
+    created_fqn = f"{catalog_name}.{schema_name}.{mv_name}"
+
+    # Existence check via OBO — block silent overwrite unless caller opts in.
+    exists, owner = _describe_existing_mv_obo(user_w, fqn, warehouse_id)
+    if exists and not overwrite:
+        return jsonify({
+            "error": "exists",
+            "exists": True,
+            "fqn": created_fqn,
+            "owner": owner,
+        }), 409
+
+    # Re-run the column validator against the YAML the user is about to push.
+    # The draft step already validates + retries, but the user may have hand-
+    # edited the YAML since. Block the push if we can still prove a column is
+    # hallucinated — much better UX than letting Spark error at CREATE time.
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if rows:
+        eng_for_schema = parse_row(rows[0])
+        schemas = _collect_engagement_schemas(eng_for_schema, user_w, warehouse_id)
+        missing = _validate_yaml_columns(yaml_body, schemas)
+        if missing:
+            return jsonify({
+                "error": (
+                    f"YAML references column(s) that don't exist in the source "
+                    f"table(s): {', '.join(missing)}. Fix the YAML or re-draft, "
+                    f"then try again."
+                ),
+                "missing_columns": missing,
+            }), 400
+
+    # YAML may contain $$ — escape using a unique delimiter if collision
+    delim = "$$"
+    if delim in yaml_body:
+        delim = "$MV_YAML$"
+    stmt = (
+        f"CREATE OR REPLACE VIEW {fqn}\n"
+        f"WITH METRICS\n"
+        f"LANGUAGE YAML\n"
+        f"AS {delim}\n{yaml_body}\n{delim}"
+    )
+
+    try:
+        _sql_exec_obo(user_w, stmt, warehouse_id)
+    except Exception as e:
+        msg = str(e)
+        status = 400
+        lowered = msg.lower()
+        if "permission" in lowered or "privilege" in lowered or "not authorized" in lowered:
+            status = 403
+        return jsonify({"error": f"Failed to create metric view: {msg}"}), status
+
+    # Persist to Session 3 (last-created MV) and auto-add to Session 4 data plan
+    if rows:
+        eng = parse_row(rows[0])
+        s4 = eng["sessions"]["4"]
+        data_plan = list(s4.get("data_plan", []))
+        # Avoid duplicate entry
+        if not any((d.get("table_or_view") == created_fqn) for d in data_plan):
+            data_plan.append({
+                "table_or_view": created_fqn,
+                "type": "Metric View",
+                "include_in_space": "Yes",
+                "notes": "Auto-added from Session 3 metric view creation.",
+            })
+        ts = now_ts()
+        sql_run(
+            f"UPDATE {TABLE} SET data_plan = :dp, metric_view_fqn = :fqn, updated_at = :ts "
+            f"WHERE engagement_id = :eid",
+            {"eid": eid, "dp": json.dumps(data_plan), "fqn": created_fqn, "ts": ts},
+        )
+
+    return jsonify({"success": True, "fqn": created_fqn})
+
+
+# ---------------------------------------------------------------------------
+# API: Push to Genie Space (Session 5)
+# ---------------------------------------------------------------------------
+
+def _snippet_entry(e, include_alias=True):
+    """Build a sql_snippet entry (filter / expression / measure) from an LLM plan item."""
+    sql_code = (e.get("sql") or "").strip()
+    if not sql_code:
+        return None
+    entry = {"id": _gen_hex_id(), "sql": [sql_code]}
+    if include_alias:
+        alias = (e.get("name") or "").strip().lower().replace(" ", "_")
+        if not alias:
+            return None
+        entry["alias"] = alias
+    display_name = (e.get("display_name") or "").strip()
+    if display_name:
+        entry["display_name"] = display_name
+    synonyms = e.get("synonyms") or []
+    if isinstance(synonyms, str):
+        synonyms = [s.strip() for s in synonyms.split(",") if s.strip()]
+    if synonyms:
+        entry["synonyms"] = list(synonyms)
+    return entry
+
+
+def _build_serialized_space(eng, plan):
+    """Build the Genie serialized_space JSON from discovery data + edited plan.
+    `plan` is a dict with: general_instructions, sample_questions,
+    sql_filters, sql_dimensions, sql_measures, example_queries, joins, benchmarks.
+    """
+    s4 = eng["sessions"]["4"]
+
+    general_instructions = plan.get("general_instructions", "") or ""
+    sample_questions = plan.get("sample_questions") or []
+    sql_filters = plan.get("sql_filters") or []
+    sql_dimensions = plan.get("sql_dimensions") or []
+    sql_measures = plan.get("sql_measures") or []
+    example_queries = plan.get("example_queries") or []
+    joins_in = plan.get("joins") or []
+    benchmarks_in = plan.get("benchmarks") or []
+
+    # Strip any sample or example that overlaps with a benchmark — benchmarks are
+    # the acceptance test, they MUST NOT appear as configured answers.
+    benchmark_qs = [
+        (b.get("question") or "").strip()
+        for b in benchmarks_in
+        if (b.get("question") or "").strip()
+    ]
+    if benchmark_qs:
+        sample_questions = _strip_benchmark_overlap(sample_questions, benchmark_qs)
+        example_queries = [
+            eq for eq in example_queries
+            if not _question_overlaps(eq.get("question", ""), benchmark_qs)
+        ]
+
+    # Tables from Session 4 data plan (only items marked "Yes")
+    tables, metric_views = [], []
+    for d in s4.get("data_plan", []):
+        if d.get("include_in_space") != "Yes":
+            continue
+        ident = d.get("table_or_view", "").strip()
+        if not ident or len(ident.split(".")) != 3:
+            continue
+        entry = {"identifier": ident}
+        notes = (d.get("notes") or "").strip()
+        if notes:
+            entry["description"] = [notes]
+        if d.get("type") == "Metric View":
+            metric_views.append(entry)
+        else:
+            tables.append(entry)
+    tables.sort(key=lambda x: x["identifier"])
+    metric_views.sort(key=lambda x: x["identifier"])
+
+    # Sample questions
+    sq_entries = [{"id": _gen_hex_id(), "question": [q]} for q in sample_questions if q]
+    sq_entries.sort(key=lambda x: x["id"])
+
+    # Text instructions (max 1)
+    ti_entries = []
+    if general_instructions.strip():
+        ti_entries.append({"id": _gen_hex_id(), "content": [general_instructions.strip()]})
+
+    # sql_snippets: filters have NO alias; expressions (dimensions) and measures have alias
+    filters_out = sorted(
+        [e for e in (_snippet_entry(x, include_alias=False) for x in sql_filters) if e],
+        key=lambda x: x["id"],
+    )
+    expressions_out = sorted(
+        [e for e in (_snippet_entry(x, include_alias=True) for x in sql_dimensions) if e],
+        key=lambda x: x["id"],
+    )
+    measures_out = sorted(
+        [e for e in (_snippet_entry(x, include_alias=True) for x in sql_measures) if e],
+        key=lambda x: x["id"],
+    )
+
+    # Example queries → example_question_sqls
+    eq_entries = []
+    for q in example_queries:
+        question = (q.get("question") or "").strip()
+        sql_text = (q.get("sql") or "").strip()
+        if not question or not sql_text:
+            continue
+        eq = {"id": _gen_hex_id(), "question": [question], "sql": [sql_text]}
+        guidance = (q.get("usage_guidance") or "").strip()
+        if guidance:
+            eq["usage_guidance"] = [guidance]
+        eq_entries.append(eq)
+    eq_entries.sort(key=lambda x: x["id"])
+
+    # Joins → join_specs (only pushed when backed by UC PK/FK)
+    join_entries = []
+    for j in joins_in:
+        left = (j.get("left_table") or "").strip()
+        right = (j.get("right_table") or "").strip()
+        lcols = j.get("left_columns") or []
+        rcols = j.get("right_columns") or []
+        rel = (j.get("relationship_type") or "MANY_TO_ONE").upper()
+        if not left or not right or not lcols or not rcols:
+            continue
+        left_alias = left.split(".")[-1]
+        right_alias = right.split(".")[-1]
+        conds = [f"{left_alias}.{lc} == {right_alias}.{rc}" for lc, rc in zip(lcols, rcols)]
+        cond = " AND ".join(conds) + "\n"
+        join_entries.append({
+            "id": _gen_hex_id(),
+            "left": {"identifier": left, "alias": left_alias},
+            "right": {"identifier": right, "alias": right_alias},
+            "sql": [cond, f"--rt=FROM_RELATIONSHIP_TYPE_{rel}--"],
+        })
+    join_entries.sort(key=lambda x: x["id"])
+
+    serialized = {
+        "version": 2,
+        "config": {"sample_questions": sq_entries},
+        "data_sources": {"tables": tables},
+        "instructions": {"text_instructions": ti_entries},
+    }
+    if metric_views:
+        serialized["data_sources"]["metric_views"] = metric_views
+
+    sql_snippets = {}
+    if filters_out:
+        sql_snippets["filters"] = filters_out
+    if expressions_out:
+        sql_snippets["expressions"] = expressions_out
+    if measures_out:
+        sql_snippets["measures"] = measures_out
+    if sql_snippets:
+        serialized["instructions"]["sql_snippets"] = sql_snippets
+    if eq_entries:
+        serialized["instructions"]["example_question_sqls"] = eq_entries
+    if join_entries:
+        serialized["instructions"]["join_specs"] = join_entries
+
+    # Benchmarks — top-level key. Only include rows with both question AND SQL.
+    bm_entries = []
+    for b in benchmarks_in:
+        q = (b.get("question") or "").strip()
+        sql = (b.get("expected_sql") or "").strip()
+        if not q or not sql:
+            continue
+        bm_entries.append({
+            "id": _gen_hex_id(),
+            "question": [q],
+            "sql_answer": [sql],
+        })
+    bm_entries.sort(key=lambda x: x["id"])
+    if bm_entries:
+        serialized["benchmarks"] = bm_entries
+
+    return serialized
+
+
+def _genie_api_call(user_w, method, path, body=None):
+    """Make an authenticated Genie REST API call using the user's token (OBO)."""
+    url = f"{user_w.config.host.rstrip('/')}{path}"
+    headers = {
+        "Authorization": f"Bearer {user_w.config.token}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.request(method, url, headers=headers, json=body, timeout=60)
+    if not resp.ok:
+        raise RuntimeError(f"Genie API {method} {path} failed ({resp.status_code}): {resp.text[:500]}")
+    return resp.json() if resp.text else {}
+
+
+@app.route("/api/engagements/<eid>/push-to-genie", methods=["POST"])
+def push_to_genie(eid):
+    """Push the approved plan to a Genie Space (create or update) via OBO."""
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "No user access token available"}), 401
+
+    data = request.json or {}
+    mode = data.get("mode", "existing")  # "existing" or "new"
+    space_id = (data.get("space_id") or "").strip()
+    warehouse_id = (data.get("warehouse_id") or "").strip()
+    new_title = (data.get("new_title") or "").strip()
+    new_description = (data.get("new_description") or "").strip()
+    new_parent_path = (data.get("new_parent_path") or "").strip()
+
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        return jsonify({"error": "Engagement not found"}), 404
+    eng = parse_row(rows[0])
+    s5 = eng["sessions"]["5"]
+
+    # Allow caller to pass edited plan pieces (from UI); fall back to persisted values.
+    s4 = eng["sessions"]["4"]
+    plan = {
+        "general_instructions": data.get("general_instructions") if data.get("general_instructions") is not None else s5.get("plan_general_instructions", ""),
+        "sample_questions":     data.get("sample_questions") if data.get("sample_questions") is not None else s5.get("plan_sample_questions", []),
+        "sql_filters":          data.get("sql_filters") if data.get("sql_filters") is not None else s5.get("plan_sql_filters", []),
+        "sql_dimensions":       data.get("sql_dimensions") if data.get("sql_dimensions") is not None else s5.get("plan_sql_dimensions", []),
+        "sql_measures":         data.get("sql_measures") if data.get("sql_measures") is not None else s5.get("plan_sql_measures", []),
+        "example_queries":      data.get("example_queries") if data.get("example_queries") is not None else s5.get("plan_example_queries", []),
+        "joins":                data.get("joins") if data.get("joins") is not None else s5.get("plan_joins", []),
+        "benchmarks":           s4.get("benchmark_questions", []),
+    }
+
+    if not warehouse_id:
+        return jsonify({"error": "warehouse_id is required"}), 400
+
+    try:
+        serialized = _build_serialized_space(eng, plan)
+    except Exception as e:
+        return jsonify({"error": f"Failed to build payload: {e}"}), 400
+
+    result = {"mode": mode, "warnings": []}
+
+    try:
+        if mode == "new":
+            if not new_title:
+                return jsonify({"error": "new_title is required for create mode"}), 400
+            if not new_parent_path:
+                # Default to the user's workspace folder
+                try:
+                    me = user_w.current_user.me()
+                    new_parent_path = f"/Workspace/Users/{me.user_name}"
+                except Exception:
+                    return jsonify({"error": "new_parent_path could not be defaulted"}), 400
+            body = {
+                "title": new_title,
+                "description": new_description,
+                "parent_path": new_parent_path,
+                "warehouse_id": warehouse_id,
+                "serialized_space": json.dumps(serialized),
+            }
+            resp = _genie_api_call(user_w, "POST", "/api/2.0/genie/spaces", body)
+            space_id = resp.get("space_id", "")
+            result["space_id"] = space_id
+            result["created"] = True
+        else:
+            if not space_id:
+                return jsonify({"error": "space_id is required for update mode"}), 400
+            # PATCH update (per internal Genie API docs)
+            body = {
+                "title": eng.get("genie_space_name", ""),
+                "warehouse_id": warehouse_id,
+                "serialized_space": json.dumps(serialized),
+            }
+            _genie_api_call(user_w, "PATCH", f"/api/2.0/genie/spaces/{space_id}", body)
+            result["space_id"] = space_id
+            result["updated"] = True
+    except Exception as e:
+        return jsonify({"error": str(e), "partial": result}), 500
+
+    space_url = f"{user_w.config.host.rstrip('/')}/genie/rooms/{space_id}"
+    result["space_url"] = space_url
+
+    # Persist push results
+    ts = now_ts()
+    sql_run(
+        f"UPDATE {TABLE} SET "
+        f"genie_space_id = :sid, genie_space_url = :url, "
+        f"genie_space_pushed_at = :pushed, plan_warehouse_id = :wid, "
+        f"updated_at = :ts "
+        f"WHERE engagement_id = :eid",
+        {
+            "eid": eid,
+            "sid": space_id,
+            "url": space_url,
+            "pushed": ts,
+            "wid": warehouse_id,
+            "ts": ts,
+        },
+    )
+
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
