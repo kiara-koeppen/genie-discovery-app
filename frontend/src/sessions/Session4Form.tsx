@@ -8,6 +8,7 @@ import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import PendingIcon from "@mui/icons-material/Pending";
 import ErrorIcon from "@mui/icons-material/Error";
 import EditableTable from "../components/EditableTable";
+import ExpandableTextField from "../components/ExpandableTextField";
 import { api } from "../api";
 import type { ColumnDef } from "../types";
 
@@ -142,14 +143,13 @@ export default function Session4Form({
             Summarize what you learned from the business owner, your technical approach,
             and anything the COE should know when reviewing this engagement.
           </Typography>
-          <TextField
-            multiline
+          <ExpandableTextField
             minRows={6}
-            fullWidth
             placeholder="Describe your findings, approach, and recommendations for the COE..."
             value={data.analyst_commentary || ""}
-            onChange={(e) => onChange("analyst_commentary", e.target.value)}
+            onChange={(v) => onChange("analyst_commentary", v)}
             disabled={readOnly}
+            dialogTitle="Analyst Commentary"
           />
         </AccordionDetails>
       </Accordion>

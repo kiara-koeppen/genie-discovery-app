@@ -151,14 +151,27 @@ def api_user():
 
 @app.route("/api/user/coe-member")
 def api_user_coe_member():
-    """Check if current user is a member of the COE reviewer group."""
+    """Check if current user is a member of the COE reviewer group.
+
+    Resolves the current user to their Databricks user ID, then compares
+    that ID against the group's member `value` field. Comparing on `display`
+    is unreliable because for some workspaces it returns the display name
+    rather than the username/email.
+    """
     email = get_current_user()
     try:
+        users = list(w.users.list(filter=f'userName eq "{email}"'))
+        if not users:
+            return jsonify({"is_member": False})
+        user_id = users[0].id
+
         groups = list(w.groups.list(filter=f'displayName eq "{COE_GROUP}"'))
-        if groups and groups[0].members:
-            for m in groups[0].members:
-                if m.display and m.display.lower() == email.lower():
-                    return jsonify({"is_member": True})
+        if not groups or not groups[0].members:
+            return jsonify({"is_member": False})
+
+        for m in groups[0].members:
+            if m.value == user_id:
+                return jsonify({"is_member": True})
         return jsonify({"is_member": False})
     except Exception:
         return jsonify({"is_member": False})
