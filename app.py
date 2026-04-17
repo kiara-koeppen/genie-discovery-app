@@ -202,6 +202,69 @@ def _user_workspace_client():
     return WC(config=cfg)
 
 
+def _user_is_coe_member(user_w):
+    """True if the OBO user is in COE_GROUP. False on any error."""
+    if not user_w:
+        return False
+    try:
+        me = user_w.current_user.me()
+        for g in (me.groups or []):
+            if g.display == COE_GROUP:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _authorize_engagement(eid):
+    """Gate access to a single engagement row.
+
+    Returns (engagement_dict, None) if the current user is the analyst, the BO,
+    or a COE-group member. Returns (None, flask_error_response) otherwise.
+    COE members get access so they can review engagements for Session 4 approval.
+    """
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        return None, (jsonify({"error": "Not found"}), 404)
+    eng = parse_row(rows[0])
+    current = (get_current_user() or "").strip().lower()
+    analyst = (eng.get("analyst_email") or "").strip().lower()
+    bo = (eng.get("business_owner_email") or "").strip().lower()
+    if current and (current == analyst or current == bo):
+        return eng, None
+    if _user_is_coe_member(_user_workspace_client()):
+        return eng, None
+    return None, (jsonify({"error": "Forbidden"}), 403)
+
+
+import re as _re
+
+_UUID_RE = _re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+@app.before_request
+def _gate_engagement_routes():
+    """Apply _authorize_engagement to every /api/engagements/<eid>[/...] route.
+
+    Catches all the per-session saves, generate-plan, push-to-genie, etc. without
+    having to bolt an auth check onto each handler individually. Only triggers
+    when the path segment after /api/engagements/ looks like an engagement UUID
+    (so sibling routes like /api/engagements/check-name are not mistakenly gated).
+    """
+    path = request.path or ""
+    prefix = "/api/engagements/"
+    if not path.startswith(prefix):
+        return None
+    remainder = path[len(prefix):]
+    if not remainder:
+        return None
+    eid = remainder.split("/", 1)[0]
+    if not _UUID_RE.match(eid):
+        return None
+    _, err = _authorize_engagement(eid)
+    return err
+
+
 @app.route("/api/warehouses")
 def api_warehouses():
     """List SQL warehouses visible to the current user (OBO).
@@ -285,11 +348,26 @@ def api_user_coe_member():
 
 @app.route("/api/engagements", methods=["GET"])
 def list_engagements():
-    rows = sql_exec(
-        f"SELECT engagement_id, genie_space_name, business_owner_name, "
-        f"analyst_name, current_session, status, created_at, updated_at "
-        f"FROM {TABLE} ORDER BY updated_at DESC"
-    )
+    """Return only engagements where the caller is a stakeholder — or all
+    engagements if the caller is a COE-group reviewer.
+    """
+    current = (get_current_user() or "").strip().lower()
+    if _user_is_coe_member(_user_workspace_client()):
+        rows = sql_exec(
+            f"SELECT engagement_id, genie_space_name, business_owner_name, "
+            f"analyst_name, current_session, status, created_at, updated_at "
+            f"FROM {TABLE} ORDER BY updated_at DESC"
+        )
+    else:
+        rows = sql_exec(
+            f"SELECT engagement_id, genie_space_name, business_owner_name, "
+            f"analyst_name, current_session, status, created_at, updated_at "
+            f"FROM {TABLE} "
+            f"WHERE LOWER(TRIM(analyst_email)) = :u "
+            f"   OR LOWER(TRIM(business_owner_email)) = :u "
+            f"ORDER BY updated_at DESC",
+            {"u": current},
+        )
     return jsonify(rows)
 
 
@@ -470,7 +548,20 @@ def save_session_6(eid):
 
 @app.route("/api/engagements/<eid>/coe-approve", methods=["PUT"])
 def coe_approve(eid):
-    """Set COE approval status. Only COE group members should call this."""
+    """Set COE approval status. Server-side enforced: caller must be in COE_GROUP.
+
+    Engagement-existence / stakeholder access is already checked by the
+    before_request gate. This handler additionally requires the caller to be a
+    COE member, so the status cannot be flipped by a direct API call from an
+    analyst or BO.
+    """
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "reauth_required"}), 401
+    if not _user_is_coe_member(user_w):
+        return jsonify({
+            "error": f"Only members of the '{COE_GROUP}' group can approve engagements.",
+        }), 403
     data = request.json
     status = data.get("status", "")
     notes = data.get("notes", "")
@@ -2415,119 +2506,164 @@ def push_to_genie(eid):
 
 # ---------------------------------------------------------------------------
 # API: Unity Catalog metadata
+#
+# ALL endpoints below run under OBO so analysts only see catalogs/schemas/
+# tables/columns/joins that their UC grants permit. The service principal is
+# deliberately NOT used as a fallback, since that would leak metadata the user
+# cannot actually query. If the forwarded token is missing or lacks the
+# catalog.* user scopes, the endpoint returns 401 reauth_required.
 # ---------------------------------------------------------------------------
+
+def _require_obo():
+    """Shared helper for UC endpoints: return a user-OBO client or a 401 response."""
+    user_w = _user_workspace_client()
+    if not user_w:
+        return None, (jsonify({"error": "reauth_required"}), 401)
+    return user_w, None
+
 
 @app.route("/api/uc/catalogs")
 def uc_catalogs():
-    rows = sql_exec("SHOW CATALOGS")
-    return jsonify([r.get("catalog", "") for r in rows if not r.get("catalog", "").startswith("__")])
+    user_w, err = _require_obo()
+    if err:
+        return err
+    try:
+        cats = list(user_w.catalogs.list())
+    except Exception as e:
+        print(f"[/api/uc/catalogs] {type(e).__name__}: {e}", flush=True)
+        return jsonify([])
+    names = [c.name for c in cats if c.name and not c.name.startswith("__")]
+    names.sort(key=str.lower)
+    return jsonify(names)
 
 
 @app.route("/api/uc/schemas")
 def uc_schemas():
+    user_w, err = _require_obo()
+    if err:
+        return err
     catalog = request.args.get("catalog", "")
     if not catalog:
         return jsonify([])
-    rows = sql_exec(f"SHOW SCHEMAS IN `{catalog}`")
-    key = "databaseName" if "databaseName" in (rows[0] if rows else {}) else "namespace"
-    return jsonify([r.get(key, "") for r in rows if r.get(key, "") != "information_schema"])
+    try:
+        schemas = list(user_w.schemas.list(catalog_name=catalog))
+    except Exception as e:
+        print(f"[/api/uc/schemas] {type(e).__name__}: {e}", flush=True)
+        return jsonify([])
+    names = [s.name for s in schemas if s.name and s.name != "information_schema"]
+    names.sort(key=str.lower)
+    return jsonify(names)
 
 
 @app.route("/api/uc/tables")
 def uc_tables():
+    user_w, err = _require_obo()
+    if err:
+        return err
     catalog = request.args.get("catalog", "")
     schema = request.args.get("schema", "")
     if not catalog or not schema:
         return jsonify([])
-    rows = sql_exec(f"SHOW TABLES IN `{catalog}`.`{schema}`")
-    return jsonify([r.get("tableName", "") for r in rows])
+    try:
+        tables = list(user_w.tables.list(catalog_name=catalog, schema_name=schema))
+    except Exception as e:
+        print(f"[/api/uc/tables] {type(e).__name__}: {e}", flush=True)
+        return jsonify([])
+    names = [t.name for t in tables if t.name]
+    names.sort(key=str.lower)
+    return jsonify(names)
 
 
 @app.route("/api/uc/columns")
 def uc_columns():
+    user_w, err = _require_obo()
+    if err:
+        return err
     catalog = request.args.get("catalog", "")
     schema = request.args.get("schema", "")
     table = request.args.get("table", "")
     if not catalog or not schema or not table:
         return jsonify([])
     try:
-        rows = sql_exec(f"DESCRIBE TABLE `{catalog}`.`{schema}`.`{table}`")
-        if not rows:
-            return jsonify([])
-        first = rows[0]
-        name_key = next((k for k in ("col_name", "column_name", "name") if k in first), "col_name")
-        type_key = next((k for k in ("data_type", "type", "Type") if k in first), "data_type")
-        return jsonify([
-            {"name": r.get(name_key, ""), "type": r.get(type_key, "")}
-            for r in rows
-            if r.get(name_key, "") and not r.get(name_key, "").startswith("#")
-        ])
-    except Exception:
+        info = user_w.tables.get(f"{catalog}.{schema}.{table}")
+    except Exception as e:
+        print(f"[/api/uc/columns] {type(e).__name__}: {e}", flush=True)
         return jsonify([])
+    cols = getattr(info, "columns", None) or []
+    return jsonify([
+        {"name": c.name, "type": str(c.type_text or c.type_name or "")}
+        for c in cols if getattr(c, "name", None)
+    ])
 
 
 @app.route("/api/uc/joins")
 def uc_joins():
-    """Auto-detect PK/FK relationships between selected tables."""
+    """Auto-detect PK/FK relationships between selected tables via OBO tables.get()."""
+    user_w, err = _require_obo()
+    if err:
+        return err
     tables = request.args.getlist("table")
     if len(tables) < 2:
         return jsonify([])
-
+    in_scope = set(tables)
     results = []
+    seen = set()
     for tbl in tables:
-        parts = tbl.split(".")
-        if len(parts) != 3:
+        if tbl.count(".") != 2:
             continue
-        cat, sch, name = parts
         try:
-            fk_rows = sql_exec(
-                f"SELECT fk_column_name, pk_table_name, pk_column_name "
-                f"FROM `{cat}`.information_schema.table_constraints tc "
-                f"JOIN `{cat}`.information_schema.key_column_usage kcu "
-                f"ON tc.constraint_name = kcu.constraint_name "
-                f"WHERE tc.table_schema = '{sch}' AND tc.table_name = '{name}' "
-                f"AND tc.constraint_type = 'FOREIGN KEY'"
-            )
-            for fk in fk_rows:
-                pk_table = fk.get("pk_table_name", "")
-                pk_col = fk.get("pk_column_name", "")
-                fk_col = fk.get("fk_column_name", "")
-                if pk_table and pk_col and fk_col:
-                    results.append({
-                        "table": f"{name} -> {pk_table}",
-                        "keys": f"{name}.{fk_col} = {pk_table}.{pk_col}",
-                    })
-        except Exception:
-            pass
-
+            info = user_w.tables.get(tbl)
+        except Exception as e:
+            print(f"[/api/uc/joins] tables.get({tbl}) {type(e).__name__}: {e}", flush=True)
+            continue
+        for c in getattr(info, "table_constraints", None) or []:
+            fk = getattr(c, "foreign_key_constraint", None)
+            if not fk:
+                continue
+            parent = getattr(fk, "parent_table", None)
+            if not parent or parent not in in_scope:
+                continue
+            child_cols = list(getattr(fk, "child_columns", []) or [])
+            parent_cols = list(getattr(fk, "parent_columns", []) or [])
+            key = (tbl, tuple(child_cols), parent, tuple(parent_cols))
+            if key in seen:
+                continue
+            seen.add(key)
+            short_child = tbl.split(".")[-1]
+            short_parent = parent.split(".")[-1]
+            keys_str = " AND ".join(
+                f"{short_child}.{cc} = {short_parent}.{pc}"
+                for cc, pc in zip(child_cols, parent_cols)
+            ) or f"{short_child} = {short_parent}"
+            results.append({
+                "table": f"{short_child} -> {short_parent}",
+                "keys": keys_str,
+            })
     return jsonify(results)
 
 
 @app.route("/api/uc/metric-views")
 def uc_metric_views():
-    """Detect existing metric views in a catalog.schema."""
+    """Detect existing metric views in a catalog.schema via OBO tables.list()."""
+    user_w, err = _require_obo()
+    if err:
+        return err
     catalog_schema = request.args.get("catalog_schema", "")
-    if not catalog_schema or "." not in catalog_schema:
+    if not catalog_schema or catalog_schema.count(".") != 1:
         return jsonify([])
-
-    parts = catalog_schema.split(".")
-    cat, sch = parts[0], parts[1]
+    cat, sch = catalog_schema.split(".", 1)
     try:
-        rows = sql_exec(f"SHOW VIEWS IN `{cat}`.`{sch}`")
-        view_names = [r.get("viewName", "") for r in rows if r.get("viewName", "")]
-        metric_views = []
-        for vn in view_names:
-            try:
-                detail = sql_exec(f"DESCRIBE TABLE EXTENDED `{cat}`.`{sch}`.`{vn}`")
-                for d in detail:
-                    if d.get("col_name", "") == "Type" and "VIEW" in d.get("data_type", "").upper():
-                        metric_views.append(f"{cat}.{sch}.{vn}")
-                        break
-            except Exception:
-                pass
-        return jsonify(metric_views)
-    except Exception:
+        tables = list(user_w.tables.list(catalog_name=cat, schema_name=sch))
+    except Exception as e:
+        print(f"[/api/uc/metric-views] {type(e).__name__}: {e}", flush=True)
         return jsonify([])
+    results = []
+    for t in tables:
+        tt = str(getattr(t, "table_type", "") or "").upper()
+        # True UC metric views show up as METRIC_VIEW; plain SQL views are VIEW.
+        if "METRIC_VIEW" in tt and t.name:
+            results.append(f"{cat}.{sch}.{t.name}")
+    return jsonify(results)
 
 
 # ---------------------------------------------------------------------------

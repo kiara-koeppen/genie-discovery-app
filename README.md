@@ -83,8 +83,11 @@ The app runs as a service principal but deliberately routes most data-plane call
 | Auto-create / migrate the `discovery` table on startup (`ensure_table`) | **App SP** | SP needs `CREATE TABLE` on `<CATALOG>.<SCHEMA>`. |
 | Call the Model Serving LLM endpoint (generate plan, draft SQL, draft MV YAML, summaries) | **App SP** | SP needs `CAN QUERY` on the endpoint. User tokens don't get billed for LLM time; SP does. |
 | List SQL warehouses for the Session 5 dropdown (`/api/warehouses`) | **OBO** | Users should only see warehouses they have access to. Returns 403 `reauth_required` if the `sql` scope is missing. |
+| UC picker: list catalogs / schemas / tables / columns (Session 3) | **OBO** | Each `/api/uc/*` endpoint calls `user_w.catalogs.list()` / `.schemas.list()` / `.tables.list()` / `.tables.get()`. The SP is never a fallback — if the user can't see it, the picker is empty. |
 | `DESCRIBE TABLE` / `SHOW CREATE TABLE` (schema grounding, live MV fetch) | **OBO** | Runs via the user's chosen warehouse; inherits the user's UC SELECT/USE CATALOG grants. |
 | `tables.get()` for PK/FK constraints (Session 5 joins seeding) | **OBO** | UC metadata API. Needs the `catalog.tables:read` user scope (see Step 2b). |
+| List engagements / read / write / delete engagement (Sessions 1–6) | **App SP for DB, OBO for authz** | The SP writes to the `discovery` Delta table, but every `/api/engagements/<eid>` request is gated by a before-request hook that only lets through the recorded `analyst_email`, `business_owner_email`, or a COE-group member. Cross-user tampering is blocked at the API layer. |
+| COE approval (Session 4 "Approve/Request Changes") | **OBO** | `/api/engagements/<eid>/coe-approve` rejects with 403 unless the caller is a live COE group member (not just hidden in the UI). |
 | Execute benchmark SQL (Session 4 "Run" button) | **OBO** | User's query, user's warehouse, user's data grants. The app never runs arbitrary user-authored SQL under the SP. |
 | Create / update / patch Genie Spaces (Session 5 "Push") | **OBO** | Uses the Genie REST API on the user's behalf so their `CAN MANAGE` on the space governs whether the push succeeds. The SP does not manage Genie spaces. |
 | Create/replace UC Metric Views (Session 3 "Create MV") | **OBO** | User's grants govern whether they can create the view and whether it overwrites an existing one they don't own. |
@@ -101,7 +104,7 @@ Practical upshot: if a user can't see a table in the SQL editor, they can't pull
 Frontend (React + Vite + MUI)    Backend (Flask)             Storage / Services
 -------------------------        -------------------         ---------------------
 React SPA                  -->   REST API             -->    Unity Catalog (Delta)
-  - 6 session forms                - CRUD + auth              engagements table
+  - 6 session forms                - CRUD + auth              `discovery` table
   - UC pickers                     - OBO passthrough       -->Warehouse (SQL exec)
   - Benchmark runner               - Prompt builders       -->Model Serving (LLM)
   - Join editor                    - Genie REST proxy      -->Genie REST API
@@ -215,6 +218,8 @@ databricks apps update genie-discovery --profile <profile> --json '{
   "name": "genie-discovery",
   "user_api_scopes": [
     "sql",
+    "catalog.catalogs:read",
+    "catalog.schemas:read",
     "catalog.tables:read",
     "dashboards.genie"
   ]
@@ -225,8 +230,12 @@ databricks apps update genie-discovery --profile <profile> --json '{
 
 What each scope unlocks:
 - `sql` — list warehouses, run `DESCRIBE TABLE` / `SHOW CREATE TABLE` for schema grounding, execute benchmark SQL.
-- `catalog.tables:read` — read UC table constraints (PK/FK) for the Session 5 joins section via `tables.get()`. Without this, the joins table will be empty and users will have to define every join manually.
+- `catalog.catalogs:read` — list catalogs the user can see (Session 3 UC picker top-level).
+- `catalog.schemas:read` — list schemas inside a catalog (Session 3 UC picker second level).
+- `catalog.tables:read` — list tables, read columns via `tables.get()`, and read PK/FK constraints for the Session 5 joins section. Without this, most of Session 3 and the auto-seeded joins in Session 5 go blank.
 - `dashboards.genie` — create/update Genie Spaces via the Genie REST API on the user's behalf.
+
+> **Everything UC-related runs under the user's OBO token on purpose.** The service principal is not used as a fallback for UC reads — if a user lacks a grant, they'll see the error rather than silently inheriting SP permissions.
 
 After updating scopes, existing users will see an OAuth re-consent prompt on next load. If a user reports the warehouse dropdown is empty and the app returns "reauth_required", have them sign out (or open the app URL in a private window) to trigger the new-scope consent flow.
 
@@ -278,7 +287,7 @@ databricks apps deploy genie-discovery \
 ### Step 5 — First-run sanity check
 
 1. Open the app URL printed by the deploy command.
-2. The backend's `ensure_columns()` creates the engagement Delta table on first startup — confirm it shows up at `<CATALOG>.<SCHEMA>.engagements`.
+2. The backend's `ensure_table()` creates the engagement Delta table on first startup — confirm it shows up at `<CATALOG>.<SCHEMA>.discovery`.
 3. Click "New Engagement" and verify catalogs from your workspace show up in the UC picker in Session 3.
 4. Confirm a COE group member sees approval buttons in Session 4; non-members can view but not approve.
 5. Open Session 4, click "Draft N Benchmarks", then "Draft All Expected SQL", then "Run All SQL" to verify the OBO + warehouse + LLM pipeline works end-to-end.
@@ -308,7 +317,7 @@ All config lives in `app.yaml`:
 | `COE_GROUP_NAME` | Databricks group whose members gate Session 4 approval |
 | `LLM_ENDPOINT_NAME` | Model Serving endpoint (chat-completion-compatible) used by every AI button |
 
-The app auto-adds any missing Delta columns on startup via `ensure_columns()`, so schema migrations happen transparently when you pull updates.
+The app auto-creates the engagement table and adds any missing Delta columns on startup via `ensure_table()`, so schema migrations happen transparently when you pull updates.
 
 ## Status
 

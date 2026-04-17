@@ -25,7 +25,7 @@ env:
 
   # REQUIRED. Schema under CATALOG where the engagement table is auto-created.
   # The schema must exist before first run; the table itself is created and
-  # maintained automatically by ensure_columns() on app startup.
+  # maintained automatically by ensure_table() on app startup.
   - name: SCHEMA
     value: "<your-schema>"
 
