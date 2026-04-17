@@ -25,6 +25,16 @@ export interface UcJoin {
   source: string;
 }
 
+export interface BenchmarkSampleResult {
+  ran_at: string;
+  columns: string[];
+  rows: unknown[][];
+  row_count: number;
+  truncated: boolean;
+  limit: number;
+  error?: string;
+}
+
 export interface BenchmarkQuestion {
   question: string;
   category: "Core" | "Edge Case";
@@ -32,6 +42,7 @@ export interface BenchmarkQuestion {
   expected_sql: string;
   notes?: string;
   bo_approved?: boolean;
+  sample_result?: BenchmarkSampleResult;
 }
 
 async function json<T>(url: string, opts?: RequestInit): Promise<T> {
@@ -89,21 +100,41 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  draftBenchmarks: (id: string) =>
+  draftBenchmarks: (id: string, count?: number) =>
     json<{ benchmarks: BenchmarkQuestion[] }>(`/engagements/${id}/draft-benchmarks`, {
       method: "POST",
+      body: JSON.stringify({ count: count ?? 12 }),
     }),
 
-  draftBenchmarkSql: (id: string, question: string) =>
-    json<{ sql: string }>(`/engagements/${id}/draft-benchmark-sql`, {
+  draftBenchmarkSql: (id: string, question: string, warehouse_id?: string) =>
+    json<{ sql: string; explanation?: string }>(`/engagements/${id}/draft-benchmark-sql`, {
       method: "POST",
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, warehouse_id: warehouse_id || "" }),
+    }),
+
+  draftBenchmarkSummary: (id: string, question: string, sql: string) =>
+    json<{ explanation: string }>(`/engagements/${id}/draft-benchmark-summary`, {
+      method: "POST",
+      body: JSON.stringify({ question, sql }),
+    }),
+
+  runBenchmarkSql: (id: string, sql: string, warehouse_id: string) =>
+    json<{
+      columns?: string[];
+      rows?: unknown[][];
+      row_count?: number;
+      truncated?: boolean;
+      limit?: number;
+      error?: string;
+    }>(`/engagements/${id}/run-benchmark-sql`, {
+      method: "POST",
+      body: JSON.stringify({ sql, warehouse_id }),
     }),
 
   getAutoSummary: (id: string) =>
     json<{ summary: string }>(`/engagements/${id}/auto-summary`),
 
-  generatePlan: (id: string) =>
+  generatePlan: (id: string, warehouse_id?: string) =>
     json<{
       general_instructions: string;
       sample_questions: string[];
@@ -113,7 +144,11 @@ export const api = {
       example_queries: ExampleQuery[];
       joins: UcJoin[];
       narrative: string;
-    }>(`/engagements/${id}/generate-plan`, { method: "POST" }),
+      warnings?: string[];
+    }>(`/engagements/${id}/generate-plan`, {
+      method: "POST",
+      body: JSON.stringify({ warehouse_id: warehouse_id || "" }),
+    }),
 
   draftMetricViewYaml: (id: string, warehouse_id?: string) =>
     json<{ yaml: string; source_table: string; suggested_name: string; warnings?: string[] }>(

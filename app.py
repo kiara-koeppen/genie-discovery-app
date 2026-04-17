@@ -180,14 +180,29 @@ def _user_workspace_client():
 
 @app.route("/api/warehouses")
 def api_warehouses():
-    """List SQL warehouses visible to the current user (OBO)."""
+    """List SQL warehouses visible to the current user (OBO).
+
+    OBO-only so users only see warehouses they actually have access to. If the
+    user's token is missing the `sql` scope (common after app scope changes
+    until the user re-authorizes), return a 403 with an actionable message —
+    do NOT fall back to the SP client, which would let users pick warehouses
+    they can't execute against.
+    """
     user_w = _user_workspace_client()
     if not user_w:
         return jsonify({"error": "No user access token"}), 401
     try:
         whs = list(user_w.warehouses.list())
     except Exception as e:
-        return jsonify({"error": f"Failed to list warehouses: {e}"}), 500
+        tb = traceback.format_exc()
+        print(f"[/api/warehouses] ERROR: {type(e).__name__}: {e}\n{tb}", flush=True)
+        msg = str(e)
+        if "does not have required scopes" in msg or "PermissionDenied" in type(e).__name__:
+            return jsonify({
+                "error": "Your app authorization is missing the `sql` scope. Please sign out of the app (or open in a private window) and re-authorize when prompted.",
+                "reauth_required": True,
+            }), 403
+        return jsonify({"error": f"Failed to list warehouses: {type(e).__name__}: {e}"}), 500
     out = []
     for wh in whs:
         out.append({
@@ -544,21 +559,30 @@ def _fetch_uc_joins(table_fqns, client=None):
     in_scope = set(table_fqns)
     joins = []
     seen = set()
+    print(f"[joins] in-scope tables: {list(in_scope)}", flush=True)
     for fqn in table_fqns:
         try:
             info = c_client.tables.get(fqn)
         except Exception as e:
-            print(f"[joins] tables.get({fqn}) failed: {e}", flush=True)
+            print(f"[joins] tables.get({fqn}) failed: {type(e).__name__}: {e}", flush=True)
             continue
         constraints = getattr(info, "table_constraints", None) or []
-        print(f"[joins] {fqn}: {len(constraints)} constraint(s)", flush=True)
+        pk_count = sum(1 for c in constraints if getattr(c, "primary_key_constraint", None))
+        fk_count = sum(1 for c in constraints if getattr(c, "foreign_key_constraint", None))
+        print(
+            f"[joins] {fqn}: {len(constraints)} constraint(s) (PK={pk_count}, FK={fk_count})",
+            flush=True,
+        )
         for c in constraints:
             fk = getattr(c, "foreign_key_constraint", None)
             if not fk:
                 continue
             parent_fqn = getattr(fk, "parent_table", None)
             if not parent_fqn or parent_fqn not in in_scope:
-                print(f"[joins] FK on {fqn} references {parent_fqn} (out of scope)", flush=True)
+                print(
+                    f"[joins] FK on {fqn} references {parent_fqn} (out of scope; in-scope list = {sorted(in_scope)})",
+                    flush=True,
+                )
                 continue
             child_cols = list(getattr(fk, "child_columns", []) or [])
             parent_cols = list(getattr(fk, "parent_columns", []) or [])
@@ -574,6 +598,7 @@ def _fetch_uc_joins(table_fqns, client=None):
                 "relationship_type": "MANY_TO_ONE",
                 "source": "uc_foreign_key",
             })
+    print(f"[joins] returning {len(joins)} join(s)", flush=True)
     return joins
 
 
@@ -606,8 +631,15 @@ def _strip_benchmark_overlap(questions, benchmarks):
     return [q for q in questions if not _question_overlaps(q, benchmarks)]
 
 
-def _build_plan_prompt(eng):
-    """Build the LLM prompt from sessions 1-4 discovery data."""
+def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
+    """Build the LLM prompt from sessions 1-4 discovery data.
+
+    `schemas`: optional {fqn: [(col, type), ...]} dict with real UC column
+    lists so the LLM cannot hallucinate columns.
+    `mv_definitions`: optional {fqn: ddl_string} dict with the live UC
+    Metric View definitions fetched via SHOW CREATE TABLE. Takes precedence
+    over any YAML stored in Session 3.
+    """
     s1 = eng["sessions"]["1"]
     s2 = eng["sessions"]["2"]
     s3 = eng["sessions"]["3"]
@@ -666,12 +698,65 @@ def _build_plan_prompt(eng):
         if d.get("include_in_space") == "Yes":
             lines.append(f"- `{d.get('table_or_view','')}` ({d.get('type','')}): {d.get('notes','')}")
 
+    # Collect every Metric View included in Session 4's data plan. Prefer the
+    # LIVE UC definition (fetched by the caller via SHOW CREATE TABLE) over the
+    # YAML stored in Session 3 — the analyst may be pointing at a pre-existing
+    # MV, or the MV may have been edited in UC after Session 3. Session 3 YAML
+    # is the fallback so we still work offline / without a warehouse.
+    mv_fqns_in_scope = [
+        (d.get("table_or_view") or "").strip()
+        for d in s4.get("data_plan", [])
+        if d.get("include_in_space") == "Yes"
+        and d.get("type") == "Metric View"
+        and (d.get("table_or_view") or "").strip()
+    ]
+    s3_mv_fqn = (s3.get("metric_view_fqn") or "").strip()
+    s3_mv_yaml = (s3.get("metric_view_yaml") or "").strip()
+
+    mv_defs_for_prompt = {}
+    for fqn in mv_fqns_in_scope:
+        live = (mv_definitions or {}).get(fqn, "").strip()
+        if live:
+            mv_defs_for_prompt[fqn] = ("UC SHOW CREATE TABLE (live)", live)
+        elif fqn == s3_mv_fqn and s3_mv_yaml:
+            mv_defs_for_prompt[fqn] = ("Session 3 YAML draft (fallback)", s3_mv_yaml)
+
+    mv_block = ""
+    if mv_defs_for_prompt:
+        parts = []
+        for fqn, (src, body) in mv_defs_for_prompt.items():
+            parts.append(f"### Metric View: `{fqn}` — source: {src}\n```\n{body}\n```")
+        joined_mvs = "\n\n".join(parts)
+        mv_block = f"""
+<metric_view_definitions>
+The Genie Space uses the following governed Metric View(s). The measures, dimensions, calcs, and filters defined IN these definitions are already governed concepts — Genie picks them up from the MV itself.
+
+STRICT RULES:
+- Do NOT emit sql_measures that duplicate any `measures:` in a definition below (by name, business meaning, or SQL expression).
+- Do NOT emit sql_dimensions that duplicate any `dimensions:` or `calcs:` in a definition below.
+- Do NOT emit sql_filters that duplicate any semantics already expressible via the MV's dimensions/calcs.
+- sql_filters / sql_dimensions / sql_measures you DO emit must be SUPPLEMENTARY — either for the raw tables in scope that aren't covered by any MV, OR for concepts genuinely missing from the MVs.
+- example_queries may reference a Metric View using its FQN — this is preferred over joining raw tables when the MV answers the question.
+
+{joined_mvs}
+</metric_view_definitions>
+"""
+
     # Collect benchmark questions for the negative rule
     benchmark_qs = [
         (b.get("question") or "").strip()
         for b in s4.get("benchmark_questions", [])
         if (b.get("question") or "").strip()
     ]
+
+    # Collect BO-approved benchmarks with SQL as gold-standard style exemplars
+    gold_standards = []
+    for b in s4.get("benchmark_questions", []):
+        q = (b.get("question") or "").strip()
+        sql = (b.get("expected_sql") or "").strip()
+        notes = (b.get("notes") or "").strip()
+        if q and sql and b.get("bo_approved"):
+            gold_standards.append({"question": q, "sql": sql, "notes": notes})
 
     discovery = "\n".join(lines)
 
@@ -685,12 +770,46 @@ These are the acceptance-test questions the space will be evaluated against. Do 
 </benchmark_questions>
 """
 
+    gold_block = ""
+    if gold_standards:
+        parts = []
+        for g in gold_standards:
+            part = f"-- Q: {g['question']}\n{g['sql']}"
+            if g["notes"]:
+                part = f"-- Notes: {g['notes']}\n" + part
+            parts.append(part)
+        joined_sql = "\n\n".join(parts)
+        gold_block = f"""
+<gold_standard_queries>
+The following SQL queries were validated by the business owner during Session 4 as correct, high-quality answers to benchmark questions. Use them as STYLE and STRUCTURE exemplars when writing example_queries and SQL snippets: column qualification conventions, filter patterns, date-arithmetic syntax, grouping choices, and formatting. Do NOT copy them verbatim into example_queries or sample_questions (they are acceptance tests for the space — see <benchmark_questions>). Mirror their style on DIFFERENT questions.
+{joined_sql}
+</gold_standard_queries>
+"""
+
+    schemas_block = ""
+    if schemas:
+        schema_parts = []
+        for fqn in sorted(schemas.keys()):
+            cols = schemas[fqn]
+            if not cols:
+                schema_parts.append(f"Table `{fqn}`: (schema unavailable)")
+                continue
+            col_lines = "\n".join(f"  - {name} {dtype}" for name, dtype in cols)
+            schema_parts.append(f"Table `{fqn}`:\n{col_lines}")
+        joined_schemas = "\n\n".join(schema_parts)
+        schemas_block = f"""
+<table_schemas>
+These are the ACTUAL columns that exist on each in-scope table (from UC DESCRIBE). Every column referenced in sql_filters / sql_dimensions / sql_measures / example_queries MUST appear below. Do NOT invent columns. If a needed column does not exist, omit that snippet or example rather than hallucinating.
+{joined_schemas}
+</table_schemas>
+"""
+
     prompt = f"""You are a Databricks Genie Space configuration expert. An analyst just completed 4 sessions of discovery with a business owner. Use this discovery to populate every instruction surface Genie supports.
 
 <discovery_data>
 {discovery}
 </discovery_data>
-{benchmarks_block}
+{mv_block}{schemas_block}{gold_block}{benchmarks_block}
 Genie Space instruction surfaces (in order of preference per Databricks best practices):
 1. SQL Expressions (Filters / Dimensions / Measures) — reusable business concepts attached to a table
 2. Example SQL queries — full SQL for complex or frequent questions
@@ -765,8 +884,82 @@ def generate_plan(eid):
         return jsonify({"error": "Not found"}), 404
     eng = parse_row(rows[0])
 
+    body = request.get_json(silent=True) or {}
+    warehouse_id = (body.get("warehouse_id") or "").strip()
+
+    warnings = []
+    s4 = eng["sessions"]["4"]
+
+    # Resolve in-scope raw tables (metric views excluded from DESCRIBE since they
+    # live in UC but their columns are derived — the prompt still references the
+    # MV FQN from the data plan separately).
+    scope_tables = [
+        d.get("table_or_view", "")
+        for d in s4.get("data_plan", [])
+        if d.get("include_in_space") == "Yes" and d.get("type") != "Metric View"
+    ]
+    scope_tables = [t for t in scope_tables if t and t.count(".") == 2]
+
+    scope_mv_fqns = [
+        (d.get("table_or_view") or "").strip()
+        for d in s4.get("data_plan", [])
+        if d.get("include_in_space") == "Yes" and d.get("type") == "Metric View"
+    ]
+    scope_mv_fqns = [t for t in scope_mv_fqns if t and t.count(".") == 2]
+
+    user_w = _user_workspace_client()
+
+    # Resolve a warehouse once; both schema DESCRIBE and MV SHOW CREATE TABLE
+    # need it under OBO. Prefer UI-supplied warehouse_id, else first visible.
+    wh_to_use = warehouse_id
+    if not wh_to_use and user_w is not None and (scope_tables or scope_mv_fqns):
+        try:
+            whs = list(user_w.warehouses.list())
+            if whs:
+                wh_to_use = whs[0].id
+                print(f"[generate-plan] auto-selected warehouse {wh_to_use}", flush=True)
+        except Exception as e:
+            print(f"[generate-plan] warehouse auto-select failed: {e}", flush=True)
+
+    # Fetch real UC column schemas to ground the prompt.
+    schemas = {}
+    if scope_tables:
+        if wh_to_use:
+            try:
+                for t in scope_tables:
+                    schemas[t] = _describe_table_columns(t, user_w, wh_to_use)
+                missing = [t for t, cols in schemas.items() if not cols]
+                if missing:
+                    warnings.append(
+                        f"Could not describe {len(missing)} table(s) under your permissions: "
+                        + ", ".join(missing[:3]) + ("..." if len(missing) > 3 else "")
+                    )
+            except Exception as e:
+                print(f"[generate-plan] schema fetch failed: {e}", flush=True)
+                warnings.append("Schema grounding failed; LLM may hallucinate columns. See server logs.")
+        else:
+            warnings.append("No warehouse available for schema grounding; LLM may hallucinate columns.")
+
+    # Fetch live Metric View definitions from UC so the LLM sees the real,
+    # current measures/dimensions/filters — not a potentially-stale Session 3
+    # draft. Falls back to Session 3 YAML inside _build_plan_prompt.
+    mv_definitions = {}
+    if scope_mv_fqns and wh_to_use:
+        for fqn in scope_mv_fqns:
+            ddl = _fetch_metric_view_definition(fqn, user_w, wh_to_use)
+            if ddl:
+                mv_definitions[fqn] = ddl
+        missing_mvs = [f for f in scope_mv_fqns if f not in mv_definitions]
+        if missing_mvs:
+            warnings.append(
+                "Could not fetch live definition for "
+                f"{len(missing_mvs)} metric view(s) from UC: "
+                + ", ".join(missing_mvs[:3]) + ("..." if len(missing_mvs) > 3 else "")
+                + ". Falling back to Session 3 YAML if available."
+            )
+
     try:
-        prompt = _build_plan_prompt(eng)
+        prompt = _build_plan_prompt(eng, schemas=schemas, mv_definitions=mv_definitions)
         plan = _call_llm(prompt)
     except Exception as e:
         tb = traceback.format_exc()
@@ -793,34 +986,42 @@ def generate_plan(eid):
     # overlap with Session 4 benchmark questions. Benchmarks are the acceptance
     # test — they MUST NOT appear as configured answers, otherwise Genie just
     # memorizes them and we lose drift-detection.
-    s4 = eng["sessions"]["4"]
     benchmark_qs = [
         (b.get("question") or "").strip()
         for b in s4.get("benchmark_questions", [])
         if (b.get("question") or "").strip()
     ]
     if benchmark_qs:
+        before_sq = len(sample_questions)
         sample_questions = _strip_benchmark_overlap(sample_questions, benchmark_qs)
+        stripped_sq = before_sq - len(sample_questions)
+
+        before_eq = len(example_queries)
         example_queries = [
             eq for eq in example_queries
             if not _question_overlaps(eq.get("question", ""), benchmark_qs)
         ]
+        stripped_eq = before_eq - len(example_queries)
 
-    # Fetch UC PK/FK joins for tables in Session 4's data plan (NOT LLM-generated)
-    scope_tables = [
-        d.get("table_or_view", "")
-        for d in s4.get("data_plan", [])
-        if d.get("include_in_space") == "Yes" and d.get("type") != "Metric View"
-    ]
-    scope_tables = [t for t in scope_tables if t and t.count(".") == 2]
-    # Use the user's OBO client so we respect their table-browse permissions
-    # (the SP may not have BROWSE on customer data tables).
-    user_w = _user_workspace_client()
+        if stripped_sq:
+            warnings.append(
+                f"Removed {stripped_sq} sample question(s) that overlapped with Session 4 benchmarks."
+            )
+        if stripped_eq:
+            warnings.append(
+                f"Removed {stripped_eq} example query/queries that overlapped with Session 4 benchmarks."
+            )
+
+    # Fetch UC PK/FK joins for tables in Session 4's data plan (NOT LLM-generated).
+    # Preserve any manually-entered joins the analyst already saved in Session 5.
+    existing_joins = eng["sessions"]["5"].get("plan_joins") or []
+    manual_joins = [j for j in existing_joins if j.get("source") == "manual"]
     try:
-        joins = _fetch_uc_joins(scope_tables, client=user_w or w)
+        uc_joins = _fetch_uc_joins(scope_tables, client=user_w or w)
     except Exception as e:
         print(f"[generate-plan] UC join fetch failed: {e}", flush=True)
-        joins = []
+        uc_joins = []
+    joins = uc_joins + manual_joins
 
     # Persist to session 5
     ts = now_ts()
@@ -854,6 +1055,7 @@ def generate_plan(eid):
         "example_queries": example_queries,
         "joins": joins,
         "narrative": narrative,
+        "warnings": warnings,
     })
 
 
@@ -861,7 +1063,7 @@ def generate_plan(eid):
 # API: Benchmark drafting (Session 4)
 # ---------------------------------------------------------------------------
 
-def _build_benchmark_draft_prompt(eng):
+def _build_benchmark_draft_prompt(eng, count=12):
     """Draft benchmark questions from Sessions 1-3 context."""
     s1 = eng["sessions"]["1"]
     s2 = eng["sessions"]["2"]
@@ -885,27 +1087,38 @@ def _build_benchmark_draft_prompt(eng):
             lines.append(f"- {d.get('table_or_view','')}")
     context = "\n".join(lines)
 
+    overgen = count + 10
     return f"""You are drafting benchmark questions for a Databricks Genie Space. Benchmarks are the acceptance-test set — the space will be measured by how many it answers correctly (>80% target). They represent what a business user would actually ask.
 
 <engagement_context>
 {context}
 </engagement_context>
 
-Draft 10-15 benchmark questions. Return a JSON array. Each item:
+Your task: return exactly {count} benchmark questions, ranked by importance. If the business owner only got to test {count} questions, these should be the {count} that best prove whether the Genie Space works for their real job.
+
+Method (do this silently — do not output your working):
+1. First brainstorm a candidate pool of ~{overgen} plausible benchmark questions covering the full engagement context.
+2. Score each candidate on: coverage of pain points, alignment with the BO's own question bank phrasing, reuse of the key metrics the analyst mapped, coverage of in-scope tables, and realism as a question a business user would actually ask.
+3. From the {overgen} candidates, pick the top {count} by overall value. Drop duplicates, near-duplicates, and low-value questions.
+4. Order the final {count} from highest-value to lowest-value.
+
+Final output — a JSON array with exactly {count} items. Each item:
 {{
   "question": "Natural-language question a business user would ask",
   "category": "Core" or "Edge Case",
   "difficulty": "Easy" or "Medium" or "Hard"
 }}
 
-Rules:
-- About 70% Core (realistic questions from the question bank, pain points, or metrics), 30% Edge Case (ambiguous phrasing, boundary conditions, synonym tests, trick wording).
+Constraints on the final {count}:
+- Every major pain point is tested at least once.
+- Every in-scope table appears in at least one question.
+- About 70% Core (realistic questions), 30% Edge Case (ambiguous phrasing, boundary conditions, synonym tests, trick wording).
 - Difficulty reflects SQL complexity: Easy = single table, simple filter; Medium = aggregation + group by; Hard = multi-table joins or subqueries.
-- Cover the core metrics and key pain points. Use the business owner's own vocabulary where possible.
-- Include a mix of time-bound questions (last quarter, YTD) and aggregation styles.
+- Include a mix of time-bound (last quarter, YTD) and aggregation styles.
+- Prefer the business owner's own phrasing when a matching question exists in their question bank.
 - Do NOT draft SQL — just the questions. SQL will be drafted per-row later.
 
-Return ONLY the JSON array. No markdown fences, no preamble."""
+Return ONLY the JSON array of {count} final picks, highest-value first. No markdown fences, no preamble, no commentary about the candidate pool."""
 
 
 @app.route("/api/engagements/<eid>/draft-benchmarks", methods=["POST"])
@@ -916,8 +1129,15 @@ def draft_benchmarks(eid):
         return jsonify({"error": "Not found"}), 404
     eng = parse_row(rows[0])
 
+    body = request.json or {}
     try:
-        prompt = _build_benchmark_draft_prompt(eng)
+        count = int(body.get("count") or 12)
+    except (TypeError, ValueError):
+        count = 12
+    count = max(1, min(50, count))
+
+    try:
+        prompt = _build_benchmark_draft_prompt(eng, count=count)
         result = _call_llm(prompt)
     except Exception as e:
         tb = traceback.format_exc()
@@ -965,49 +1185,87 @@ def draft_benchmark_sql(eid):
 
     body = request.json or {}
     question = (body.get("question") or "").strip()
+    warehouse_id = (body.get("warehouse_id") or "").strip()
     if not question:
         return jsonify({"error": "question is required"}), 400
 
     s3 = eng["sessions"]["3"]
     s4 = eng["sessions"]["4"]
 
-    ctx_lines = ["Tables in scope (use these fully qualified):"]
-    for d in s4.get("data_plan", []):
-        if d.get("include_in_space") == "Yes":
-            ctx_lines.append(f"- {d.get('table_or_view','')}")
-    ctx_lines.append("Known SQL expressions / metrics:")
+    # Collect actual column schemas for every in-scope table so the LLM has
+    # ground truth to reference and doesn't invent columns. Uses OBO so we
+    # inherit the user's UC grants.
+    user_w = _user_workspace_client()
+    in_scope_tables = [
+        (d.get("table_or_view") or "").strip()
+        for d in s4.get("data_plan", [])
+        if d.get("include_in_space") == "Yes" and (d.get("table_or_view") or "").count(".") == 2
+    ]
+    schema_blocks = []
+    for t in in_scope_tables:
+        cols = _describe_table_columns(t, user_w, warehouse_id) if warehouse_id else []
+        if cols:
+            col_lines = "\n".join(f"  - {c[0]} ({c[1]})" for c in cols)
+            schema_blocks.append(f"{t}:\n{col_lines}")
+        else:
+            # Fall back to listing just the table; the column-constraint rule
+            # below still instructs the LLM not to invent columns.
+            schema_blocks.append(f"{t}:\n  (schema unavailable — be conservative with column references)")
+    schemas_text = "\n\n".join(schema_blocks) if schema_blocks else "(no tables in scope)"
+
+    metric_lines = []
     for e in s3.get("sql_expressions", []):
-        ctx_lines.append(f"- {e.get('metric_name','')}: `{e.get('sql_code','')}` on {e.get('uc_table','')}")
-    ctx = "\n".join(ctx_lines)
+        metric_lines.append(
+            f"- {e.get('metric_name','')}: `{e.get('sql_code','')}` on {e.get('uc_table','')}"
+        )
+    metrics_text = "\n".join(metric_lines) if metric_lines else "(none)"
 
-    prompt = f"""Draft the expected SQL answer for one benchmark question. This is the ground-truth SQL that the Genie Space will be scored against.
+    prompt = f"""Draft the expected SQL answer for one benchmark question. This SQL will run on Databricks SQL (Spark SQL / ANSI dialect) and is the ground-truth query the Genie Space will be scored against.
 
-<context>
-{ctx}
-</context>
+<table_schemas>
+The following are the ONLY tables you may reference, with their exact columns and types. Every column you use in the SQL MUST appear below. Do not invent, rename, or guess column names. If the question seems to require a column that is not listed, pick the closest real column OR leave a SQL comment explaining the gap — do not fabricate.
+
+{schemas_text}
+</table_schemas>
+
+<known_metrics>
+These are the analyst-mapped SQL expressions. Reuse them verbatim when the benchmark question involves the same measure:
+{metrics_text}
+</known_metrics>
+
+<dialect_notes>
+Write Databricks SQL (Spark SQL). Common gotchas — do NOT use Postgres/MySQL/T-SQL syntax:
+- DATE_ADD(date, n) takes an INTEGER number of days, NOT an INTERVAL. Use ADD_MONTHS(date, n) for months and date arithmetic with + INTERVAL for other units.
+- For "N months ago": ADD_MONTHS(CURRENT_DATE, -N) or CURRENT_DATE - INTERVAL N MONTH.
+- For quarter boundaries: DATE_TRUNC('QUARTER', CURRENT_DATE) for current quarter start; ADD_MONTHS(DATE_TRUNC('QUARTER', CURRENT_DATE), -3) for previous quarter start.
+- Use DATEDIFF(end, start) (end-start in days) — note Databricks order is (end, start), not Postgres' (start, end).
+- Use DOUBLE division (COUNT(...) * 100.0 / COUNT(*)) to avoid integer truncation.
+- No ILIKE on columns unless needed (LIKE is case-sensitive by default; use LOWER() for case-insensitive compares).
+- String literals use single quotes. Do not use double quotes for strings — double quotes are identifier quoting in ANSI mode.
+</dialect_notes>
 
 Benchmark question:
 {question}
 
+Return JSON with exactly:
+{{
+  "sql": "the SQL query"
+}}
+
 Rules:
 - Use fully qualified table references (catalog.schema.table) — example queries are standalone.
 - Reuse the known SQL expressions where they apply.
-- Return SQL only. No markdown fences, no preamble. If you need CTEs, use WITH. Single statement only."""
+- ONLY reference columns that appear in <table_schemas>. Double-check every column name against the list before emitting it. If you're uncertain, prefer a column that clearly exists over one you remember by naming convention.
+- Follow the <dialect_notes> — this is Databricks SQL, not Postgres/MySQL.
+- Single SQL statement. If you need CTEs, use WITH.
+- Return ONLY the JSON. No markdown fences, no preamble."""
 
     try:
-        resp = w.serving_endpoints.query(
-            name=LLM_ENDPOINT,
-            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-            max_tokens=2000,
-            temperature=0.2,
-        )
-        if isinstance(resp, dict):
-            d = resp
-        elif hasattr(resp, "as_dict"):
-            d = resp.as_dict()
+        result = _call_llm(prompt)
+        if isinstance(result, dict):
+            sql_text = str(result.get("sql", "")).strip()
         else:
-            d = {"choices": [{"message": {"content": resp.choices[0].message.content}}]}
-        sql_text = d["choices"][0]["message"]["content"].strip()
+            sql_text = str(result or "").strip()
         # Strip code fences if any
         if sql_text.startswith("```"):
             sql_text = sql_text.split("\n", 1)[1] if "\n" in sql_text else sql_text
@@ -1019,12 +1277,170 @@ Rules:
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-    return jsonify({"sql": sql_text})
+    # Second LLM call — summary is derived from the final SQL, not from the
+    # question. Guarantees the plain-English explanation describes what the
+    # query actually does.
+    explanation = ""
+    if sql_text:
+        try:
+            explanation = _summarize_benchmark_sql(question, sql_text)
+        except Exception as e:
+            print(f"[draft-benchmark-sql] summary generation failed: {type(e).__name__}: {e}", flush=True)
+
+    return jsonify({"sql": sql_text, "explanation": explanation})
+
+
+def _summarize_benchmark_sql(question, sql_text):
+    """Given the final SQL, produce a plain-English summary. This runs as a
+    second LLM call AFTER the SQL is generated so the summary strictly
+    describes what the query does, not what the question intends."""
+    prompt = f"""Describe what this benchmark SQL is measuring, in plain English for a non-technical business owner.
+
+<benchmark_question>
+{question}
+</benchmark_question>
+
+<sql>
+{sql_text}
+</sql>
+
+Write 2-3 sentences answering "how are we measuring this?" — no column names in backticks, no SQL jargon. Example voice: "Counts every claim received in the current calendar year, excluding voided records, and averages the number of days between receipt and final decision." Your summary must describe the SQL exactly as written, including any filters or groupings it applies. Do not describe anything the SQL doesn't actually do.
+
+Return JSON with exactly: {{"explanation": "..."}}. No markdown fences."""
+    result = _call_llm(prompt)
+    if isinstance(result, dict):
+        return str(result.get("explanation", "")).strip()
+    return ""
+
+
+@app.route("/api/engagements/<eid>/draft-benchmark-summary", methods=["POST"])
+def draft_benchmark_summary(eid):
+    """Draft a plain-English summary of existing SQL for a benchmark question."""
+    body = request.json or {}
+    question = (body.get("question") or "").strip()
+    sql_text = (body.get("sql") or "").strip()
+    if not question or not sql_text:
+        return jsonify({"error": "question and sql are required"}), 400
+
+    try:
+        explanation = _summarize_benchmark_sql(question, sql_text)
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+    return jsonify({"explanation": explanation})
+
+
+@app.route("/api/engagements/<eid>/run-benchmark-sql", methods=["POST"])
+def run_benchmark_sql(eid):
+    """Execute benchmark SQL via OBO and return a sample of rows for BO review."""
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        return jsonify({"error": "Not found"}), 404
+
+    body = request.json or {}
+    sql_text = (body.get("sql") or "").strip()
+    warehouse_id = (body.get("warehouse_id") or "").strip()
+    if not sql_text:
+        return jsonify({"error": "sql is required"}), 400
+    if not warehouse_id:
+        return jsonify({"error": "warehouse_id is required"}), 400
+
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "User auth unavailable — reload the app so OBO token is present"}), 401
+
+    # Strip trailing semicolons so the wrapper doesn't break
+    stmt = sql_text.rstrip().rstrip(";").strip()
+
+    # Always wrap in an outer LIMIT so the BO preview can't pull huge result
+    # sets. Wrapping is safe whether the inner query has its own LIMIT,
+    # ORDER BY, or CTEs — the outer cap applies to whatever the inner returns.
+    limit_cap = 50
+    wrapped = f"SELECT * FROM (\n{stmt}\n) __bm LIMIT {limit_cap}"
+
+    try:
+        # wait_timeout=50s lets the call block up to 50s before returning
+        # PENDING/RUNNING. We still poll below so a cold warehouse start
+        # doesn't surface as a misleading error.
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id,
+            statement=wrapped,
+            wait_timeout="50s",
+        )
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 200
+
+    statement_id = resp.statement_id
+    state = str(resp.status.state) if resp.status else ""
+    import time as _time
+    deadline = _time.time() + 120  # up to 2 min total (warehouse cold start + query)
+    while statement_id and "SUCCEEDED" not in state and "FAILED" not in state and "CANCELED" not in state and "CLOSED" not in state:
+        if _time.time() > deadline:
+            try:
+                user_w.statement_execution.cancel_execution(statement_id)
+            except Exception:
+                pass
+            return jsonify({"error": "Query timed out after 2 minutes waiting for the warehouse"}), 200
+        _time.sleep(1.5)
+        try:
+            resp = user_w.statement_execution.get_statement(statement_id)
+        except Exception as e:
+            return jsonify({"error": f"{type(e).__name__}: {e}"}), 200
+        state = str(resp.status.state) if resp.status else ""
+
+    if "SUCCEEDED" not in state:
+        err = resp.status.error.message if (resp.status and resp.status.error) else f"Statement state: {state}"
+        return jsonify({"error": err}), 200
+
+    columns: list[str] = []
+    out_rows: list[list] = []
+    row_count = 0
+    if resp.manifest and resp.manifest.schema and resp.manifest.schema.columns:
+        columns = [c.name for c in resp.manifest.schema.columns]
+    if resp.result and resp.result.data_array:
+        out_rows = [list(r) for r in resp.result.data_array]
+        row_count = len(out_rows)
+    truncated = row_count >= limit_cap
+
+    return jsonify({
+        "columns": columns,
+        "rows": out_rows,
+        "row_count": row_count,
+        "truncated": truncated,
+        "limit": limit_cap,
+    })
 
 
 # ---------------------------------------------------------------------------
 # API: Metric View authoring (Session 3)
 # ---------------------------------------------------------------------------
+
+def _fetch_metric_view_definition(fqn, user_w=None, warehouse_id=None):
+    """Return the live UC definition of a Metric View as a string (DDL / YAML).
+
+    Uses SHOW CREATE TABLE under OBO so we inherit the user's UC grants. This
+    is the source of truth — the YAML stored in Session 3 could be stale or
+    absent if the analyst pointed at a pre-existing MV.
+    """
+    parts = fqn.split(".")
+    if len(parts) != 3 or not (user_w and warehouse_id):
+        return ""
+    stmt = f"SHOW CREATE TABLE `{parts[0]}`.`{parts[1]}`.`{parts[2]}`"
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id, statement=stmt,
+        )
+        state = str(resp.status.state) if resp.status else ""
+        if "SUCCEEDED" not in state or not resp.result or not resp.result.data_array:
+            print(f"[mv-fetch] {fqn}: state={state}", flush=True)
+            return ""
+        # SHOW CREATE TABLE returns a single row with a single column (createtab_stmt).
+        row = resp.result.data_array[0]
+        return str(row[0]) if row else ""
+    except Exception as e:
+        print(f"[mv-fetch] {fqn} failed: {type(e).__name__}: {e}", flush=True)
+        return ""
+
 
 def _describe_table_columns(fqn, user_w=None, warehouse_id=None):
     """Return a list of (column_name, data_type) for a three-part UC table.

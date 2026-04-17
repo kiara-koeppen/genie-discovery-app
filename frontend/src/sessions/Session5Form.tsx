@@ -31,6 +31,7 @@ export default function Session5Form({
 }: Props) {
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string>("");
+  const [generateWarnings, setGenerateWarnings] = useState<string[]>([]);
   const [pushing, setPushing] = useState(false);
   const [pushResult, setPushResult] = useState<string>("");
   const [pushError, setPushError] = useState<string>("");
@@ -80,8 +81,9 @@ export default function Session5Form({
     if (!engagementId) return;
     setGenerating(true);
     setGenerateError("");
+    setGenerateWarnings([]);
     try {
-      const plan = await api.generatePlan(engagementId);
+      const plan = await api.generatePlan(engagementId, data.plan_warehouse_id || "");
       onChange("plan_general_instructions", plan.general_instructions);
       onChange("plan_sample_questions", plan.sample_questions);
       onChange("plan_sql_filters", plan.sql_filters);
@@ -90,11 +92,42 @@ export default function Session5Form({
       onChange("plan_example_queries", plan.example_queries);
       onChange("plan_joins", plan.joins);
       onChange("plan_narrative", plan.narrative);
+      setGenerateWarnings(plan.warnings || []);
     } catch (err: any) {
       setGenerateError(err.message || "Generate failed");
     }
     setGenerating(false);
   };
+
+  // Joins handlers (analyst-editable; auto-detected UC FK rows are source="uc_foreign_key"
+  // and manually added rows are source="manual"; regenerate preserves the manual rows).
+  const updateJoin = (idx: number, field: keyof UcJoin, value: any) => {
+    const list: UcJoin[] = [...joins];
+    list[idx] = { ...list[idx], [field]: value };
+    onChange("plan_joins", list);
+  };
+  const updateJoinCols = (idx: number, field: "left_columns" | "right_columns", csv: string) => {
+    const list: UcJoin[] = [...joins];
+    list[idx] = {
+      ...list[idx],
+      [field]: csv.split(",").map((s) => s.trim()).filter(Boolean),
+    };
+    onChange("plan_joins", list);
+  };
+  const removeJoin = (idx: number) =>
+    onChange("plan_joins", joins.filter((_, i) => i !== idx));
+  const addJoin = () =>
+    onChange("plan_joins", [
+      ...joins,
+      {
+        left_table: scopeTables[0] || "",
+        left_columns: [],
+        right_table: scopeTables[1] || scopeTables[0] || "",
+        right_columns: [],
+        relationship_type: "MANY_TO_ONE",
+        source: "manual",
+      },
+    ]);
 
   // Sample questions handlers
   const updateQuestion = (idx: number, value: string) => {
@@ -275,6 +308,16 @@ export default function Session5Form({
               <strong>Generate Plan failed:</strong> {generateError}
             </Alert>
           )}
+          {generateWarnings.length > 0 && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              <strong>Plan generated with warnings:</strong>
+              <Box component="ul" sx={{ pl: 3, mt: 0.5, mb: 0 }}>
+                {generateWarnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </Box>
+            </Alert>
+          )}
           {data.plan_narrative && (
             <Paper variant="outlined" sx={{ p: 2, bgcolor: "grey.50" }}>
               <Typography variant="caption" color="text.secondary">Plan summary</Typography>
@@ -362,14 +405,15 @@ export default function Session5Form({
 
           <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
             <Typography variant="subtitle2">Joins</Typography>
-            <Chip icon={<LockIcon />} label="Read-only, from UC PK/FK" size="small" />
+            <Chip label="UC PK/FK auto-seeded, analyst-editable" size="small" />
           </Stack>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-            Auto-detected from declared PK/FK constraints in Unity Catalog. If no joins appear,
-            Genie will rely on runtime auto-detection. To add explicit joins, declare them as UC
-            constraints on the tables.
+            Joins from declared Unity Catalog PK/FK constraints are auto-seeded on Generate Plan.
+            Add manual joins below for relationships not declared in UC. Regenerating Plan refreshes
+            UC joins but keeps your manual rows. If you leave this empty, Genie will attempt runtime
+            auto-detection.
           </Typography>
-          {joins.length > 0 ? (
+          {joins.length > 0 && (
             <Table size="small">
               <TableHead>
                 <TableRow>
@@ -378,25 +422,91 @@ export default function Session5Form({
                   <TableCell>Right table</TableCell>
                   <TableCell>Right cols</TableCell>
                   <TableCell>Relationship</TableCell>
+                  <TableCell>Source</TableCell>
+                  {!readOnly && <TableCell></TableCell>}
                 </TableRow>
               </TableHead>
               <TableBody>
-                {joins.map((j, i) => (
-                  <TableRow key={i}>
-                    <TableCell sx={{ fontFamily: "monospace", fontSize: 12 }}>{j.left_table}</TableCell>
-                    <TableCell sx={{ fontFamily: "monospace", fontSize: 12 }}>{(j.left_columns || []).join(", ")}</TableCell>
-                    <TableCell sx={{ fontFamily: "monospace", fontSize: 12 }}>{j.right_table}</TableCell>
-                    <TableCell sx={{ fontFamily: "monospace", fontSize: 12 }}>{(j.right_columns || []).join(", ")}</TableCell>
-                    <TableCell>{j.relationship_type}</TableCell>
-                  </TableRow>
-                ))}
+                {joins.map((j, i) => {
+                  const isManual = j.source === "manual";
+                  const editable = !readOnly && isManual;
+                  return (
+                    <TableRow key={i}>
+                      <TableCell sx={{ fontFamily: "monospace", fontSize: 12, minWidth: 180 }}>
+                        {editable ? (
+                          <Select size="small" fullWidth value={j.left_table}
+                            onChange={(e) => updateJoin(i, "left_table", e.target.value)}>
+                            {scopeTables.map((t) => <MenuItem key={t} value={t} sx={{ fontFamily: "monospace", fontSize: 12 }}>{t}</MenuItem>)}
+                          </Select>
+                        ) : j.left_table}
+                      </TableCell>
+                      <TableCell sx={{ fontFamily: "monospace", fontSize: 12, minWidth: 150 }}>
+                        {editable ? (
+                          <TextField size="small" fullWidth placeholder="col1, col2"
+                            value={(j.left_columns || []).join(", ")}
+                            onChange={(e) => updateJoinCols(i, "left_columns", e.target.value)} />
+                        ) : (j.left_columns || []).join(", ")}
+                      </TableCell>
+                      <TableCell sx={{ fontFamily: "monospace", fontSize: 12, minWidth: 180 }}>
+                        {editable ? (
+                          <Select size="small" fullWidth value={j.right_table}
+                            onChange={(e) => updateJoin(i, "right_table", e.target.value)}>
+                            {scopeTables.map((t) => <MenuItem key={t} value={t} sx={{ fontFamily: "monospace", fontSize: 12 }}>{t}</MenuItem>)}
+                          </Select>
+                        ) : j.right_table}
+                      </TableCell>
+                      <TableCell sx={{ fontFamily: "monospace", fontSize: 12, minWidth: 150 }}>
+                        {editable ? (
+                          <TextField size="small" fullWidth placeholder="col1, col2"
+                            value={(j.right_columns || []).join(", ")}
+                            onChange={(e) => updateJoinCols(i, "right_columns", e.target.value)} />
+                        ) : (j.right_columns || []).join(", ")}
+                      </TableCell>
+                      <TableCell sx={{ minWidth: 140 }}>
+                        {editable ? (
+                          <Select size="small" fullWidth value={j.relationship_type}
+                            onChange={(e) => updateJoin(i, "relationship_type", e.target.value)}>
+                            <MenuItem value="ONE_TO_ONE">ONE_TO_ONE</MenuItem>
+                            <MenuItem value="ONE_TO_MANY">ONE_TO_MANY</MenuItem>
+                            <MenuItem value="MANY_TO_ONE">MANY_TO_ONE</MenuItem>
+                            <MenuItem value="MANY_TO_MANY">MANY_TO_MANY</MenuItem>
+                          </Select>
+                        ) : j.relationship_type}
+                      </TableCell>
+                      <TableCell>
+                        <Chip
+                          size="small"
+                          label={isManual ? "manual" : "UC FK"}
+                          icon={isManual ? undefined : <LockIcon />}
+                          color={isManual ? "default" : "primary"}
+                          variant="outlined"
+                        />
+                      </TableCell>
+                      {!readOnly && (
+                        <TableCell>
+                          {isManual && (
+                            <IconButton size="small" onClick={() => removeJoin(i)}>
+                              <DeleteIcon fontSize="small" />
+                            </IconButton>
+                          )}
+                        </TableCell>
+                      )}
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
-          ) : (
-            <Alert severity="info">
-              No PK/FK constraints detected across the tables in scope. Click Regenerate Plan after
-              declaring constraints in UC.
+          )}
+          {joins.length === 0 && (
+            <Alert severity="info" sx={{ mb: 1 }}>
+              No joins yet. UC PK/FK joins will be auto-seeded on Generate Plan; you can also add
+              manual joins below.
             </Alert>
+          )}
+          {!readOnly && scopeTables.length >= 2 && (
+            <Button size="small" startIcon={<AddIcon />} onClick={addJoin} sx={{ mt: 1 }}>
+              Add manual join
+            </Button>
           )}
         </AccordionDetails>
       </Accordion>
