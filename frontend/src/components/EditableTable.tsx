@@ -1,9 +1,12 @@
+import { useState } from "react";
 import {
   Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
   TextField, IconButton, Button, Select, MenuItem, Paper,
+  Dialog, DialogTitle, DialogContent, DialogActions, Box, Tooltip,
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
+import OpenInFullIcon from "@mui/icons-material/OpenInFull";
 import UCColumnPicker from "./UCColumnPicker";
 import UCTablePicker from "./UCTablePicker";
 import type { ColumnDef } from "../types";
@@ -15,7 +18,17 @@ interface Props {
   readOnly?: boolean;
 }
 
+interface ExpandedCell {
+  rowIdx: number;
+  colKey: string;
+  colLabel: string;
+  value: string;
+}
+
 export default function EditableTable({ columns, rows, onChange, readOnly }: Props) {
+  const [expanded, setExpanded] = useState<ExpandedCell | null>(null);
+  const [expandedDraft, setExpandedDraft] = useState("");
+
   const addRow = () => {
     const blank: Record<string, string> = {};
     columns.forEach((c) => (blank[c.key] = ""));
@@ -29,6 +42,17 @@ export default function EditableTable({ columns, rows, onChange, readOnly }: Pro
   const update = (idx: number, key: string, value: string) => {
     const next = rows.map((r, i) => (i === idx ? { ...r, [key]: value } : r));
     onChange(next);
+  };
+
+  const openExpand = (rowIdx: number, col: ColumnDef) => {
+    const value = rows[rowIdx]?.[col.key] || "";
+    setExpanded({ rowIdx, colKey: col.key, colLabel: col.label, value });
+    setExpandedDraft(value);
+  };
+
+  const saveExpand = () => {
+    if (expanded) update(expanded.rowIdx, expanded.colKey, expandedDraft);
+    setExpanded(null);
   };
 
   return (
@@ -76,12 +100,41 @@ export default function EditableTable({ columns, rows, onChange, readOnly }: Pro
                         <MenuItem key={o} value={o}>{o}</MenuItem>
                       ))}
                     </Select>
+                  ) : c.type === "textarea" ? (
+                    <Box sx={{ position: "relative" }}>
+                      <TextField
+                        size="small"
+                        fullWidth
+                        multiline
+                        minRows={2}
+                        value={row[c.key] || ""}
+                        onChange={(e) => update(idx, c.key, e.target.value)}
+                        variant="outlined"
+                        sx={{
+                          "& .MuiOutlinedInput-root": { fontSize: 14 },
+                          "& .MuiInputBase-input": { pr: 4 },
+                        }}
+                      />
+                      <Tooltip title="Expand to edit">
+                        <IconButton
+                          size="small"
+                          onClick={() => openExpand(idx, c)}
+                          sx={{
+                            position: "absolute",
+                            top: 4,
+                            right: 4,
+                            opacity: 0.6,
+                            "&:hover": { opacity: 1, bgcolor: "grey.100" },
+                          }}
+                        >
+                          <OpenInFullIcon sx={{ fontSize: 14 }} />
+                        </IconButton>
+                      </Tooltip>
+                    </Box>
                   ) : (
                     <TextField
                       size="small"
                       fullWidth
-                      multiline={c.type === "textarea"}
-                      minRows={c.type === "textarea" ? 2 : 1}
                       value={row[c.key] || ""}
                       onChange={(e) => update(idx, c.key, e.target.value)}
                       variant="outlined"
@@ -113,6 +166,35 @@ export default function EditableTable({ columns, rows, onChange, readOnly }: Pro
           Add Row
         </Button>
       )}
+
+      {/* Expanded edit dialog */}
+      <Dialog
+        open={!!expanded}
+        onClose={() => setExpanded(null)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>{expanded?.colLabel}</DialogTitle>
+        <DialogContent>
+          <TextField
+            autoFocus
+            multiline
+            fullWidth
+            minRows={18}
+            value={expandedDraft}
+            onChange={(e) => setExpandedDraft(e.target.value)}
+            variant="outlined"
+            sx={{
+              mt: 1,
+              "& .MuiInputBase-input": { fontFamily: "monospace", fontSize: 14 },
+            }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setExpanded(null)}>Cancel</Button>
+          <Button variant="contained" onClick={saveExpand}>Save</Button>
+        </DialogActions>
+      </Dialog>
     </TableContainer>
   );
 }
