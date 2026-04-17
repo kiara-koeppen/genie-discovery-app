@@ -151,18 +151,30 @@ def parse_row(row):
 # DB migration: ensure new columns exist
 # ---------------------------------------------------------------------------
 
-def ensure_columns():
-    """Add any missing columns to the discovery table."""
-    try:
-        rows = sql_exec(f"DESCRIBE TABLE {TABLE}")
-        existing = {r.get("col_name", "") for r in rows}
-        for col in ALL_SECTION_COLS:
-            if col not in existing:
-                sql_run(f"ALTER TABLE {TABLE} ADD COLUMN {col} STRING")
-    except Exception:
-        pass
+def ensure_table():
+    """Create the engagement Delta table on first run, then add any missing columns.
 
-ensure_columns()
+    The README promises auto-creation; this is that promise. Requires the SP to
+    have CREATE TABLE on <CATALOG>.<SCHEMA>.
+    """
+    section_ddl = ", ".join(f"{col} STRING" for col in ALL_SECTION_COLS)
+    sql_run(
+        f"CREATE TABLE IF NOT EXISTS {TABLE} ("
+        f"engagement_id STRING, genie_space_name STRING, "
+        f"business_owner_name STRING, business_owner_email STRING, "
+        f"analyst_name STRING, analyst_email STRING, "
+        f"current_session INT, status STRING, "
+        f"created_at STRING, updated_at STRING, "
+        f"{section_ddl}"
+        f") USING DELTA"
+    )
+    rows = sql_exec(f"DESCRIBE TABLE {TABLE}")
+    existing = {r.get("col_name", "") for r in rows}
+    for col in ALL_SECTION_COLS:
+        if col not in existing:
+            sql_run(f"ALTER TABLE {TABLE} ADD COLUMN {col} STRING")
+
+ensure_table()
 
 
 # ---------------------------------------------------------------------------
