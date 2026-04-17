@@ -70,8 +70,28 @@ This is where discovery becomes a real Genie Space configuration.
 - **`/api/warehouses` is OBO-only.** Users only see warehouses they actually have access to. If their token is missing the `sql` scope (incremental-consent drift), the endpoint returns 403 with `reauth_required: true` instead of silently falling back to the SP.
 - **Schema-grounded prompting everywhere LLM writes SQL.** Benchmark SQL drafting, metric view YAML drafting, and plan generation all inject real UC column lists so the model cannot hallucinate.
 - **Two-step LLM flows** for SQL + summary so the explanation always describes the actual code.
-- **Delta-backed persistence** with a single engagement row; JSON columns per session. `ensure_columns()` auto-migrates the schema on startup so pulling updates doesn't require manual SQL.
+- **Delta-backed persistence** with a single engagement row; JSON columns per session. `ensure_table()` auto-creates the engagement table on first run and additively migrates the schema on every startup so pulling updates doesn't require manual SQL.
 - **Popup editing + debounced autosave** on every table — you never lose work between clicks.
+
+### Who calls what: OBO vs App Service Principal
+
+The app runs as a service principal but deliberately routes most data-plane calls through the end user's OAuth-on-behalf-of (OBO) token (`X-Forwarded-Access-Token`). This keeps the SP's blast radius small and respects each user's UC grants.
+
+| Operation | Identity | Why |
+|---|---|---|
+| Read/write the `discovery` engagement table (create, update, get, save) | **App SP** | The SP owns the Delta table so engagements are durable across users. Only place the SP touches customer-adjacent storage. |
+| Auto-create / migrate the `discovery` table on startup (`ensure_table`) | **App SP** | SP needs `CREATE TABLE` on `<CATALOG>.<SCHEMA>`. |
+| Call the Model Serving LLM endpoint (generate plan, draft SQL, draft MV YAML, summaries) | **App SP** | SP needs `CAN QUERY` on the endpoint. User tokens don't get billed for LLM time; SP does. |
+| List SQL warehouses for the Session 5 dropdown (`/api/warehouses`) | **OBO** | Users should only see warehouses they have access to. Returns 403 `reauth_required` if the `sql` scope is missing. |
+| `DESCRIBE TABLE` / `SHOW CREATE TABLE` (schema grounding, live MV fetch) | **OBO** | Runs via the user's chosen warehouse; inherits the user's UC SELECT/USE CATALOG grants. |
+| `tables.get()` for PK/FK constraints (Session 5 joins seeding) | **OBO** | UC metadata API. Needs the `catalog.tables:read` user scope (see Step 2b). |
+| Execute benchmark SQL (Session 4 "Run" button) | **OBO** | User's query, user's warehouse, user's data grants. The app never runs arbitrary user-authored SQL under the SP. |
+| Create / update / patch Genie Spaces (Session 5 "Push") | **OBO** | Uses the Genie REST API on the user's behalf so their `CAN MANAGE` on the space governs whether the push succeeds. The SP does not manage Genie spaces. |
+| Create/replace UC Metric Views (Session 3 "Create MV") | **OBO** | User's grants govern whether they can create the view and whether it overwrites an existing one they don't own. |
+| Check COE group membership (Session 4 approval gating) | **OBO** | Uses `current_user.me()` so membership is evaluated against the logged-in user. Keeps the SP out of IAM. |
+| Resolve the current user's identity for audit fields | **OBO header** | Reads `X-Forwarded-Email` / `X-Forwarded-User` — set by Databricks Apps from the user's auth. Falls back to the SP identity only if the header is missing. |
+
+Practical upshot: if a user can't see a table in the SQL editor, they can't pull its schema in this app. If they can't `CREATE TABLE` in the target catalog for the metric view, the Create MV button fails with their own UC error, not a fake SP success. The SP holds `CREATE TABLE` grants on the engagement catalog/schema and `CAN QUERY` on the LLM endpoint — nothing else.
 
 ---
 
