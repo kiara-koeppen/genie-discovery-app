@@ -1,12 +1,32 @@
+# Databricks App config for Genie Discovery
+#
+# BEFORE DEPLOYING TO YOUR WORKSPACE, update the four env vars below to match
+# your environment. See README.md ("Deploy to your workspace") for details.
+
 command:
   - python
   - app.py
+
 env:
+  # SQL Warehouse used for all UC metadata queries and engagement storage.
+  # Find this in your workspace: SQL > SQL Warehouses > (select warehouse) >
+  # Connection details > copy the ID from the end of the HTTP Path.
   - name: DATABRICKS_WAREHOUSE_ID
-    value: "ad1dd0025031919f"
+    value: "ad1dd0025031919f"  # CHANGE ME
+
+  # Catalog where the engagement-storage Delta table lives.
+  # Pick a catalog the app's service principal can CREATE TABLE in.
   - name: CATALOG
-    value: "genie_training"
+    value: "genie_training"  # CHANGE ME
+
+  # Schema under CATALOG where the engagement table will be auto-created.
+  # The schema must exist before first run; the table itself is created/
+  # maintained automatically by ensure_columns() on app startup.
   - name: SCHEMA
-    value: "genie_discovery"
+    value: "genie_discovery"  # CHANGE ME
+
+  # Databricks group whose members gate COE approval in Session 4.
+  # Create this group in Account Console > User management > Groups,
+  # add your COE reviewers as members, then put the group name here.
   - name: COE_GROUP_NAME
-    value: "genie-coe-reviewers"
+    value: "genie-coe-reviewers"  # CHANGE ME
