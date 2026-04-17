@@ -4,6 +4,12 @@ A structured workbook that guides an analyst + business owner pair through the f
 
 ---
 
+## Disclaimer
+
+This is **not an official Databricks product or supported solution**. It is a personal project shared as-is for reference and experimentation. It is **not intended for production use** and comes with **no warranty, support, or SLA** of any kind from Databricks or the author. Before deploying it in any environment that handles customer, regulated, or otherwise sensitive data, you are responsible for performing your own security review, legal / compliance review, and operational hardening. Any use is at your own risk.
+
+---
+
 ## What this app does
 
 The app is a 6-session workbook. Each session is a form backed by a Delta table so engagements persist across days/weeks. Below is the full capability surface, including the non-obvious behaviors that took iteration to get right.
