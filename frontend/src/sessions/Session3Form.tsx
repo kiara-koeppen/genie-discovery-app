@@ -26,14 +26,14 @@ const TEXT_INSTR_COLS: ColumnDef[] = [
 const GAP_COLS: ColumnDef[] = [
   { key: "business_question", label: "Business Question", type: "textarea" },
   { key: "data_available", label: "Data Available?", width: 130, type: "select", options: ["Yes", "No", "Partial"] },
-  { key: "gap_description", label: "Gap" },
+  { key: "gap_description", label: "Gap", type: "textarea" },
   { key: "proposed_resolution", label: "Proposed Resolution", type: "textarea" },
 ];
 
 const SCOPE_COLS: ColumnDef[] = [
-  { key: "item", label: "Topic / Question Area" },
+  { key: "item", label: "Topic / Question Area", type: "textarea" },
   { key: "in_scope", label: "Scope", width: 130, type: "select", options: ["In Scope", "Out of Scope"] },
-  { key: "notes", label: "Notes / Redirect" },
+  { key: "notes", label: "Notes / Redirect", type: "textarea" },
 ];
 
 const TERM_TYPES = ["Metric", "Synonym", "Filter", "Date Logic"];
