@@ -8,50 +8,38 @@ command:
   - app.py
 
 # NOTE: OAuth scopes for the end-user OBO token are NOT set in app.yaml (the
-# key is silently ignored). Configure them once via the CLI:
-#   databricks apps update genie-discovery --json '{
-#     "name": "genie-discovery",
-#     "user_api_scopes": [
-#       "iam.current-user:read",
-#       "iam.access-control:read",
-#       "sql",
-#       "dashboards.genie"
-#     ]
-#   }'
-# Or via the app's "User authorization" section in the Databricks UI.
-# Required scopes for this app:
-#   - sql              → list warehouses (Session 5 dropdown)
-#   - dashboards.genie → create/update Genie Spaces via /api/2.0/genie/spaces
+# key is silently ignored). See README.md "Step 2b" for the `databricks apps
+# update` command to configure user_api_scopes.
 
 env:
-  # SQL Warehouse used for all UC metadata queries and engagement storage.
-  # Find this in your workspace: SQL > SQL Warehouses > (select warehouse) >
-  # Connection details > copy the ID from the end of the HTTP Path.
+  # REQUIRED. SQL Warehouse used for all UC metadata queries and engagement
+  # storage. Find this in your workspace: SQL > SQL Warehouses > (select
+  # warehouse) > Connection details > copy the ID from the end of the HTTP Path.
   - name: DATABRICKS_WAREHOUSE_ID
-    value: "ad1dd0025031919f"  # CHANGE ME
+    value: "<your-warehouse-id>"
 
-  # Catalog where the engagement-storage Delta table lives.
-  # Pick a catalog the app's service principal can CREATE TABLE in.
+  # REQUIRED. Catalog where the engagement-storage Delta table lives.
+  # The app's service principal must have CREATE TABLE on <CATALOG>.<SCHEMA>.
   - name: CATALOG
-    value: "genie_training"  # CHANGE ME
+    value: "<your-catalog>"
 
-  # Schema under CATALOG where the engagement table will be auto-created.
-  # The schema must exist before first run; the table itself is created/
+  # REQUIRED. Schema under CATALOG where the engagement table is auto-created.
+  # The schema must exist before first run; the table itself is created and
   # maintained automatically by ensure_columns() on app startup.
   - name: SCHEMA
-    value: "genie_discovery"  # CHANGE ME
+    value: "<your-schema>"
 
-  # Databricks group whose members gate COE approval in Session 4.
-  # Create this group in Account Console > User management > Groups,
-  # add your COE reviewers as members, then put the group name here.
+  # Optional. Databricks group whose members gate COE approval in Session 4.
+  # Create this group in Account Console > User management > Groups, add your
+  # COE reviewers as members, then put the group name here.
   - name: COE_GROUP_NAME
-    value: "genie-coe-reviewers"  # CHANGE ME
+    value: "genie-coe-reviewers"
 
-  # Model Serving endpoint used by Session 5's "Generate Plan" button to
-  # synthesize Genie Space configuration from Sessions 1-4.
-  # Default is the HIPAA-eligible pay-per-token Claude endpoint on Azure.
-  # The app's service principal needs CAN QUERY on this endpoint.
-  # Alternatives: databricks-claude-3-7-sonnet, databricks-gpt-oss-120b,
-  # or any custom chat-completion-compatible served model.
+  # Optional. Model Serving endpoint used by every AI button (generate-plan,
+  # draft-benchmarks, draft-metric-view-yaml, etc). Default is the HIPAA-
+  # eligible pay-per-token Claude endpoint. The app's service principal
+  # needs CAN QUERY on this endpoint.
+  # Alternatives: databricks-claude-3-7-sonnet, databricks-gpt-oss-120b, or
+  # any chat-completion-compatible served model.
   - name: LLM_ENDPOINT_NAME
-    value: "databricks-claude-sonnet-4-6"  # CHANGE ME if needed
+    value: "databricks-claude-sonnet-4-6"

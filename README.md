@@ -1,6 +1,6 @@
 # Genie Space Discovery App
 
-A structured workbook that guides an analyst + business owner pair through the full discovery needed to configure a Databricks Genie Space — from first conversation about pain points all the way through to a pushed, prototyped, benchmarked space. Built for Intermountain Health's train-the-trainer program but designed to be workspace-portable.
+A structured workbook that guides an analyst + business owner pair through the full discovery needed to configure a Databricks Genie Space — from first conversation about pain points all the way through to a pushed, prototyped, benchmarked space. Workspace-portable: one `app.yaml` edit deploys it into any Databricks workspace.
 
 ---
 
@@ -21,7 +21,7 @@ The app is a 6-session workbook. Each session is a form backed by a Delta table 
 - **Text Instructions** — analyst guidance that can't be expressed as SQL.
 - **Data Gaps** — capture concepts the BO asked about that have no data home yet.
 - **Scope Boundaries** — explicit "we are / are not covering X."
-- **Global Filter** — a space-wide WHERE clause (e.g., "only BCBS policies") that flows through to the metric view YAML and plan.
+- **Global Filter** — a space-wide WHERE clause (e.g., `region = 'North'`) that flows through to the metric view YAML and plan.
 - **Optional Metric View builder** —
   - Click "Draft YAML" and the app produces a Databricks-spec metric view YAML grounded in the actual UC column schemas of the source tables (DESCRIBE-driven, no hallucinated columns).
   - The YAML honors the global filter, detected PK/FK joins, and the analyst's Session 3 SQL expressions.
@@ -186,14 +186,40 @@ Everything else (UC catalog/schema/table picking, metric view detection, PK/FK j
 
 **Prod pattern for Genie Spaces:** Have your ops team create each space ahead of time (owned by a service principal for durability), grant each analyst `CAN MANAGE`, then drop the space ID into Session 5. The "Create New Space" toggle in Session 5 is for dev/testing only.
 
+### Step 2b — Configure user OAuth scopes (required)
+
+Databricks Apps read the end user's OAuth scopes from a CLI-only setting — **this is not something `app.yaml` can set**, and without it the app will fail silently at runtime (the warehouse dropdown empties, schema grounding fails, Genie push returns 403). Run this once after first deploy:
+
+```bash
+databricks apps update genie-discovery --profile <profile> --json '{
+  "name": "genie-discovery",
+  "user_api_scopes": [
+    "iam.current-user:read",
+    "iam.access-control:read",
+    "sql",
+    "dashboards.genie"
+  ]
+}'
+```
+
+What each scope unlocks:
+- `iam.current-user:read` — resolve the logged-in user for audit trails.
+- `iam.access-control:read` — check COE group membership for Session 4 approval gating.
+- `sql` — list warehouses, run `DESCRIBE TABLE` / `SHOW CREATE TABLE` for schema grounding, execute benchmark SQL.
+- `dashboards.genie` — create/update Genie Spaces via the Genie REST API on the user's behalf.
+
+After updating scopes, existing users will see an OAuth re-consent prompt on next load. If a user reports the warehouse dropdown is empty and the app returns "reauth_required", have them sign out (or open the app URL in a private window) to trigger the new-scope consent flow.
+
 ### Step 3 — Build the frontend
 
 ```bash
 cd frontend
-npm install
+npm install          # generates a fresh package-lock.json against your npm registry
 npm run build        # outputs to ../static/
 cd ..
 ```
+
+> `frontend/package-lock.json` is intentionally gitignored — it's regenerated on first install so your build isn't tied to whichever npm registry the previous author used.
 
 ### Step 4 — Upload and deploy
 

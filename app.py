@@ -13,12 +13,24 @@ from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 
-CATALOG = os.getenv("CATALOG", "genie_training")
-SCHEMA = os.getenv("SCHEMA", "genie_discovery")
+def _require_env(name):
+    v = (os.getenv(name) or "").strip()
+    if not v:
+        raise RuntimeError(
+            f"Required environment variable {name!r} is not set. "
+            f"Configure it in app.yaml (see README 'Deploy to your workspace')."
+        )
+    return v
+
+# Required — no defaults, since these encode workspace-specific resources.
+CATALOG = _require_env("CATALOG")
+SCHEMA = _require_env("SCHEMA")
+WAREHOUSE_ID = _require_env("DATABRICKS_WAREHOUSE_ID")
 TABLE = f"{CATALOG}.{SCHEMA}.discovery"
-WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "ad1dd0025031919f")
-COE_GROUP = os.getenv("COE_GROUP_NAME", "genie-coe-reviewers")
-LLM_ENDPOINT = os.getenv("LLM_ENDPOINT_NAME", "databricks-claude-sonnet-4-6")
+
+# Optional — sensible defaults are OK here.
+COE_GROUP = os.getenv("COE_GROUP_NAME") or "genie-coe-reviewers"
+LLM_ENDPOINT = os.getenv("LLM_ENDPOINT_NAME") or "databricks-claude-sonnet-4-6"
 
 w = WorkspaceClient()
 
