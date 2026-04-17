@@ -149,32 +149,59 @@ def api_user():
     return jsonify({"email": get_current_user()})
 
 
+def _user_workspace_client():
+    """Build a WorkspaceClient using the forwarded user access token (OBO).
+
+    Forces PAT auth via explicit Config so it does not accidentally combine
+    with the app service principal's OAuth creds from env vars.
+    Returns None if no user token is available.
+    """
+    user_token = request.headers.get("X-Forwarded-Access-Token")
+    if not user_token:
+        return None
+    from databricks.sdk import WorkspaceClient as WC
+    from databricks.sdk.core import Config
+    cfg = Config(host=w.config.host, token=user_token, auth_type="pat")
+    return WC(config=cfg)
+
+
 @app.route("/api/user/coe-member")
 def api_user_coe_member():
-    """Check if current user is a member of the COE reviewer group.
+    """Check COE membership using the user's forwarded access token (OBO).
 
-    Resolves the current user to their Databricks user ID, then compares
-    that ID against the group's member `value` field. Comparing on `display`
-    is unreliable because for some workspaces it returns the display name
-    rather than the username/email.
+    This respects the user's own permissions rather than requiring the app
+    service principal to be a workspace admin. Append ?debug=1 for
+    diagnostics.
     """
     email = get_current_user()
+    debug = request.args.get("debug") == "1"
+    result = {"is_member": False}
+    if debug:
+        result["email"] = email
+        result["coe_group_name"] = COE_GROUP
+
+    user_w = _user_workspace_client()
+    if not user_w:
+        if debug:
+            result["error"] = "no X-Forwarded-Access-Token header"
+        return jsonify(result)
+
     try:
-        users = list(w.users.list(filter=f'userName eq "{email}"'))
-        if not users:
-            return jsonify({"is_member": False})
-        user_id = users[0].id
-
-        groups = list(w.groups.list(filter=f'displayName eq "{COE_GROUP}"'))
-        if not groups or not groups[0].members:
-            return jsonify({"is_member": False})
-
-        for m in groups[0].members:
-            if m.value == user_id:
-                return jsonify({"is_member": True})
-        return jsonify({"is_member": False})
-    except Exception:
-        return jsonify({"is_member": False})
+        me = user_w.current_user.me()
+        me_groups = me.groups or []
+        if debug:
+            result["me_group_count"] = len(me_groups)
+            result["me_groups"] = [g.display for g in me_groups]
+        for g in me_groups:
+            if g.display == COE_GROUP:
+                result["is_member"] = True
+                return jsonify(result)
+        return jsonify(result)
+    except Exception as e:
+        if debug:
+            result["error"] = str(e)
+            result["error_type"] = type(e).__name__
+        return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
