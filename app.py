@@ -583,74 +583,301 @@ def coe_approve(eid):
 
 @app.route("/api/engagements/<eid>/auto-summary")
 def auto_summary(eid):
-    """Generate a structured summary of sessions 1-3."""
+    """Generate an LLM-driven Readiness Brief synthesizing Sessions 1-4 for COE review.
+
+    Replaces the older deterministic dump. The brief includes citation-backed
+    narrative, a coverage analysis tying S2 questions to S3 metrics, and a gap
+    section that distinguishes acknowledged vs unacknowledged gaps.
+    """
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
         return jsonify({"summary": ""}), 404
     eng = parse_row(rows[0])
-    s1 = eng["sessions"]["1"]
-    s2 = eng["sessions"]["2"]
-    s3 = eng["sessions"]["3"]
 
-    parts = []
-    parts.append(f"## Engagement: {eng.get('genie_space_name', 'Untitled')}")
-    parts.append(f"**Business Owner:** {eng.get('business_owner_name', '')} ({eng.get('business_owner_email', '')})")
-    parts.append(f"**Analyst:** {eng.get('analyst_name', '')} ({eng.get('analyst_email', '')})")
-    parts.append("")
+    try:
+        prompt = _build_readiness_brief_prompt(eng)
+        result = _call_llm(prompt)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[readiness-brief] ERROR: {e}\n{tb}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-    # Session 1
-    pain_points = s1.get("pain_points", [])
-    reports = s1.get("existing_reports", [])
-    parts.append("### Session 1: Business Context")
-    if pain_points:
-        parts.append(f"**Pain Points:** {len(pain_points)}")
-        for pp in pain_points:
-            parts.append(f"- {pp.get('description', '')}")
-    if reports:
-        parts.append(f"**Existing Reports:** {len(reports)}")
-        for r in reports:
-            parts.append(f"- {r.get('report_name', '')}: {r.get('what_it_shows', '')}")
-    parts.append("")
+    brief = str(result.get("brief", "")).strip()
+    if not brief:
+        return jsonify({"error": "LLM returned empty brief"}), 500
+    return jsonify({"summary": brief})
 
-    # Session 2
-    questions = s2.get("question_bank", [])
-    vocab = s2.get("vocabulary_metrics", [])
-    parts.append("### Session 2: Questions & Vocabulary")
-    parts.append(f"**Questions Captured:** {len(questions)}")
-    parts.append(f"**Vocabulary Terms:** {len(vocab)}")
-    if vocab:
-        terms_list = ", ".join(v.get("business_term", "") for v in vocab[:10])
-        parts.append(f"**Terms:** {terms_list}")
-    parts.append("")
 
-    # Session 3
-    classifications = s3.get("term_classifications", [])
-    sql_exprs = s3.get("sql_expressions", [])
-    text_instrs = s3.get("text_instructions", [])
-    data_gaps = s3.get("data_gaps", [])
-    scope = s3.get("scope_boundaries", [])
-    parts.append("### Session 3: Technical Design")
-    parts.append(f"**Classified Terms:** {len(classifications)}")
-    parts.append(f"**SQL Expressions (Metrics):** {len(sql_exprs)}")
+def _build_readiness_brief_prompt(eng):
+    """Build the LLM prompt that produces a COE-facing Readiness Brief."""
+    s1 = eng["sessions"].get("1", {}) or {}
+    s2 = eng["sessions"].get("2", {}) or {}
+    s3 = eng["sessions"].get("3", {}) or {}
+    s4 = eng["sessions"].get("4", {}) or {}
+
+    lines = []
+    lines.append(f"# Engagement: {eng.get('genie_space_name', 'Untitled')}")
+    lines.append(f"Business Owner: {eng.get('business_owner_name', '')} <{eng.get('business_owner_email', '')}>")
+    lines.append(f"Analyst: {eng.get('analyst_name', '')} <{eng.get('analyst_email', '')}>")
+    lines.append("")
+
+    # ----- SESSION 1 -----
+    lines.append("## SESSION 1: Business Context")
+    bc = s1.get("business_context", []) or []
+    if bc:
+        lines.append("### Business Context Q&A (BO answers)")
+        for b in bc:
+            if not isinstance(b, dict):
+                continue
+            q = (b.get("question") or "").strip()
+            why = (b.get("why_it_matters") or "").strip()
+            notes = (b.get("response") or "").strip()
+            if not (q or notes):
+                continue
+            lines.append(f"- **Q:** {q}")
+            if why:
+                lines.append(f"  - *Why it matters:* {why}")
+            if notes:
+                lines.append(f"  - **BO answer:** {notes}")
+    pps = s1.get("pain_points", []) or []
+    if pps:
+        lines.append("### Pain Points")
+        for pp in pps:
+            d = (pp.get("description") if isinstance(pp, dict) else str(pp)) or ""
+            d = d.strip()
+            if d:
+                lines.append(f"- {d}")
+    er = s1.get("existing_reports", []) or []
+    if er:
+        lines.append("### Existing Reports")
+        for r in er:
+            if not isinstance(r, dict):
+                continue
+            name = (r.get("report_name") or "").strip()
+            what = (r.get("what_it_shows") or "").strip()
+            freq = (r.get("frequency") or "").strip()
+            issues = (r.get("known_issues") or "").strip()
+            if not (name or what):
+                continue
+            line = f"- **{name}**"
+            if freq:
+                line += f" ({freq})"
+            if what:
+                line += f": {what}"
+            lines.append(line)
+            if issues:
+                lines.append(f"  - Known issues: {issues}")
+    lines.append("")
+
+    # ----- SESSION 2 -----
+    lines.append("## SESSION 2: Questions & Vocabulary")
+    qb = s2.get("question_bank", []) or []
+    if qb:
+        lines.append("### Question Bank")
+        for i, q in enumerate(qb, 1):
+            if not isinstance(q, dict):
+                continue
+            text = (q.get("question") or q.get("text") or "").strip()
+            decision = (q.get("decision_it_drives") or "").strip()
+            if not text:
+                continue
+            lines.append(f"- **Q{i}:** {text}")
+            if decision:
+                lines.append(f"  - Drives decision: {decision}")
+    vm = s2.get("vocabulary_metrics", []) or []
+    if vm:
+        lines.append("### Vocabulary & Metric Definitions")
+        for v in vm:
+            if not isinstance(v, dict):
+                continue
+            term = (v.get("business_term") or "").strip()
+            defn = (v.get("definition") or v.get("description") or "").strip()
+            synonyms = (v.get("synonyms") or "").strip()
+            if not term:
+                continue
+            line = f"- **{term}**"
+            if defn:
+                line += f": {defn}"
+            if synonyms:
+                line += f" (synonyms: {synonyms})"
+            lines.append(line)
+    lines.append("")
+
+    # ----- SESSION 3 -----
+    lines.append("## SESSION 3: Technical Design")
+    tc = s3.get("term_classifications", []) or []
+    if tc:
+        lines.append("### Term Classifications")
+        for t in tc:
+            if not isinstance(t, dict):
+                continue
+            term = (t.get("business_term") or t.get("term") or "").strip()
+            types = t.get("types") or []
+            if isinstance(types, list):
+                types_str = ", ".join(str(x) for x in types)
+            else:
+                types_str = str(types)
+            if term:
+                lines.append(f"- **{term}** → {types_str}")
+    sb = s3.get("scope_boundaries", []) or []
+    if sb:
+        lines.append("### Scope Boundaries")
+        for b in sb:
+            if not isinstance(b, dict):
+                continue
+            item = (b.get("item") or b.get("topic") or "").strip()
+            scope_status = (b.get("in_scope") or b.get("status") or "").strip()
+            notes = (b.get("notes") or b.get("rationale") or b.get("description") or "").strip()
+            if item:
+                line = f"- **{item}** ({scope_status})"
+                if notes:
+                    line += f": {notes}"
+                lines.append(line)
+    dg = s3.get("data_gaps", []) or []
+    if dg:
+        lines.append("### Data Gaps (analyst-acknowledged)")
+        for g in dg:
+            if not isinstance(g, dict):
+                continue
+            bq = (g.get("business_question") or g.get("topic") or g.get("gap") or "").strip()
+            avail = (g.get("data_available") or "").strip()
+            gap = (g.get("gap_description") or g.get("description") or g.get("detail") or "").strip()
+            res = (g.get("proposed_resolution") or "").strip()
+            if not (bq or gap):
+                continue
+            line = f"- **{bq}**"
+            if avail:
+                line += f" (data available: {avail})"
+            if gap:
+                line += f" — {gap}"
+            lines.append(line)
+            if res:
+                lines.append(f"  - Proposed resolution: {res}")
+    gf = (s3.get("global_filter") or "").strip()
+    if gf:
+        lines.append("### Global Filter")
+        lines.append(f"```\n{gf}\n```")
+    sql_exprs = s3.get("sql_expressions", []) or []
     if sql_exprs:
+        lines.append("### SQL Expressions (the core technical design)")
         for e in sql_exprs:
-            parts.append(f"- {e.get('metric_name', '')}: `{e.get('uc_table', '')}`")
-    parts.append(f"**Text Instructions:** {len(text_instrs)}")
-    parts.append(f"**Data Gaps:** {len(data_gaps)}")
-    parts.append(f"**Scope Boundaries:** {len(scope)}")
+            if not isinstance(e, dict):
+                continue
+            name = (e.get("metric_name") or "").strip()
+            tbl = (e.get("uc_table") or "").strip()
+            sql = (e.get("sql_code") or "").strip()
+            display = (e.get("display_name") or "").strip()
+            synonyms = (e.get("synonyms") or "").strip()
+            if not (name or sql):
+                continue
+            line = f"- **{name}**"
+            if display and display != name:
+                line += f" (display: {display})"
+            if tbl:
+                line += f" on `{tbl}`"
+            lines.append(line)
+            if sql:
+                lines.append(f"  - SQL: `{sql}`")
+            if synonyms:
+                lines.append(f"  - Synonyms: {synonyms}")
+    ti = s3.get("text_instructions", []) or []
+    if ti:
+        lines.append("### Text Instructions / Rules")
+        for t in ti:
+            if not isinstance(t, dict):
+                continue
+            title = (t.get("title") or "").strip()
+            instr = (t.get("instruction") or "").strip()
+            if title or instr:
+                lines.append(f"- **{title}**: {instr}")
+    mv_yaml = (s3.get("metric_view_yaml") or "").strip()
+    if mv_yaml:
+        lines.append("### Generated Metric View YAML")
+        lines.append(f"```yaml\n{mv_yaml}\n```")
+    mv_fqn = (s3.get("metric_view_fqn") or "").strip()
+    if mv_fqn:
+        lines.append(f"### Created Metric View: `{mv_fqn}`")
+    lines.append("")
 
-    # Tables identified
-    tables = set()
-    for e in sql_exprs:
-        t = e.get("uc_table", "")
-        if t and len(t.split(".")) == 3:
-            tables.add(t)
-    if tables:
-        parts.append(f"\n**Tables Identified ({len(tables)}):**")
-        for t in sorted(tables):
-            parts.append(f"- `{t}`")
+    # ----- SESSION 4 (data plan only — not the brief itself) -----
+    dp = s4.get("data_plan", []) or []
+    if dp:
+        lines.append("## SESSION 4: Data Plan (current state)")
+        for d in dp:
+            if not isinstance(d, dict):
+                continue
+            tbl = (d.get("table_or_view") or "").strip()
+            typ = (d.get("type") or "").strip()
+            inc = (d.get("include_in_space") or "").strip()
+            notes = (d.get("notes") or "").strip()
+            if not tbl:
+                continue
+            line = f"- **{tbl}** ({typ}, include: {inc})"
+            if notes:
+                line += f" — {notes}"
+            lines.append(line)
+        lines.append("")
 
-    return jsonify({"summary": "\n".join(parts)})
+    context = "\n".join(lines)
+
+    return f"""You are preparing a READINESS BRIEF for a Center of Excellence (COE) reviewer who must approve or reject this Genie Space engagement.
+
+The brief gives the COE reviewer a clear, citation-backed picture of:
+1. Whether the analyst captured enough information from the business owner to scope a useful Genie Space
+2. Whether the technical design (SQL expressions, metric view, data plan) actually addresses what the BO needs
+3. What's still NOT addressed, distinguishing acknowledged gaps (analyst-flagged) from unacknowledged coverage gaps (red flags)
+
+CRITICAL RULES:
+- CITE your sources. Every concrete claim should reference where it came from. Use citations like `[S1 Pain Points]`, `[S2 Q3]`, `[S3 SQL: denial_rate_pct]`, `[S4 Data Plan]`. Never make a coverage claim without a citation.
+- Be SKEPTICAL. The COE is liable for what they approve. Find holes. Do NOT smooth over gaps to make the brief feel coherent. Adversarial review is the goal.
+- Distinguish ACKNOWLEDGED gaps (the analyst flagged these in S3 Data Gaps — they are FINE to have) from UNACKNOWLEDGED gaps (S2 questions or existing-report metrics not covered by the design and not flagged — these are RED FLAGS).
+- If S3 SQL Expressions, the data plan, or the question bank is empty/sparse, FLAG IT explicitly. Do not pretend the engagement is ready when it isn't.
+- The COE will read this in 3-5 minutes. Be specific and concise. No filler.
+- Use the BO's language where possible (from S1 Business Context Q&A and S2 Vocabulary) — not invented terminology.
+
+OUTPUT STRUCTURE (markdown, exact section headers in this order):
+
+## TL;DR
+3-5 bullets: who the audience is, what they need, what was built, the headline risk.
+
+## What We Learned
+2-4 short paragraphs synthesizing S1+S2: the BO's day-to-day, decisions they make, pain points, existing reports they rely on, key vocabulary. Cite every paragraph.
+
+## Technical Approach
+2-3 short paragraphs on S3: source tables, key metrics defined, scope decisions, the metric view (or lack of one), the global filter if any. Cite specific SQL expressions or vocabulary terms.
+
+## Data Plan
+A short bulleted list of tables and metric views being included in the Genie Space (from S4 Data Plan). Identifier + 1-line purpose each. If empty, flag this as a problem.
+
+## Coverage Analysis
+Walk through the S2 Question Bank. For each question (group similar ones if there are many), classify and cite:
+- ✅ **Answerable**: name the specific measure/dimension/table that addresses it
+- ⚠️ **Partial**: what part is covered, what's missing
+- ❌ **Not addressed**: nothing in the design supports this
+
+If the question bank is empty, say so explicitly and flag it as a problem.
+
+## Open Gaps & Risks
+
+### Acknowledged Gaps
+List what the analyst already flagged in `S3 Data Gaps`. Brief context per item. These are NOT blockers.
+
+### Unacknowledged Gaps
+Coverage failures the analyst did NOT flag — S2 questions or existing-report metrics not supported by the current design. Each with severity: **Low / Medium / High**. THIS IS WHERE COE FOCUSES.
+
+If there are none, say "None identified" — but only if you've genuinely cross-checked every S2 question and existing report against the design.
+
+## Reviewer Recommendation
+ONE sentence framing the question for COE. NOT a verdict. Examples:
+- "Recommended: approve — coverage is strong, residual gaps are acknowledged and bounded."
+- "Recommended: request changes — Q3, Q7, Q11 cannot be answered by the current design and were not flagged."
+- "Recommended: clarify before review — Session 3 SQL Expressions has only 2 entries; the engagement is not ready for COE evaluation."
+
+<engagement_context>
+{context}
+</engagement_context>
+
+Return JSON: {{"brief": "<the markdown brief>"}}. Just the markdown — no markdown fences around the JSON itself."""
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
+import ReactMarkdown from "react-markdown";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
 import { api, BenchmarkQuestion } from "../api";
@@ -406,28 +407,54 @@ export default function Session4Form({
         </AccordionDetails>
       </Accordion>
 
-      {/* Auto-Summary */}
+      {/* Readiness Brief */}
       <Accordion defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography variant="h6">Sessions 1-3 Summary</Typography>
+          <Stack direction="row" alignItems="center" spacing={1}>
+            <Typography variant="h6">Readiness Brief</Typography>
+            <Chip label="AI-generated" size="small" variant="outlined" icon={<AutoAwesomeIcon />} />
+          </Stack>
         </AccordionSummary>
         <AccordionDetails>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Auto-generated snapshot of what was captured in Sessions 1-3.
+            Citation-backed synthesis of Sessions 1-4 for COE review. Includes coverage analysis
+            (which Question Bank items the design answers) and an explicit gaps section that
+            distinguishes analyst-acknowledged gaps from unacknowledged coverage failures.
+            Regenerate after any change to Sessions 1-3 or the Data Plan.
           </Typography>
           {!readOnly && (
             <Button
               size="small"
               variant="outlined"
+              startIcon={loadingSummary ? <CircularProgress size={14} /> : <AutoAwesomeIcon />}
               onClick={fetchSummary}
               disabled={loadingSummary}
               sx={{ mb: 2 }}
             >
-              {loadingSummary ? "Generating..." : "Refresh Summary"}
+              {loadingSummary ? "Generating..." : (summary ? "Regenerate Brief" : "Generate Brief")}
             </Button>
           )}
-          <Paper variant="outlined" sx={{ p: 2, bgcolor: "grey.50", whiteSpace: "pre-wrap", fontSize: 14 }}>
-            {summary || "No summary available. Click Refresh to generate."}
+          <Paper
+            variant="outlined"
+            sx={{
+              p: 3,
+              bgcolor: "grey.50",
+              fontSize: 14,
+              "& h1": { fontSize: "1.4rem", mt: 2, mb: 1 },
+              "& h2": { fontSize: "1.2rem", mt: 2.5, mb: 1, borderBottom: "1px solid", borderColor: "divider", pb: 0.5 },
+              "& h3": { fontSize: "1.05rem", mt: 2, mb: 0.5 },
+              "& p": { my: 1, lineHeight: 1.6 },
+              "& ul, & ol": { pl: 3, my: 1 },
+              "& li": { my: 0.25 },
+              "& code": { bgcolor: "grey.200", px: 0.5, borderRadius: 0.5, fontSize: "0.9em" },
+              "& pre": { bgcolor: "grey.900", color: "grey.100", p: 1.5, borderRadius: 1, overflowX: "auto" },
+              "& pre code": { bgcolor: "transparent", color: "inherit" },
+              "& strong": { fontWeight: 600 },
+            }}
+          >
+            {summary
+              ? <ReactMarkdown>{summary}</ReactMarkdown>
+              : <Typography variant="body2" color="text.secondary">No brief generated yet. Click Generate to synthesize Sessions 1-4 into a COE-ready brief.</Typography>}
           </Paper>
         </AccordionDetails>
       </Accordion>
