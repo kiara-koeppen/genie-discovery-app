@@ -596,22 +596,57 @@ def auto_summary(eid):
 
     try:
         prompt = _build_readiness_brief_prompt(eng)
-        result = _call_llm(prompt)
+        raw = _call_llm_raw(prompt)
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[readiness-brief] ERROR: {e}\n{tb}", flush=True)
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-    brief = str(result.get("brief", "")).strip()
+    # Output format:
+    # <markdown brief>
+    # ---STRUCTURED-GAPS---
+    # <JSON array of gap objects>
+    SENTINEL = "---STRUCTURED-GAPS---"
+    brief = ""
+    gaps_raw = []
+    if SENTINEL in raw:
+        parts = raw.split(SENTINEL, 1)
+        brief = parts[0].strip()
+        gaps_text = parts[1].strip()
+        # Strip any leading/trailing code fences around the JSON section
+        if gaps_text.startswith("```"):
+            gaps_text = gaps_text.split("\n", 1)[1] if "\n" in gaps_text else gaps_text
+            if gaps_text.endswith("```"):
+                gaps_text = gaps_text.rsplit("\n", 1)[0] if "\n" in gaps_text else gaps_text[:-3]
+            gaps_text = gaps_text.strip()
+            if gaps_text.lower().startswith("json"):
+                gaps_text = gaps_text[4:].lstrip()
+        try:
+            gaps_raw = json.loads(gaps_text)
+        except Exception as e:
+            print(f"[readiness-brief] gap JSON parse failed: {e}; tail of raw output: {raw[-500:]}", flush=True)
+            gaps_raw = []
+    else:
+        # Sentinel missing -- treat the entire response as the brief, no gaps surfaced
+        brief = raw.strip()
+        print("[readiness-brief] sentinel missing; full output treated as brief", flush=True)
+
+    # Strip wrapping code fences from the markdown if any (defensive)
+    if brief.startswith("```"):
+        brief = brief.split("\n", 1)[1] if "\n" in brief else brief
+        if brief.endswith("```"):
+            brief = brief.rsplit("\n", 1)[0] if "\n" in brief else brief[:-3]
+        brief = brief.strip()
+        if brief.lower().startswith("markdown"):
+            brief = brief[8:].lstrip()
+
     if not brief:
         return jsonify({"error": "LLM returned empty brief"}), 500
 
-    # Normalize structured unacknowledged gaps the LLM extracted alongside the
-    # markdown. Each gap drives a response card in the Analyst Commentary form.
-    raw_gaps = result.get("unacknowledged_gaps") or []
+    # Normalize structured unacknowledged gaps. Each drives a response card.
     gaps = []
-    if isinstance(raw_gaps, list):
-        for g in raw_gaps:
+    if isinstance(gaps_raw, list):
+        for g in gaps_raw:
             if not isinstance(g, dict):
                 continue
             title = str(g.get("title", "")).strip()
@@ -913,28 +948,26 @@ ONE sentence framing the question for COE. NOT a verdict. Examples:
 {context}
 </engagement_context>
 
-OUTPUT — return EXACTLY this JSON shape:
+OUTPUT FORMAT — emit the markdown brief, then a sentinel line, then a JSON array of structured unacknowledged gaps. Exactly this format:
 
-{{
-  "brief": "<the full markdown brief, with all sections above>",
-  "unacknowledged_gaps": [
-    {{
-      "id": "<stable slug derived from the title; lowercase, dashes only, no spaces>",
-      "title": "<short headline, ~3-7 words>",
-      "severity": "<one of: Low, Medium, High>",
-      "summary": "<1-2 sentences explaining the gap and why it matters>",
-      "citations": ["<source tags like 'S1 Business Context Q&A' or 'S3 Generated Metric View YAML'>"]
-    }}
-  ]
-}}
+<the full markdown brief — every section above, in order, no JSON wrapping, no escaping needed, raw markdown>
+---STRUCTURED-GAPS---
+[
+  {{
+    "id": "<stable slug from the title; lowercase, dashes only, no spaces>",
+    "title": "<short headline, ~3-7 words>",
+    "severity": "Low" | "Medium" | "High",
+    "summary": "<1-2 sentences explaining the gap and why it matters>",
+    "citations": ["<source tags like 'S1 Business Context Q&A'>"]
+  }}
+]
 
-CRITICAL: the entries in `unacknowledged_gaps` MUST match the gaps you list under `## Open Gaps & Risks` → `### Unacknowledged Gaps` in the markdown. Same gaps, same titles, same order, same severities. The structured array is the source of truth and the markdown should mirror it.
-
-Do NOT include acknowledged gaps in `unacknowledged_gaps` — only gaps the analyst did NOT flag in S3 Data Gaps.
-
-If there are no unacknowledged gaps, return an empty array: `"unacknowledged_gaps": []`.
-
-Just the JSON — no markdown fences around the JSON itself."""
+CRITICAL:
+- The literal sentinel `---STRUCTURED-GAPS---` MUST appear on its own line between the markdown and the JSON. No other use of that string anywhere.
+- The markdown brief comes first, raw — DO NOT wrap it in JSON, DO NOT escape its quotes or newlines, DO NOT put it inside a code fence.
+- The JSON array after the sentinel MUST contain exactly the same gaps you listed under `### Unacknowledged Gaps` in the markdown — same titles, same order, same severities. The JSON is the source of truth for downstream UI.
+- Do NOT include acknowledged gaps in the JSON array — only gaps the analyst did NOT flag in S3 Data Gaps.
+- If there are no unacknowledged gaps, the JSON array is just `[]`."""
 
 
 # ---------------------------------------------------------------------------
@@ -1245,24 +1278,31 @@ Return ONLY the JSON object. No markdown fences, no preamble, no trailing commen
     return prompt
 
 
-def _call_llm(prompt):
-    """Call the Databricks serving endpoint with the prompt. Returns parsed JSON."""
+def _call_llm_raw(prompt):
+    """Call the Databricks serving endpoint and return the raw text content (no JSON parse).
+
+    Use this when the prompt asks for non-JSON output (e.g. markdown with a
+    structured trailer) — JSON-wrapping markdown content breaks on every
+    backtick or newline the LLM emits.
+    """
     resp = w.serving_endpoints.query(
         name=LLM_ENDPOINT,
         messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
         max_tokens=16000,
         temperature=0.2,
     )
-    # Response shape varies: SDK object, dict, or OpenAI-style object
     if isinstance(resp, dict):
         d = resp
     elif hasattr(resp, "as_dict"):
         d = resp.as_dict()
     else:
         d = {"choices": [{"message": {"content": resp.choices[0].message.content}}]}
-    content = d["choices"][0]["message"]["content"]
+    return d["choices"][0]["message"]["content"]
 
-    # Strip markdown fences if model ignored the instruction
+
+def _call_llm(prompt):
+    """Call the LLM and return parsed JSON. Tolerates ```json fences."""
+    content = _call_llm_raw(prompt)
     text = content.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text
@@ -1271,7 +1311,6 @@ def _call_llm(prompt):
         text = text.strip()
         if text.startswith("json"):
             text = text[4:].strip()
-
     return json.loads(text)
 
 

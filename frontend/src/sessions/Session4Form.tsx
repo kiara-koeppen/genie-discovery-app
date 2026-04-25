@@ -87,6 +87,7 @@ export default function Session4Form({
 }: Props) {
   const [summary, setSummary] = useState("");
   const [loadingSummary, setLoadingSummary] = useState(false);
+  const [briefError, setBriefError] = useState("");
   const [currentGaps, setCurrentGaps] = useState<BriefGap[]>([]);
   const [approvalNotes, setApprovalNotes] = useState("");
   const [draftingBenchmarks, setDraftingBenchmarks] = useState(false);
@@ -206,6 +207,7 @@ export default function Session4Form({
   const fetchSummary = async () => {
     if (!engagementId) return;
     setLoadingSummary(true);
+    setBriefError("");
     try {
       const res = await api.getAutoSummary(engagementId);
       setSummary(res.summary);
@@ -214,8 +216,10 @@ export default function Session4Form({
       setCurrentGaps(gaps);
       onChange("brief_unacknowledged_gaps", gaps);
       reconcileGaps(gaps);
-    } catch {
-      setSummary("Failed to generate summary.");
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      setBriefError(msg);
+      console.error("[readiness-brief] generate failed:", err);
     }
     setLoadingSummary(false);
   };
@@ -585,6 +589,14 @@ export default function Session4Form({
             >
               {loadingSummary ? "Generating..." : (summary ? "Regenerate Brief" : "Generate Brief")}
             </Button>
+          )}
+          {briefError && (
+            <Alert severity="error" sx={{ mb: 2 }} onClose={() => setBriefError("")}>
+              <strong>Brief generation failed:</strong>{" "}
+              <Box component="span" sx={{ fontFamily: "monospace", fontSize: 12 }}>
+                {briefError}
+              </Box>
+            </Alert>
           )}
           <Paper
             variant="outlined"
