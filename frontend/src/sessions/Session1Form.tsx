@@ -14,13 +14,12 @@ const CONTEXT_QUESTIONS = [
 ];
 
 const CONTEXT_COLS: ColumnDef[] = [
-  { key: "question", label: "Question", width: 250, readOnlyField: true },
-  { key: "why_it_matters", label: "Why It Matters for Genie", width: 250, readOnlyField: true },
+  { key: "question", label: "Question", width: 250, type: "textarea" },
+  { key: "why_it_matters", label: "Why It Matters for Genie", width: 250, type: "textarea" },
   { key: "response", label: "Notes", type: "textarea" },
 ];
 
 const PAIN_COLS: ColumnDef[] = [
-  { key: "rank", label: "#", width: 50 },
   { key: "description", label: "Pain Point", type: "textarea" },
 ];
 
