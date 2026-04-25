@@ -495,6 +495,34 @@ export default function Session4Form({
         </Alert>
       )}
 
+      {/* Data Plan */}
+      <Accordion defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="h6">Data Plan</Typography>
+            <Chip
+              label={`${(data.data_plan || []).length} items`}
+              size="small"
+              variant="outlined"
+            />
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Tables and metric views that will be included in the Genie Space. Pre-populated
+            from Session 3. Add additional tables or metric views you have created. The Readiness
+            Brief below uses this data plan as one of its inputs -- regenerate the brief after
+            any changes here.
+          </Typography>
+          <EditableTable
+            columns={DATA_PLAN_COLS}
+            rows={data.data_plan || []}
+            onChange={(rows) => onChange("data_plan", rows)}
+            readOnly={readOnly}
+          />
+        </AccordionDetails>
+      </Accordion>
+
       {/* Readiness Brief */}
       <Accordion defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
@@ -505,9 +533,9 @@ export default function Session4Form({
         </AccordionSummary>
         <AccordionDetails>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Citation-backed synthesis of Sessions 1-4 for COE review. Includes coverage analysis
-            (which Question Bank items the design answers) and an explicit gaps section that
-            distinguishes analyst-acknowledged gaps from unacknowledged coverage failures.
+            Citation-backed synthesis of Sessions 1-3 plus the Data Plan above. Includes coverage
+            analysis (which Question Bank items the design answers) and an explicit gaps section
+            that distinguishes analyst-acknowledged gaps from unacknowledged coverage failures.
             Regenerate after any change to Sessions 1-3 or the Data Plan.
           </Typography>
           {!readOnly && (
@@ -644,32 +672,6 @@ export default function Session4Form({
               )}
             </>
           )}
-        </AccordionDetails>
-      </Accordion>
-
-      {/* Data Plan */}
-      <Accordion defaultExpanded>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-            <Typography variant="h6">Data Plan</Typography>
-            <Chip
-              label={`${(data.data_plan || []).length} items`}
-              size="small"
-              variant="outlined"
-            />
-          </Box>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Tables and metric views that will be included in the Genie Space. Pre-populated
-            from Session 3. Add additional tables or metric views you have created.
-          </Typography>
-          <EditableTable
-            columns={DATA_PLAN_COLS}
-            rows={data.data_plan || []}
-            onChange={(rows) => onChange("data_plan", rows)}
-            readOnly={readOnly}
-          />
         </AccordionDetails>
       </Accordion>
 
