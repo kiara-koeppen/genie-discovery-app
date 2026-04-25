@@ -358,9 +358,6 @@ export default function Session4Form({
     }
   };
 
-  // Metric view YAML from Session 3
-  const metricViewYaml = session3Data?.metric_view_yaml || "";
-
   return (
     <Box>
       <Alert severity="info" sx={{ mb: 2 }}>
@@ -385,27 +382,6 @@ export default function Session4Form({
           <strong>COE Feedback:</strong> {data.coe_approval_notes}
         </Alert>
       )}
-
-      {/* Analyst Commentary */}
-      <Accordion defaultExpanded>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography variant="h6">Analyst Commentary</Typography>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Summarize what you learned from the business owner, your technical approach,
-            and anything the COE should know when reviewing this engagement.
-          </Typography>
-          <ExpandableTextField
-            minRows={6}
-            placeholder="Describe your findings, approach, and recommendations for the COE..."
-            value={data.analyst_commentary || ""}
-            onChange={(v) => onChange("analyst_commentary", v)}
-            disabled={readOnly}
-            dialogTitle="Analyst Commentary"
-          />
-        </AccordionDetails>
-      </Accordion>
 
       {/* Readiness Brief */}
       <Accordion defaultExpanded>
@@ -456,6 +432,27 @@ export default function Session4Form({
               ? <ReactMarkdown>{summary}</ReactMarkdown>
               : <Typography variant="body2" color="text.secondary">No brief generated yet. Click Generate to synthesize Sessions 1-4 into a COE-ready brief.</Typography>}
           </Paper>
+        </AccordionDetails>
+      </Accordion>
+
+      {/* Analyst Commentary */}
+      <Accordion defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Typography variant="h6">Analyst Commentary</Typography>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Summarize what you learned from the business owner, your technical approach,
+            and anything the COE should know when reviewing this engagement.
+          </Typography>
+          <ExpandableTextField
+            minRows={6}
+            placeholder="Describe your findings, approach, and recommendations for the COE..."
+            value={data.analyst_commentary || ""}
+            onChange={(v) => onChange("analyst_commentary", v)}
+            disabled={readOnly}
+            dialogTitle="Analyst Commentary"
+          />
         </AccordionDetails>
       </Accordion>
 
@@ -811,29 +808,6 @@ export default function Session4Form({
             <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
               No benchmarks yet. Click "Draft Benchmarks from Sessions 1-3" to seed a starting set.
             </Typography>
-          )}
-        </AccordionDetails>
-      </Accordion>
-
-      {/* Metric View YAML */}
-      <Accordion defaultExpanded={!!metricViewYaml}>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography variant="h6">Recommended Metric View</Typography>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Generated metric view YAML from Session 3 based on the SQL expressions defined.
-            The analyst should create this metric view in the workspace before requesting approval.
-          </Typography>
-          {metricViewYaml ? (
-            <Paper variant="outlined" sx={{ p: 2, bgcolor: "grey.900", color: "grey.100", fontFamily: "monospace", fontSize: 13, whiteSpace: "pre-wrap", overflowX: "auto" }}>
-              {metricViewYaml}
-            </Paper>
-          ) : (
-            <Alert severity="info">
-              No metric view YAML has been generated yet. Complete Session 3's SQL Expressions
-              section to generate a recommendation.
-            </Alert>
           )}
         </AccordionDetails>
       </Accordion>
