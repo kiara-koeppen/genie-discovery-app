@@ -1463,27 +1463,117 @@ def generate_plan(eid):
 # ---------------------------------------------------------------------------
 
 def _build_benchmark_draft_prompt(eng, count=12):
-    """Draft benchmark questions from Sessions 1-3 context."""
-    s1 = eng["sessions"]["1"]
-    s2 = eng["sessions"]["2"]
-    s3 = eng["sessions"]["3"]
-    s4 = eng["sessions"]["4"]
+    """Draft benchmark questions from full engagement context (Sessions 1-4)."""
+    s1 = eng["sessions"].get("1", {}) or {}
+    s2 = eng["sessions"].get("2", {}) or {}
+    s3 = eng["sessions"].get("3", {}) or {}
+    s4 = eng["sessions"].get("4", {}) or {}
 
     lines = []
     lines.append(f"Genie Space: {eng.get('genie_space_name', '')}")
+    lines.append("")
+
+    # S1: Business Context Q&A (the BO's own words about their work)
+    bc = s1.get("business_context", []) or []
+    if bc:
+        lines.append("Business Context (BO answers — use this language):")
+        for b in bc:
+            if not isinstance(b, dict):
+                continue
+            q = (b.get("question") or "").strip()
+            notes = (b.get("response") or "").strip()
+            if q and notes:
+                lines.append(f"- Q: {q}")
+                lines.append(f"  A: {notes}")
+
+    lines.append("")
     lines.append("Pain Points:")
-    for pp in s1.get("pain_points", []):
-        lines.append(f"- {pp.get('description', '')}")
-    lines.append("Question Bank (from business owner):")
-    for q in s2.get("question_bank", []):
-        lines.append(f"- {q.get('question') or q.get('text') or ''}")
+    for pp in s1.get("pain_points", []) or []:
+        if isinstance(pp, dict):
+            lines.append(f"- {pp.get('description', '')}")
+
+    lines.append("")
+    lines.append("Question Bank (from business owner — prefer this phrasing):")
+    qb = s2.get("question_bank", []) or []
+    if qb:
+        for q in qb:
+            if isinstance(q, dict):
+                text = (q.get("question") or q.get("text") or "").strip()
+                if text:
+                    lines.append(f"- {text}")
+    else:
+        lines.append("(empty — no BO-captured questions; rely on Business Context Q&A above for phrasing)")
+
+    # S2: Vocabulary with synonyms (critical for Edge Case generation)
+    vm = s2.get("vocabulary_metrics", []) or []
+    if vm:
+        lines.append("")
+        lines.append("Vocabulary & Synonyms (use these in Edge Case questions to test synonym handling):")
+        for v in vm:
+            if isinstance(v, dict):
+                term = (v.get("business_term") or "").strip()
+                defn = (v.get("definition") or v.get("description") or "").strip()
+                synonyms = (v.get("synonyms") or "").strip()
+                if term:
+                    line = f"- {term}"
+                    if defn:
+                        line += f" — {defn}"
+                    if synonyms:
+                        line += f" (synonyms: {synonyms})"
+                    lines.append(line)
+
+    # S3: Scope boundaries (what's IN/OUT — questions must respect)
+    sb = s3.get("scope_boundaries", []) or []
+    if sb:
+        lines.append("")
+        lines.append("Scope Boundaries (do NOT generate questions outside scope):")
+        for b in sb:
+            if isinstance(b, dict):
+                item = (b.get("item") or b.get("topic") or "").strip()
+                scope_status = (b.get("in_scope") or b.get("status") or "").strip()
+                if item:
+                    lines.append(f"- {item}: {scope_status}")
+
+    lines.append("")
     lines.append("Key Metrics / SQL Expressions:")
-    for e in s3.get("sql_expressions", []):
-        lines.append(f"- {e.get('metric_name','')} ({e.get('display_name','')}): `{e.get('sql_code','')}` on {e.get('uc_table','')}")
-    lines.append("Tables in scope:")
-    for d in s4.get("data_plan", []):
-        if d.get("include_in_space") == "Yes":
-            lines.append(f"- {d.get('table_or_view','')}")
+    for e in s3.get("sql_expressions", []) or []:
+        if isinstance(e, dict):
+            lines.append(
+                f"- {e.get('metric_name','')} ({e.get('display_name','')}): "
+                f"`{e.get('sql_code','')}` on {e.get('uc_table','')}"
+            )
+
+    # S3: Text instructions (rules the analyst flagged)
+    ti = s3.get("text_instructions", []) or []
+    if ti:
+        lines.append("")
+        lines.append("Analyst Rules / Instructions:")
+        for t in ti:
+            if isinstance(t, dict):
+                title = (t.get("title") or "").strip()
+                instr = (t.get("instruction") or "").strip()
+                if title or instr:
+                    lines.append(f"- {title}: {instr}")
+
+    # S3: Metric view YAML (the actual dimensions/measures Genie sees)
+    mv_yaml = (s3.get("metric_view_yaml") or "").strip()
+    if mv_yaml:
+        lines.append("")
+        lines.append("Generated Metric View YAML (the actual dimensions/measures the Genie Space exposes):")
+        lines.append("```yaml")
+        lines.append(mv_yaml)
+        lines.append("```")
+
+    # S4: Data plan WITH type (Table vs Metric View)
+    lines.append("")
+    lines.append("Data Plan (in-scope sources):")
+    for d in s4.get("data_plan", []) or []:
+        if isinstance(d, dict) and d.get("include_in_space") == "Yes":
+            tbl = (d.get("table_or_view") or "").strip()
+            typ = (d.get("type") or "Table").strip()
+            if tbl:
+                lines.append(f"- {tbl} ({typ})")
+
     context = "\n".join(lines)
 
     overgen = count + 10
@@ -1510,11 +1600,14 @@ Final output — a JSON array with exactly {count} items. Each item:
 
 Constraints on the final {count}:
 - Every major pain point is tested at least once.
-- Every in-scope table appears in at least one question.
-- About 70% Core (realistic questions), 30% Edge Case (ambiguous phrasing, boundary conditions, synonym tests, trick wording).
+- Every in-scope table or metric view appears in at least one question. If a Metric View is in scope, prioritize testing its measures and dimensions by name.
+- About 70% Core (realistic questions), 30% Edge Case. For Edge Cases:
+  * Use synonyms from the Vocabulary section to test synonym handling (e.g., if "BCBS" is a synonym for "Blue Cross", a question like "What's BCBS's denial rate?" tests whether Genie maps it correctly).
+  * Test ambiguous phrasing, boundary conditions, and trick wording.
+- Respect Scope Boundaries — do NOT generate questions about explicitly out-of-scope topics.
 - Difficulty reflects SQL complexity: Easy = single table, simple filter; Medium = aggregation + group by; Hard = multi-table joins or subqueries.
 - Include a mix of time-bound (last quarter, YTD) and aggregation styles.
-- Prefer the business owner's own phrasing when a matching question exists in their question bank.
+- Prefer the business owner's own phrasing — pull from the Question Bank when populated, and from the Business Context Q&A answers otherwise. Use the BO's actual words.
 - Do NOT draft SQL — just the questions. SQL will be drafted per-row later.
 
 Return ONLY the JSON array of {count} final picks, highest-value first. No markdown fences, no preamble, no commentary about the candidate pool."""
@@ -1585,6 +1678,7 @@ def draft_benchmark_sql(eid):
     body = request.json or {}
     question = (body.get("question") or "").strip()
     warehouse_id = (body.get("warehouse_id") or "").strip()
+    validate = bool(body.get("validate"))
     if not question:
         return jsonify({"error": "question is required"}), 400
 
@@ -1676,9 +1770,84 @@ Rules:
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-    # Second LLM call — summary is derived from the final SQL, not from the
-    # question. Guarantees the plain-English explanation describes what the
-    # query actually does.
+    # Optional validation pass: run the drafted SQL on the chosen warehouse.
+    # If it fails, do ONE auto-fix retry with the error message so the LLM
+    # can correct hallucinated columns / dialect issues. Mirrors the metric
+    # view YAML retry pattern.
+    validation = None
+    if validate and sql_text and warehouse_id:
+        validation = {"ran": False, "error": None, "retried": False, "sample_result": None}
+        run_result = _execute_benchmark_sql_obo(user_w, sql_text, warehouse_id)
+        if run_result.get("error"):
+            err_msg = run_result["error"]
+            print(f"[draft-benchmark-sql] validation failed: {err_msg}", flush=True)
+            # ONE retry with the error embedded in the prompt
+            retry_prompt = f"""Your drafted SQL failed when executed on Databricks. Fix it.
+
+<failed_sql>
+{sql_text}
+</failed_sql>
+
+<execution_error>
+{err_msg}
+</execution_error>
+
+<table_schemas>
+{schemas_text}
+</table_schemas>
+
+<known_metrics>
+{metrics_text}
+</known_metrics>
+
+<benchmark_question>
+{question}
+</benchmark_question>
+
+Common causes:
+- Column name doesn't exist (check the schema list above carefully)
+- Wrong dialect (this is Databricks SQL / Spark SQL — see common gotchas: DATE_ADD takes integer days; use ADD_MONTHS for months; DATEDIFF is (end, start); single quotes for strings)
+- Missing fully-qualified table reference
+
+Return JSON: {{"sql": "the corrected SQL"}}. No markdown fences, no commentary."""
+            try:
+                retry_result = _call_llm(retry_prompt)
+                if isinstance(retry_result, dict):
+                    retry_sql = str(retry_result.get("sql", "")).strip()
+                else:
+                    retry_sql = str(retry_result or "").strip()
+                if retry_sql.startswith("```"):
+                    retry_sql = retry_sql.split("\n", 1)[1] if "\n" in retry_sql else retry_sql
+                    if retry_sql.endswith("```"):
+                        retry_sql = retry_sql.rsplit("\n", 1)[0] if "\n" in retry_sql else retry_sql[:-3]
+                    retry_sql = retry_sql.strip()
+                    if retry_sql.lower().startswith("sql"):
+                        retry_sql = retry_sql[3:].lstrip()
+                if retry_sql:
+                    retry_run = _execute_benchmark_sql_obo(user_w, retry_sql, warehouse_id)
+                    validation["retried"] = True
+                    if retry_run.get("error"):
+                        # Both passes failed — keep the original SQL and surface the latest error
+                        validation["ran"] = False
+                        validation["error"] = retry_run["error"]
+                    else:
+                        # Retry succeeded — promote the corrected SQL
+                        sql_text = retry_sql
+                        validation["ran"] = True
+                        validation["error"] = None
+                        validation["sample_result"] = retry_run
+                else:
+                    validation["error"] = err_msg
+            except Exception as e:
+                print(f"[draft-benchmark-sql] retry failed: {type(e).__name__}: {e}", flush=True)
+                validation["error"] = err_msg
+        else:
+            validation["ran"] = True
+            validation["sample_result"] = run_result
+
+    # Second LLM call — summary is derived from the final SQL (post-retry if
+    # applicable), not from the question. Guarantees the plain-English
+    # explanation describes what the query actually does.
     explanation = ""
     if sql_text:
         try:
@@ -1686,7 +1855,11 @@ Rules:
         except Exception as e:
             print(f"[draft-benchmark-sql] summary generation failed: {type(e).__name__}: {e}", flush=True)
 
-    return jsonify({"sql": sql_text, "explanation": explanation})
+    return jsonify({
+        "sql": sql_text,
+        "explanation": explanation,
+        "validation": validation,
+    })
 
 
 def _summarize_benchmark_sql(question, sql_text):
@@ -1729,6 +1902,71 @@ def draft_benchmark_summary(eid):
     return jsonify({"explanation": explanation})
 
 
+def _execute_benchmark_sql_obo(user_w, sql_text, warehouse_id, limit_cap=50):
+    """Run benchmark SQL via OBO; return a dict with columns/rows/row_count or error.
+
+    Always returns a dict (never raises). The caller can check for `error`.
+    Used by both `/run-benchmark-sql` (analyst-triggered) and the draft
+    validation pass (auto-triggered after SQL drafting).
+    """
+    if not user_w:
+        return {"error": "User auth unavailable — reload the app so OBO token is present"}
+    if not sql_text:
+        return {"error": "sql is required"}
+    if not warehouse_id:
+        return {"error": "warehouse_id is required"}
+
+    stmt = sql_text.rstrip().rstrip(";").strip()
+    wrapped = f"SELECT * FROM (\n{stmt}\n) __bm LIMIT {limit_cap}"
+
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id,
+            statement=wrapped,
+            wait_timeout="50s",
+        )
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    statement_id = resp.statement_id
+    state = str(resp.status.state) if resp.status else ""
+    import time as _time
+    deadline = _time.time() + 120
+    while statement_id and "SUCCEEDED" not in state and "FAILED" not in state and "CANCELED" not in state and "CLOSED" not in state:
+        if _time.time() > deadline:
+            try:
+                user_w.statement_execution.cancel_execution(statement_id)
+            except Exception:
+                pass
+            return {"error": "Query timed out after 2 minutes waiting for the warehouse"}
+        _time.sleep(1.5)
+        try:
+            resp = user_w.statement_execution.get_statement(statement_id)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        state = str(resp.status.state) if resp.status else ""
+
+    if "SUCCEEDED" not in state:
+        err = resp.status.error.message if (resp.status and resp.status.error) else f"Statement state: {state}"
+        return {"error": err}
+
+    columns: list[str] = []
+    out_rows: list[list] = []
+    row_count = 0
+    if resp.manifest and resp.manifest.schema and resp.manifest.schema.columns:
+        columns = [c.name for c in resp.manifest.schema.columns]
+    if resp.result and resp.result.data_array:
+        out_rows = [list(r) for r in resp.result.data_array]
+        row_count = len(out_rows)
+    return {
+        "columns": columns,
+        "rows": out_rows,
+        "row_count": row_count,
+        "truncated": row_count >= limit_cap,
+        "limit": limit_cap,
+    }
+
+
 @app.route("/api/engagements/<eid>/run-benchmark-sql", methods=["POST"])
 def run_benchmark_sql(eid):
     """Execute benchmark SQL via OBO and return a sample of rows for BO review."""
@@ -1739,75 +1977,9 @@ def run_benchmark_sql(eid):
     body = request.json or {}
     sql_text = (body.get("sql") or "").strip()
     warehouse_id = (body.get("warehouse_id") or "").strip()
-    if not sql_text:
-        return jsonify({"error": "sql is required"}), 400
-    if not warehouse_id:
-        return jsonify({"error": "warehouse_id is required"}), 400
-
     user_w = _user_workspace_client()
-    if not user_w:
-        return jsonify({"error": "User auth unavailable — reload the app so OBO token is present"}), 401
-
-    # Strip trailing semicolons so the wrapper doesn't break
-    stmt = sql_text.rstrip().rstrip(";").strip()
-
-    # Always wrap in an outer LIMIT so the BO preview can't pull huge result
-    # sets. Wrapping is safe whether the inner query has its own LIMIT,
-    # ORDER BY, or CTEs — the outer cap applies to whatever the inner returns.
-    limit_cap = 50
-    wrapped = f"SELECT * FROM (\n{stmt}\n) __bm LIMIT {limit_cap}"
-
-    try:
-        # wait_timeout=50s lets the call block up to 50s before returning
-        # PENDING/RUNNING. We still poll below so a cold warehouse start
-        # doesn't surface as a misleading error.
-        resp = user_w.statement_execution.execute_statement(
-            warehouse_id=warehouse_id,
-            statement=wrapped,
-            wait_timeout="50s",
-        )
-    except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 200
-
-    statement_id = resp.statement_id
-    state = str(resp.status.state) if resp.status else ""
-    import time as _time
-    deadline = _time.time() + 120  # up to 2 min total (warehouse cold start + query)
-    while statement_id and "SUCCEEDED" not in state and "FAILED" not in state and "CANCELED" not in state and "CLOSED" not in state:
-        if _time.time() > deadline:
-            try:
-                user_w.statement_execution.cancel_execution(statement_id)
-            except Exception:
-                pass
-            return jsonify({"error": "Query timed out after 2 minutes waiting for the warehouse"}), 200
-        _time.sleep(1.5)
-        try:
-            resp = user_w.statement_execution.get_statement(statement_id)
-        except Exception as e:
-            return jsonify({"error": f"{type(e).__name__}: {e}"}), 200
-        state = str(resp.status.state) if resp.status else ""
-
-    if "SUCCEEDED" not in state:
-        err = resp.status.error.message if (resp.status and resp.status.error) else f"Statement state: {state}"
-        return jsonify({"error": err}), 200
-
-    columns: list[str] = []
-    out_rows: list[list] = []
-    row_count = 0
-    if resp.manifest and resp.manifest.schema and resp.manifest.schema.columns:
-        columns = [c.name for c in resp.manifest.schema.columns]
-    if resp.result and resp.result.data_array:
-        out_rows = [list(r) for r in resp.result.data_array]
-        row_count = len(out_rows)
-    truncated = row_count >= limit_cap
-
-    return jsonify({
-        "columns": columns,
-        "rows": out_rows,
-        "row_count": row_count,
-        "truncated": truncated,
-        "limit": limit_cap,
-    })
+    result = _execute_benchmark_sql_obo(user_w, sql_text, warehouse_id)
+    return jsonify(result), 200
 
 
 # ---------------------------------------------------------------------------

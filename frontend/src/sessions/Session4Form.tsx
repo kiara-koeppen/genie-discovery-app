@@ -395,13 +395,46 @@ export default function Session4Form({
     next[idx] = rest;
     onChange("benchmark_questions", next);
   };
+  // Translate the backend validation field into the row's sample_result + a
+  // small "validation_status" tag the UI uses for the per-row chip.
+  type ValidationField = Awaited<ReturnType<typeof api.draftBenchmarkSql>>["validation"];
+  const applyValidationToPatch = (
+    patch: Record<string, any>,
+    validation: ValidationField | undefined,
+  ) => {
+    if (!validation) {
+      patch.validation_status = "skipped"; // no warehouse selected, or backend skipped
+      return;
+    }
+    if (validation.ran && validation.sample_result) {
+      patch.sample_result = {
+        ...validation.sample_result,
+        ran_at: new Date().toISOString(),
+        error: "",
+      };
+      patch.validation_status = validation.retried ? "retried_ok" : "ok";
+    } else if (validation.error) {
+      patch.sample_result = {
+        ran_at: new Date().toISOString(),
+        columns: [],
+        rows: [],
+        row_count: 0,
+        truncated: false,
+        limit: 50,
+        error: validation.error,
+      };
+      patch.validation_status = "failed";
+    }
+  };
+
   const draftSqlForRow = async (idx: number) => {
     if (!engagementId) return;
     const q = benchmarks[idx]?.question?.trim();
     if (!q) return;
     setDraftingSqlIdx(idx);
     try {
-      const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId);
+      const validate = !!benchmarkWarehouseId;
+      const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId, validate);
       const existing = benchmarks[idx];
       const patch: Record<string, any> = { expected_sql: res.sql };
       // Only populate notes with the plain-English explanation if the analyst
@@ -409,6 +442,7 @@ export default function Session4Form({
       if (res.explanation && !existing?.notes?.trim()) {
         patch.notes = res.explanation;
       }
+      if (validate) applyValidationToPatch(patch, res.validation);
       const next = [...benchmarks];
       next[idx] = { ...existing, ...patch };
       onChange("benchmark_questions", next);
@@ -430,10 +464,12 @@ export default function Session4Form({
       if (hasSql && hasNotes) continue; // fully filled, skip
       try {
         if (!hasSql) {
-          // Draft both SQL and plain-English summary in one call
-          const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId);
+          // Draft SQL (+ summary + auto-validate if warehouse selected) in one call
+          const validate = !!benchmarkWarehouseId;
+          const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId, validate);
           const patch: Record<string, any> = { expected_sql: res.sql };
           if (res.explanation && !hasNotes) patch.notes = res.explanation;
+          if (validate) applyValidationToPatch(patch, res.validation);
           next[i] = { ...next[i], ...patch };
         } else {
           // SQL exists but no summary — backfill from existing SQL
@@ -718,7 +754,7 @@ export default function Session4Form({
                 onClick={handleDraftBenchmarksClick}
                 disabled={draftingBenchmarks}
               >
-                {draftingBenchmarks ? "Drafting..." : `Draft ${draftCount} Benchmarks from Sessions 1-3`}
+                {draftingBenchmarks ? "Drafting..." : `Draft ${draftCount} Benchmarks from Sessions 1-4`}
               </Button>
               <Button
                 variant="outlined"
@@ -898,6 +934,26 @@ export default function Session4Form({
                         {b.expected_sql?.trim() && (
                           <Chip label="SQL drafted" size="small" variant="outlined" sx={{ height: 20 }} />
                         )}
+                        {(b as any).validation_status === "ok" && (
+                          <Tooltip title="SQL was validated against the warehouse on draft and ran successfully.">
+                            <Chip label="Validated" size="small" color="success" variant="outlined" sx={{ height: 20 }} />
+                          </Tooltip>
+                        )}
+                        {(b as any).validation_status === "retried_ok" && (
+                          <Tooltip title="First draft failed; auto-retry succeeded with corrected SQL.">
+                            <Chip label="Validated (retried)" size="small" color="success" variant="outlined" sx={{ height: 20 }} />
+                          </Tooltip>
+                        )}
+                        {(b as any).validation_status === "failed" && (
+                          <Tooltip title="SQL failed validation against the warehouse, even after one auto-retry. Edit and re-run manually.">
+                            <Chip label="Validation failed" size="small" color="error" variant="outlined" sx={{ height: 20 }} />
+                          </Tooltip>
+                        )}
+                        {(b as any).validation_status === "skipped" && (
+                          <Tooltip title="No SQL warehouse was selected at draft time, so the SQL wasn't auto-validated. Pick a warehouse and click Run to validate.">
+                            <Chip label="Not validated" size="small" variant="outlined" sx={{ height: 20 }} />
+                          </Tooltip>
+                        )}
                       </Stack>
                       <ExpandableTextField
                         value={b.expected_sql || ""}
@@ -999,7 +1055,7 @@ export default function Session4Form({
           )}
           {benchmarks.length === 0 && (
             <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-              No benchmarks yet. Click "Draft Benchmarks from Sessions 1-3" to seed a starting set.
+              No benchmarks yet. Click "Draft Benchmarks from Sessions 1-4" to seed a starting set.
             </Typography>
           )}
         </AccordionDetails>

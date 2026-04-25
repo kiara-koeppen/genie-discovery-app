@@ -119,10 +119,28 @@ export const api = {
       body: JSON.stringify({ count: count ?? 12 }),
     }),
 
-  draftBenchmarkSql: (id: string, question: string, warehouse_id?: string) =>
-    json<{ sql: string; explanation?: string }>(`/engagements/${id}/draft-benchmark-sql`, {
+  draftBenchmarkSql: (
+    id: string,
+    question: string,
+    warehouse_id?: string,
+    validate?: boolean,
+  ) =>
+    json<{
+      sql: string;
+      explanation?: string;
+      validation?: {
+        ran: boolean;
+        error: string | null;
+        retried: boolean;
+        sample_result: BenchmarkSampleResult | null;
+      } | null;
+    }>(`/engagements/${id}/draft-benchmark-sql`, {
       method: "POST",
-      body: JSON.stringify({ question, warehouse_id: warehouse_id || "" }),
+      body: JSON.stringify({
+        question,
+        warehouse_id: warehouse_id || "",
+        validate: !!validate,
+      }),
     }),
 
   draftBenchmarkSummary: (id: string, question: string, sql: string) =>
