@@ -864,7 +864,15 @@ def _build_readiness_brief_prompt(eng):
     mv_yaml = (s3.get("metric_view_yaml") or "").strip()
     if mv_yaml:
         lines.append("### Generated Metric View YAML")
-        lines.append(f"```yaml\n{mv_yaml}\n```")
+        # Truncate very long YAML to keep prompt size + LLM latency bounded.
+        # The brief mainly needs to know what dimensions/measures exist; the
+        # full text isn't required.
+        mv_lines = mv_yaml.splitlines()
+        if len(mv_lines) > 60:
+            shown = "\n".join(mv_lines[:60])
+            lines.append(f"```yaml\n{shown}\n# ... ({len(mv_lines) - 60} more lines truncated for brief generation; full YAML lives in S3)\n```")
+        else:
+            lines.append(f"```yaml\n{mv_yaml}\n```")
     mv_fqn = (s3.get("metric_view_fqn") or "").strip()
     if mv_fqn:
         lines.append(f"### Created Metric View: `{mv_fqn}`")
@@ -1278,7 +1286,7 @@ Return ONLY the JSON object. No markdown fences, no preamble, no trailing commen
     return prompt
 
 
-def _call_llm_raw(prompt):
+def _call_llm_raw(prompt, max_tokens=16000):
     """Call the Databricks serving endpoint and return the raw text content (no JSON parse).
 
     Use this when the prompt asks for non-JSON output (e.g. markdown with a
@@ -1288,7 +1296,7 @@ def _call_llm_raw(prompt):
     resp = w.serving_endpoints.query(
         name=LLM_ENDPOINT,
         messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-        max_tokens=16000,
+        max_tokens=max_tokens,
         temperature=0.2,
     )
     if isinstance(resp, dict):
