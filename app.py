@@ -605,7 +605,43 @@ def auto_summary(eid):
     brief = str(result.get("brief", "")).strip()
     if not brief:
         return jsonify({"error": "LLM returned empty brief"}), 500
-    return jsonify({"summary": brief})
+
+    # Normalize structured unacknowledged gaps the LLM extracted alongside the
+    # markdown. Each gap drives a response card in the Analyst Commentary form.
+    raw_gaps = result.get("unacknowledged_gaps") or []
+    gaps = []
+    if isinstance(raw_gaps, list):
+        for g in raw_gaps:
+            if not isinstance(g, dict):
+                continue
+            title = str(g.get("title", "")).strip()
+            if not title:
+                continue
+            severity = str(g.get("severity", "Medium")).strip().capitalize()
+            if severity not in {"Low", "Medium", "High"}:
+                severity = "Medium"
+            summary = str(g.get("summary", "")).strip()
+            cits = g.get("citations") or []
+            if not isinstance(cits, list):
+                cits = []
+            cits = [str(c).strip() for c in cits if str(c).strip()]
+            gid = str(g.get("id", "")).strip() or _slug(title)
+            gaps.append({
+                "id": gid,
+                "title": title,
+                "severity": severity,
+                "summary": summary,
+                "citations": cits,
+            })
+
+    return jsonify({"summary": brief, "unacknowledged_gaps": gaps})
+
+
+def _slug(text):
+    """Lowercase, alnum + dashes only, collapse runs. Used to derive stable gap IDs."""
+    import re
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower())
+    return s.strip("-")
 
 
 def _build_readiness_brief_prompt(eng):
@@ -877,7 +913,28 @@ ONE sentence framing the question for COE. NOT a verdict. Examples:
 {context}
 </engagement_context>
 
-Return JSON: {{"brief": "<the markdown brief>"}}. Just the markdown — no markdown fences around the JSON itself."""
+OUTPUT — return EXACTLY this JSON shape:
+
+{{
+  "brief": "<the full markdown brief, with all sections above>",
+  "unacknowledged_gaps": [
+    {{
+      "id": "<stable slug derived from the title; lowercase, dashes only, no spaces>",
+      "title": "<short headline, ~3-7 words>",
+      "severity": "<one of: Low, Medium, High>",
+      "summary": "<1-2 sentences explaining the gap and why it matters>",
+      "citations": ["<source tags like 'S1 Business Context Q&A' or 'S3 Generated Metric View YAML'>"]
+    }}
+  ]
+}}
+
+CRITICAL: the entries in `unacknowledged_gaps` MUST match the gaps you list under `## Open Gaps & Risks` → `### Unacknowledged Gaps` in the markdown. Same gaps, same titles, same order, same severities. The structured array is the source of truth and the markdown should mirror it.
+
+Do NOT include acknowledged gaps in `unacknowledged_gaps` — only gaps the analyst did NOT flag in S3 Data Gaps.
+
+If there are no unacknowledged gaps, return an empty array: `"unacknowledged_gaps": []`.
+
+Just the JSON — no markdown fences around the JSON itself."""
 
 
 # ---------------------------------------------------------------------------

@@ -17,8 +17,52 @@ import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import ReactMarkdown from "react-markdown";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
-import { api, BenchmarkQuestion } from "../api";
+import { api, BenchmarkQuestion, BriefGap, AnalystCommentary } from "../api";
 import type { ColumnDef } from "../types";
+
+// --- Gap-matching helpers (for preserving analyst responses across regenerations) ---
+function slug(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function tokens(s: string): Set<string> {
+  return new Set(s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter(Boolean));
+}
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (!a.size && !b.size) return 0;
+  let inter = 0;
+  a.forEach((t) => b.has(t) && inter++);
+  return inter / (a.size + b.size - inter);
+}
+function findCarryoverKey(
+  gapId: string,
+  gapTitle: string,
+  oldResponses: Record<string, string>,
+  oldTitleByKey: Record<string, string>,
+): string | null {
+  if (oldResponses[gapId]) return gapId;
+  const newTokens = tokens(gapTitle);
+  let bestKey: string | null = null;
+  let bestScore = 0;
+  for (const k of Object.keys(oldResponses)) {
+    const oldTitle = oldTitleByKey[k] || k.replace(/-/g, " ");
+    const score = jaccard(newTokens, tokens(oldTitle));
+    if (score > bestScore) {
+      bestScore = score;
+      bestKey = k;
+    }
+  }
+  return bestScore >= 0.5 ? bestKey : null;
+}
+function normalizeCommentary(raw: any): AnalystCommentary {
+  if (!raw || typeof raw === "string") {
+    // Legacy commentary was a freeform string -- silently discard per design.
+    return { gap_responses: {}, resolved_gaps: {} };
+  }
+  return {
+    gap_responses: raw.gap_responses || {},
+    resolved_gaps: raw.resolved_gaps || {},
+  };
+}
 
 const DATA_PLAN_COLS: ColumnDef[] = [
   { key: "table_or_view", label: "Table / Metric View", type: "uc_table" },
@@ -43,6 +87,7 @@ export default function Session4Form({
 }: Props) {
   const [summary, setSummary] = useState("");
   const [loadingSummary, setLoadingSummary] = useState(false);
+  const [currentGaps, setCurrentGaps] = useState<BriefGap[]>([]);
   const [approvalNotes, setApprovalNotes] = useState("");
   const [draftingBenchmarks, setDraftingBenchmarks] = useState(false);
   const [draftingSqlIdx, setDraftingSqlIdx] = useState<number | null>(null);
@@ -110,7 +155,54 @@ export default function Session4Form({
     onChange("data_plan", next);
   }, [mvFqn]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Fetch auto-summary
+  // Current analyst commentary (always normalized to structured form)
+  const commentary: AnalystCommentary = useMemo(
+    () => normalizeCommentary(data.analyst_commentary),
+    [data.analyst_commentary],
+  );
+
+  // Reconcile gaps from a fresh brief against existing analyst responses.
+  // Carry forward responses where the gap still exists; archive disappeared
+  // gaps in resolved_gaps so the analyst's writeup isn't lost.
+  const reconcileGaps = (newGaps: BriefGap[]) => {
+    const oldResponses = commentary.gap_responses || {};
+    const oldResolved = commentary.resolved_gaps || {};
+    // We don't have old titles persisted (only IDs), so use ID as proxy when
+    // matching by Jaccard. This is good enough for slug-style IDs.
+    const oldTitleByKey: Record<string, string> = {};
+    for (const k of Object.keys(oldResponses)) oldTitleByKey[k] = k.replace(/-/g, " ");
+
+    const nextResponses: Record<string, string> = {};
+    const consumedOldKeys = new Set<string>();
+
+    for (const g of newGaps) {
+      const carryKey = findCarryoverKey(g.id, g.title, oldResponses, oldTitleByKey);
+      if (carryKey) {
+        nextResponses[g.id] = oldResponses[carryKey];
+        consumedOldKeys.add(carryKey);
+      } else {
+        nextResponses[g.id] = "";
+      }
+    }
+    // Anything in oldResponses that wasn't consumed -> archive into resolved_gaps
+    const nextResolved = { ...oldResolved };
+    for (const k of Object.keys(oldResponses)) {
+      if (consumedOldKeys.has(k)) continue;
+      const text = oldResponses[k];
+      if (!text || !text.trim()) continue; // don't archive empty placeholders
+      nextResolved[k] = {
+        title: oldTitleByKey[k] || k,
+        severity: "Unknown",
+        response: text,
+      };
+    }
+    onChange("analyst_commentary", {
+      gap_responses: nextResponses,
+      resolved_gaps: nextResolved,
+    });
+  };
+
+  // Fetch auto-summary (Readiness Brief + structured unacknowledged gaps)
   const fetchSummary = async () => {
     if (!engagementId) return;
     setLoadingSummary(true);
@@ -118,6 +210,10 @@ export default function Session4Form({
       const res = await api.getAutoSummary(engagementId);
       setSummary(res.summary);
       onChange("auto_summary", res.summary);
+      const gaps = res.unacknowledged_gaps || [];
+      setCurrentGaps(gaps);
+      onChange("brief_unacknowledged_gaps", gaps);
+      reconcileGaps(gaps);
     } catch {
       setSummary("Failed to generate summary.");
     }
@@ -125,12 +221,28 @@ export default function Session4Form({
   };
 
   useEffect(() => {
-    if (data.auto_summary) {
-      setSummary(data.auto_summary);
-    } else if (engagementId) {
-      fetchSummary();
-    }
+    if (data.auto_summary) setSummary(data.auto_summary);
+    if (data.brief_unacknowledged_gaps) setCurrentGaps(data.brief_unacknowledged_gaps);
+    if (!data.auto_summary && engagementId) fetchSummary();
   }, [engagementId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const updateGapResponse = (gapId: string, text: string) => {
+    onChange("analyst_commentary", {
+      ...commentary,
+      gap_responses: { ...(commentary.gap_responses || {}), [gapId]: text },
+    });
+  };
+
+  const severityColor = (s: string): "error" | "warning" | "info" | "default" => {
+    if (s === "High") return "error";
+    if (s === "Medium") return "warning";
+    if (s === "Low") return "info";
+    return "default";
+  };
+  const respondedCount = currentGaps.filter(
+    (g) => ((commentary.gap_responses || {})[g.id] || "").trim(),
+  ).length;
+  const resolvedEntries = Object.entries(commentary.resolved_gaps || {});
 
   // Benchmark handlers
   const updateBenchmark = (idx: number, field: keyof BenchmarkQuestion, value: any) => {
@@ -435,24 +547,103 @@ export default function Session4Form({
         </AccordionDetails>
       </Accordion>
 
-      {/* Analyst Commentary */}
+      {/* Analyst Commentary -- structured gap responses */}
       <Accordion defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography variant="h6">Analyst Commentary</Typography>
+          <Stack direction="row" alignItems="center" spacing={1}>
+            <Typography variant="h6">Analyst Commentary</Typography>
+            {currentGaps.length > 0 && (
+              <Chip
+                label={`${respondedCount} of ${currentGaps.length} addressed`}
+                size="small"
+                color={respondedCount === currentGaps.length ? "success" : "default"}
+              />
+            )}
+          </Stack>
         </AccordionSummary>
         <AccordionDetails>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Summarize what you learned from the business owner, your technical approach,
-            and anything the COE should know when reviewing this engagement.
-          </Typography>
-          <ExpandableTextField
-            minRows={6}
-            placeholder="Describe your findings, approach, and recommendations for the COE..."
-            value={data.analyst_commentary || ""}
-            onChange={(v) => onChange("analyst_commentary", v)}
-            disabled={readOnly}
-            dialogTitle="Analyst Commentary"
-          />
+          {currentGaps.length === 0 ? (
+            <Alert severity="info" variant="outlined">
+              {summary
+                ? "The Readiness Brief did not surface any unacknowledged gaps. Nothing to comment on here -- you're good to proceed."
+                : "Generate the Readiness Brief above to surface gaps. Each unacknowledged gap will appear here as a card for you to respond to."}
+            </Alert>
+          ) : (
+            <>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Each unacknowledged gap from the Readiness Brief is below. Explain to the COE why
+                each gap exists, how it will be addressed, or why it can ship as-is. Your responses
+                are preserved when you regenerate the brief, even if titles shift slightly.
+              </Typography>
+              <Stack spacing={2}>
+                {currentGaps.map((g) => {
+                  const resp = (commentary.gap_responses || {})[g.id] || "";
+                  return (
+                    <Paper key={g.id} variant="outlined" sx={{ p: 2 }}>
+                      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+                        <Chip label={g.severity} size="small" color={severityColor(g.severity)} />
+                        <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                          {g.title}
+                        </Typography>
+                      </Stack>
+                      {g.summary && (
+                        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                          {g.summary}
+                        </Typography>
+                      )}
+                      {g.citations && g.citations.length > 0 && (
+                        <Stack direction="row" spacing={0.5} sx={{ mb: 1.5, flexWrap: "wrap", gap: 0.5 }}>
+                          {g.citations.map((c, i) => (
+                            <Chip key={i} label={c} size="small" variant="outlined" sx={{ fontSize: 11 }} />
+                          ))}
+                        </Stack>
+                      )}
+                      <ExpandableTextField
+                        minRows={2}
+                        placeholder="How will this gap be addressed? Why is it acceptable to ship as-is? What's the analyst's take?"
+                        value={resp}
+                        onChange={(v) => updateGapResponse(g.id, v)}
+                        disabled={readOnly}
+                        dialogTitle={`Response: ${g.title}`}
+                      />
+                    </Paper>
+                  );
+                })}
+              </Stack>
+              {resolvedEntries.length > 0 && (
+                <Accordion sx={{ mt: 2 }}>
+                  <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                    <Stack direction="row" alignItems="center" spacing={1}>
+                      <Typography variant="subtitle2" color="text.secondary">
+                        Resolved Gaps (archived)
+                      </Typography>
+                      <Chip label={resolvedEntries.length} size="small" />
+                    </Stack>
+                  </AccordionSummary>
+                  <AccordionDetails>
+                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                      Gaps that were flagged in a previous brief but no longer appear. Your prior
+                      responses are preserved here for audit trail. Read-only.
+                    </Typography>
+                    <Stack spacing={1.5}>
+                      {resolvedEntries.map(([k, v]) => (
+                        <Paper key={k} variant="outlined" sx={{ p: 1.5, bgcolor: "grey.50" }}>
+                          <Typography variant="subtitle2">{v.title}</Typography>
+                          <Typography
+                            variant="body2"
+                            color="text.secondary"
+                            sx={{ mt: 0.5, whiteSpace: "pre-wrap" }}
+                          >
+                            {v.response}
+                          </Typography>
+                        </Paper>
+                      ))}
+                    </Stack>
+                  </AccordionDetails>
+                </Accordion>
+              )}
+            </>
+          )}
         </AccordionDetails>
       </Accordion>
 
@@ -850,6 +1041,41 @@ export default function Session4Form({
                 Review the analyst's work above. Approve to unlock Sessions 5 & 6,
                 or request changes with specific feedback.
               </Typography>
+
+              {/* Analyst gap responses summary -- read-only */}
+              {currentGaps.length > 0 && (
+                <Paper variant="outlined" sx={{ p: 2, mb: 2, bgcolor: "grey.50" }}>
+                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5 }}>
+                    <Typography variant="subtitle2">Analyst's Responses to Flagged Gaps</Typography>
+                    <Chip
+                      label={`${respondedCount} of ${currentGaps.length} addressed`}
+                      size="small"
+                      color={respondedCount === currentGaps.length ? "success" : "default"}
+                    />
+                  </Stack>
+                  <Stack spacing={1}>
+                    {currentGaps.map((g) => {
+                      const resp = ((commentary.gap_responses || {})[g.id] || "").trim();
+                      return (
+                        <Box key={g.id} sx={{ pl: 1, borderLeft: "3px solid", borderColor: severityColor(g.severity) === "default" ? "grey.400" : `${severityColor(g.severity)}.main` }}>
+                          <Stack direction="row" alignItems="center" spacing={1}>
+                            <Chip label={g.severity} size="small" color={severityColor(g.severity)} sx={{ height: 20 }} />
+                            <Typography variant="body2" sx={{ fontWeight: 600 }}>{g.title}</Typography>
+                          </Stack>
+                          <Typography
+                            variant="body2"
+                            color={resp ? "text.primary" : "text.secondary"}
+                            sx={{ mt: 0.5, fontStyle: resp ? "normal" : "italic", whiteSpace: "pre-wrap" }}
+                          >
+                            {resp || "No response from analyst yet"}
+                          </Typography>
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                </Paper>
+              )}
+
               <TextField
                 multiline
                 minRows={3}

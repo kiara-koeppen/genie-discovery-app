@@ -45,6 +45,19 @@ export interface BenchmarkQuestion {
   sample_result?: BenchmarkSampleResult;
 }
 
+export interface BriefGap {
+  id: string;
+  title: string;
+  severity: "Low" | "Medium" | "High";
+  summary: string;
+  citations: string[];
+}
+
+export interface AnalystCommentary {
+  gap_responses?: Record<string, string>;
+  resolved_gaps?: Record<string, { title: string; severity: string; response: string }>;
+}
+
 async function json<T>(url: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${url}`, {
     headers: { "Content-Type": "application/json" },
@@ -132,7 +145,10 @@ export const api = {
     }),
 
   getAutoSummary: (id: string) =>
-    json<{ summary: string }>(`/engagements/${id}/auto-summary`),
+    json<{
+      summary: string;
+      unacknowledged_gaps?: BriefGap[];
+    }>(`/engagements/${id}/auto-summary`),
 
   generatePlan: (id: string, warehouse_id?: string) =>
     json<{
