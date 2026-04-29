@@ -68,6 +68,38 @@ ALL_SECTION_COLS = sorted(set(col for cols in SESSION_COLS.values() for col in c
 
 
 # ---------------------------------------------------------------------------
+# Form-key tolerant accessors
+#
+# The frontend Session 2 form writes `question_text` (Question Bank) and
+# `what_they_mean` (Vocabulary). Several prompt builders historically looked
+# for `question` / `definition`, which silently returned empty strings and
+# made every LLM-generated artifact (brief, plan, benchmarks, MV YAML)
+# blind to the BO-captured questions and vocabulary. These helpers normalize
+# access and tolerate a couple of legacy/alternative keys.
+# ---------------------------------------------------------------------------
+
+def _qb_question(q):
+    """Return the question text from a question_bank entry, or empty string."""
+    if not isinstance(q, dict):
+        return ""
+    return (q.get("question_text") or q.get("question") or q.get("text") or "").strip()
+
+
+def _vm_definition(v):
+    """Return the definition/meaning from a vocabulary_metrics entry."""
+    if not isinstance(v, dict):
+        return ""
+    return (v.get("what_they_mean") or v.get("definition") or v.get("description") or "").strip()
+
+
+def _er_what(r):
+    """Return what an existing_reports entry shows."""
+    if not isinstance(r, dict):
+        return ""
+    return (r.get("what_it_shows") or r.get("description") or r.get("key_metrics") or "").strip()
+
+
+# ---------------------------------------------------------------------------
 # Async job runner
 #
 # Long-running LLM calls (Readiness Brief, plan generation, etc.) routinely
@@ -884,12 +916,10 @@ def _build_readiness_brief_prompt(eng):
     if qb:
         lines.append("### Question Bank")
         for i, q in enumerate(qb, 1):
-            if not isinstance(q, dict):
-                continue
-            text = (q.get("question") or q.get("text") or "").strip()
-            decision = (q.get("decision_it_drives") or "").strip()
+            text = _qb_question(q)
             if not text:
                 continue
+            decision = (q.get("decision_it_drives") or "").strip() if isinstance(q, dict) else ""
             lines.append(f"- **Q{i}:** {text}")
             if decision:
                 lines.append(f"  - Drives decision: {decision}")
@@ -900,7 +930,7 @@ def _build_readiness_brief_prompt(eng):
             if not isinstance(v, dict):
                 continue
             term = (v.get("business_term") or "").strip()
-            defn = (v.get("definition") or v.get("description") or "").strip()
+            defn = _vm_definition(v)
             synonyms = (v.get("synonyms") or "").strip()
             if not term:
                 continue
@@ -1239,12 +1269,15 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
     lines.append("## Session 2: Questions & Vocabulary")
     lines.append("### Question Bank (candidates for sample questions)")
     for q in s2.get("question_bank", []):
-        text = q.get("question") or q.get("text") or ""
-        lines.append(f"- {text}")
+        text = _qb_question(q)
+        if text:
+            lines.append(f"- {text}")
     lines.append("### Vocabulary & Metric Definitions")
     for v in s2.get("vocabulary_metrics", []):
+        if not isinstance(v, dict):
+            continue
         term = v.get("business_term", "")
-        defn = v.get("definition") or v.get("description") or ""
+        defn = _vm_definition(v)
         lines.append(f"- **{term}**: {defn}")
     lines.append("")
 
@@ -1698,12 +1731,9 @@ def _build_benchmark_draft_prompt(eng, count=12):
     lines.append("")
     lines.append("Question Bank (from business owner — prefer this phrasing):")
     qb = s2.get("question_bank", []) or []
-    if qb:
-        for q in qb:
-            if isinstance(q, dict):
-                text = (q.get("question") or q.get("text") or "").strip()
-                if text:
-                    lines.append(f"- {text}")
+    qb_lines = [f"- {t}" for t in (_qb_question(q) for q in qb) if t]
+    if qb_lines:
+        lines.extend(qb_lines)
     else:
         lines.append("(empty — no BO-captured questions; rely on Business Context Q&A above for phrasing)")
 
@@ -1713,17 +1743,18 @@ def _build_benchmark_draft_prompt(eng, count=12):
         lines.append("")
         lines.append("Vocabulary & Synonyms (use these in Edge Case questions to test synonym handling):")
         for v in vm:
-            if isinstance(v, dict):
-                term = (v.get("business_term") or "").strip()
-                defn = (v.get("definition") or v.get("description") or "").strip()
-                synonyms = (v.get("synonyms") or "").strip()
-                if term:
-                    line = f"- {term}"
-                    if defn:
-                        line += f" — {defn}"
-                    if synonyms:
-                        line += f" (synonyms: {synonyms})"
-                    lines.append(line)
+            if not isinstance(v, dict):
+                continue
+            term = (v.get("business_term") or "").strip()
+            defn = _vm_definition(v)
+            synonyms = (v.get("synonyms") or "").strip()
+            if term:
+                line = f"- {term}"
+                if defn:
+                    line += f" — {defn}"
+                if synonyms:
+                    line += f" (synonyms: {synonyms})"
+                lines.append(line)
 
     # S3: Scope boundaries (what's IN/OUT — questions must respect)
     sb = s3.get("scope_boundaries", []) or []
@@ -2297,18 +2328,22 @@ def _build_mv_yaml_prompt(eng, user_w=None, warehouse_id=None):
         lines.append("## Existing Reports (S1) — metrics analysts already produce today")
         for r in er:
             if isinstance(r, dict):
-                lines.append(f"- **{r.get('report_name') or r.get('name','')}**: {r.get('description') or r.get('key_metrics') or ''}")
+                lines.append(f"- **{r.get('report_name') or r.get('name','')}**: {_er_what(r)}")
             else:
                 lines.append(f"- {r}")
         lines.append("")
 
     lines.append("## Business Questions (S2)")
     for q in s2.get("question_bank", []):
-        lines.append(f"- {q.get('question') or q.get('text') or ''}")
+        text = _qb_question(q)
+        if text:
+            lines.append(f"- {text}")
     lines.append("")
     lines.append("## Vocabulary & Metric Definitions (S2)")
     for v in s2.get("vocabulary_metrics", []):
-        lines.append(f"- **{v.get('business_term','')}**: {v.get('definition') or v.get('description') or ''}")
+        if not isinstance(v, dict):
+            continue
+        lines.append(f"- **{v.get('business_term','')}**: {_vm_definition(v)}")
     lines.append("")
 
     tc = s3.get("term_classifications", [])
