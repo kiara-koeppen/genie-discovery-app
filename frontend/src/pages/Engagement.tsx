@@ -3,12 +3,11 @@ import { useParams, useNavigate } from "react-router-dom";
 import {
   Box, Typography, Tabs, Tab, Button, CircularProgress, Alert, Snackbar,
   Chip, IconButton, Paper, Tooltip, Dialog, DialogTitle, DialogContent,
-  DialogActions, TextField, Stack, InputAdornment, Link,
+  DialogActions, TextField, Stack, Link,
 } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import LockIcon from "@mui/icons-material/Lock";
 import EditIcon from "@mui/icons-material/Edit";
-import LinkIcon from "@mui/icons-material/Link";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudSyncIcon from "@mui/icons-material/CloudSync";
@@ -149,6 +148,40 @@ export default function Engagement({ readOnly = false }: Props) {
     }));
   };
 
+  // --- ServiceNow URL: edited inline in Section 1, autosaved separately ---
+  // Lives in `meta` like the rest of the engagement metadata, but has its own
+  // autosave path because it's not part of the dialog flow.
+  const snUrlSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const snUrlInitialLoad = useRef(true);
+
+  const updateServiceNowUrl = useCallback((value: string) => {
+    setMeta((prev) => ({ ...prev, servicenow_ticket_url: value }));
+  }, []);
+
+  useEffect(() => {
+    if (readOnly || !id) return;
+    if (snUrlInitialLoad.current) {
+      snUrlInitialLoad.current = false;
+      return;
+    }
+    setSaveStatus("dirty");
+    if (snUrlSaveTimer.current) clearTimeout(snUrlSaveTimer.current);
+    snUrlSaveTimer.current = setTimeout(async () => {
+      setSaveStatus("saving");
+      try {
+        await api.updateEngagement(id, { ...meta, status: data?.status || "in_progress" });
+        setData((prev: any) => (prev ? { ...prev, servicenow_ticket_url: meta.servicenow_ticket_url } : prev));
+        setSaveStatus("saved");
+      } catch (err: any) {
+        setSaveStatus("error");
+        setToast(`Error saving ServiceNow link: ${err?.message || "unknown"}`);
+      }
+    }, AUTOSAVE_DELAY_MS);
+    return () => {
+      if (snUrlSaveTimer.current) clearTimeout(snUrlSaveTimer.current);
+    };
+  }, [meta.servicenow_ticket_url, readOnly, id]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // --- Engagement metadata edit dialog ---
   const [editOpen, setEditOpen] = useState(false);
   const [draftMeta, setDraftMeta] = useState<EngagementMeta>(meta);
@@ -199,18 +232,8 @@ export default function Engagement({ readOnly = false }: Props) {
     };
   }, [draftMeta.genie_space_name, editOpen, id, meta.genie_space_name]);
 
-  const isValidUrl = (s: string) => {
-    if (!s.trim()) return true;
-    try {
-      const u = new URL(s);
-      return u.protocol === "http:" || u.protocol === "https:";
-    } catch {
-      return false;
-    }
-  };
-  const draftUrlValid = isValidUrl(draftMeta.servicenow_ticket_url);
   const draftNameValid = !!draftMeta.genie_space_name.trim() && nameAvailable !== false;
-  const canSaveMeta = draftNameValid && draftUrlValid && !savingMeta;
+  const canSaveMeta = draftNameValid && !savingMeta;
 
   const saveMeta = async () => {
     if (!id || !canSaveMeta) return;
@@ -354,7 +377,13 @@ export default function Engagement({ readOnly = false }: Props) {
 
       {/* Session Content */}
       <Box sx={{ mb: 3 }}>
-        {tab === 0 && <Session1Form {...sessionProps(1)} />}
+        {tab === 0 && (
+          <Session1Form
+            {...sessionProps(1)}
+            serviceNowUrl={meta.servicenow_ticket_url}
+            onServiceNowUrlChange={updateServiceNowUrl}
+          />
+        )}
         {tab === 1 && <Session2Form {...sessionProps(2)} />}
         {tab === 2 && (
           <Session3Form
@@ -416,41 +445,6 @@ export default function Engagement({ readOnly = false }: Props) {
             </Alert>
           )}
           <Stack spacing={2} sx={{ mt: 1 }}>
-            <TextField
-              label="ServiceNow Ticket URL"
-              value={draftMeta.servicenow_ticket_url}
-              onChange={(e) => updateDraftMeta("servicenow_ticket_url", e.target.value)}
-              placeholder="https://yourorg.service-now.com/..."
-              fullWidth
-              size="small"
-              error={!draftUrlValid}
-              helperText={
-                !draftUrlValid
-                  ? "Enter a valid http(s) URL or leave blank"
-                  : "Optional. Link to the originating ServiceNow ticket."
-              }
-              InputProps={{
-                startAdornment: (
-                  <InputAdornment position="start">
-                    <LinkIcon fontSize="small" />
-                  </InputAdornment>
-                ),
-                endAdornment: draftMeta.servicenow_ticket_url && draftUrlValid ? (
-                  <InputAdornment position="end">
-                    <Tooltip title="Open ticket in new tab">
-                      <Link
-                        href={draftMeta.servicenow_ticket_url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        <OpenInNewIcon fontSize="small" />
-                      </Link>
-                    </Tooltip>
-                  </InputAdornment>
-                ) : null,
-              }}
-            />
-
             <TextField
               label="Genie Space Name"
               value={draftMeta.genie_space_name}
