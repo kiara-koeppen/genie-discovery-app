@@ -698,10 +698,17 @@ def coe_approve(eid):
 # API: Auto-summary (structured, no LLM)
 # ---------------------------------------------------------------------------
 
+BRIEF_MODEL = os.getenv("BRIEF_LLM_ENDPOINT_NAME") or "databricks-claude-haiku-4-5"
+
+
 def _generate_readiness_brief(eid):
     """Core Readiness Brief logic. Used by both the legacy sync endpoint and
     the async job task. Returns dict {summary, unacknowledged_gaps}.
     Raises on engagement-not-found or LLM/parse failure.
+
+    Uses BRIEF_MODEL (default Haiku 4.5) instead of the default Sonnet, since
+    this task is structured extraction with citations -- a small fast model
+    handles it well, and Sonnet was hitting 5+ minute generation times.
     """
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
@@ -709,7 +716,7 @@ def _generate_readiness_brief(eid):
     eng = parse_row(rows[0])
 
     prompt = _build_readiness_brief_prompt(eng)
-    raw = _call_llm_raw(prompt)
+    raw = _call_llm_raw(prompt, model=BRIEF_MODEL, label="brief")
 
     # Output format:
     # <markdown brief>
@@ -1417,31 +1424,49 @@ Return ONLY the JSON object. No markdown fences, no preamble, no trailing commen
     return prompt
 
 
-def _call_llm_raw(prompt, max_tokens=16000):
+def _call_llm_raw(prompt, max_tokens=16000, model=None, label=None):
     """Call the Databricks serving endpoint and return the raw text content (no JSON parse).
 
     Use this when the prompt asks for non-JSON output (e.g. markdown with a
     structured trailer) — JSON-wrapping markdown content breaks on every
     backtick or newline the LLM emits.
+
+    `model` overrides the default LLM_ENDPOINT for this single call. Useful
+    when a specific task (e.g. the Readiness Brief) wants a faster model
+    while other tasks keep using a stronger one.
+    `label` is a short tag for timing logs.
     """
-    resp = w.serving_endpoints.query(
-        name=LLM_ENDPOINT,
-        messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-        max_tokens=max_tokens,
-        temperature=0.2,
-    )
+    endpoint = model or LLM_ENDPOINT
+    tag = label or "llm"
+    prompt_chars = len(prompt)
+    started = time.time()
+    print(f"[{tag}] start endpoint={endpoint} prompt_chars={prompt_chars} max_tokens={max_tokens}", flush=True)
+    try:
+        resp = w.serving_endpoints.query(
+            name=endpoint,
+            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+    except Exception as e:
+        elapsed = time.time() - started
+        print(f"[{tag}] FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
+        raise
     if isinstance(resp, dict):
         d = resp
     elif hasattr(resp, "as_dict"):
         d = resp.as_dict()
     else:
         d = {"choices": [{"message": {"content": resp.choices[0].message.content}}]}
-    return d["choices"][0]["message"]["content"]
+    content = d["choices"][0]["message"]["content"]
+    elapsed = time.time() - started
+    print(f"[{tag}] done in {elapsed:.1f}s output_chars={len(content)}", flush=True)
+    return content
 
 
-def _call_llm(prompt):
+def _call_llm(prompt, model=None, label=None):
     """Call the LLM and return parsed JSON. Tolerates ```json fences."""
-    content = _call_llm_raw(prompt)
+    content = _call_llm_raw(prompt, model=model, label=label)
     text = content.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text
