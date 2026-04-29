@@ -3686,7 +3686,9 @@ def _build_serialized_space(eng, plan):
     if join_entries:
         serialized["instructions"]["join_specs"] = join_entries
 
-    # Benchmarks — top-level key. Only include rows with both question AND SQL.
+    # Benchmarks — top-level {"questions": [...]}. Each question has an
+    # answer: [{format: "SQL", content: [...]}] (array, single element).
+    # `content` is an array of strings — Genie joins them as the SQL.
     bm_entries = []
     for b in benchmarks_in:
         q = (b.get("question") or "").strip()
@@ -3696,11 +3698,11 @@ def _build_serialized_space(eng, plan):
         bm_entries.append({
             "id": _gen_hex_id(),
             "question": [q],
-            "sql_answer": [sql],
+            "answer": [{"format": "SQL", "content": [sql]}],
         })
     bm_entries.sort(key=lambda x: x["id"])
     if bm_entries:
-        serialized["benchmarks"] = bm_entries
+        serialized["benchmarks"] = {"questions": bm_entries}
 
     return serialized
 
@@ -3712,8 +3714,20 @@ def _genie_api_call(user_w, method, path, body=None):
         "Authorization": f"Bearer {user_w.config.token}",
         "Content-Type": "application/json",
     }
+    # DEBUG: log a sample of the body so we can see what's being sent on failure.
+    try:
+        body_for_log = json.dumps(body) if body else "<none>"
+        sample = body_for_log[:300] + (" ..." if len(body_for_log) > 300 else "")
+        print(f"[genie-api] {method} {path} body_chars={len(body_for_log)} sample={sample}", flush=True)
+    except Exception:
+        pass
     resp = requests.request(method, url, headers=headers, json=body, timeout=60)
     if not resp.ok:
+        # DEBUG: log full request body when failing so we can diagnose
+        print(f"[genie-api] FAILED {method} {path} status={resp.status_code}", flush=True)
+        print(f"[genie-api] response: {resp.text[:1000]}", flush=True)
+        if body:
+            print(f"[genie-api] full body: {json.dumps(body)[:5000]}", flush=True)
         raise RuntimeError(f"Genie API {method} {path} failed ({resp.status_code}): {resp.text[:500]}")
     return resp.json() if resp.text else {}
 
@@ -3778,7 +3792,7 @@ def push_to_genie(eid):
                 "description": new_description,
                 "parent_path": new_parent_path,
                 "warehouse_id": warehouse_id,
-                "serialized_space": json.dumps(serialized),
+                "serialized_space": json.dumps(serialized, ensure_ascii=False),
             }
             resp = _genie_api_call(user_w, "POST", "/api/2.0/genie/spaces", body)
             space_id = resp.get("space_id", "")
@@ -3791,7 +3805,7 @@ def push_to_genie(eid):
             body = {
                 "title": eng.get("genie_space_name", ""),
                 "warehouse_id": warehouse_id,
-                "serialized_space": json.dumps(serialized),
+                "serialized_space": json.dumps(serialized, ensure_ascii=False),
             }
             _genie_api_call(user_w, "PATCH", f"/api/2.0/genie/spaces/{space_id}", body)
             result["space_id"] = space_id
@@ -3819,6 +3833,9 @@ def push_to_genie(eid):
             "ts": ts,
         },
     )
+    # Return new updated_at so the client can refresh its optimistic-lock token
+    # and avoid 409s on the next autosave.
+    result["updated_at"] = ts
 
     return jsonify(result)
 

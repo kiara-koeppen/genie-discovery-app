@@ -461,6 +461,7 @@ export default function Engagement({ readOnly = false }: Props) {
             session3Data={sessionDrafts[3]}
             session4Data={sessionDrafts[4]}
             engagementId={id}
+            onPushed={(ts) => { updatedAtRef.current = ts; }}
           />
         )}
         {tab === 5 && <Session6Form {...sessionProps(6)} />}

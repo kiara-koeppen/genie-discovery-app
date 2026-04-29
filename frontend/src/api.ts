@@ -363,6 +363,7 @@ export const api = {
       created?: boolean;
       updated?: boolean;
       warnings?: string[];
+      updated_at?: string;
     }>(`/engagements/${id}/push-to-genie`, {
       method: "POST",
       body: JSON.stringify(body),
