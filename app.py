@@ -1082,7 +1082,7 @@ CRITICAL RULES:
 - The COE will read this in 3-5 minutes. Be specific and concise. No filler.
 - Use the BO's language where possible (from S1 Business Context Q&A and S2 Vocabulary) — not invented terminology.
 
-OUTPUT STRUCTURE (markdown, exact section headers in this order):
+OUTPUT STRUCTURE (markdown). Each section header below appears EXACTLY ONCE, in this order. Do not duplicate any `##` heading. Do not invent extra top-level sections. Use bulleted lists, never markdown tables (the renderer doesn't support them).
 
 ## TL;DR
 3-5 bullets: who the audience is, what they need, what was built, the headline risk.
@@ -1091,18 +1091,17 @@ OUTPUT STRUCTURE (markdown, exact section headers in this order):
 2-4 short paragraphs synthesizing S1+S2: the BO's day-to-day, decisions they make, pain points, existing reports they rely on, key vocabulary. Cite every paragraph.
 
 ## Technical Approach
-2-3 short paragraphs on S3: source tables, key metrics defined, scope decisions, the metric view (or lack of one), the global filter if any. Cite specific SQL expressions or vocabulary terms.
+2-3 short paragraphs on S3: source tables, key metrics defined, scope decisions, the metric view (or lack of one), the global filter if any. Cite specific SQL expressions or vocabulary terms. If you want to enumerate measures or dimensions, do it inline in prose — do NOT create a separate "Defined Measures" or duplicate "Data Plan" section for that.
 
 ## Data Plan
-A short bulleted list of tables and metric views being included in the Genie Space (from S4 Data Plan). Identifier + 1-line purpose each. If empty, flag this as a problem.
+ONE bulleted list of tables and metric views being included in the Genie Space (from S4 Data Plan). Identifier + 1-line purpose each. If empty, flag this as a problem. Do NOT include another Data Plan section anywhere else in the brief.
 
 ## Coverage Analysis
-Walk through the S2 Question Bank. For each question (group similar ones if there are many), classify and cite:
-- ✅ **Answerable**: name the specific measure/dimension/table that addresses it
-- ⚠️ **Partial**: what part is covered, what's missing
-- ❌ **Not addressed**: nothing in the design supports this
+Walk through the S2 Question Bank. For each question (group similar ones if there are many), output ONE bullet using this exact shape:
 
-If the question bank is empty, say so explicitly and flag it as a problem.
+- **Q1: <question text>** — ✅ Answerable | ⚠️ Partial | ❌ Not addressed. <one-sentence justification with citations like [S3 SQL: denial_rate_pct]>
+
+Use bulleted lists only — NEVER use markdown tables (`| col |` syntax) here, the renderer breaks on them. If the question bank is empty, say so explicitly and flag it as a problem.
 
 ## Open Gaps & Risks
 
