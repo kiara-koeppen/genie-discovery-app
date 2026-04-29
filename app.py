@@ -144,6 +144,90 @@ JOBS_LOCK = threading.Lock()
 JOB_TTL_SECONDS = 3600  # 1 hour
 TASK_HANDLERS = {}
 
+# Delta table for job persistence so app restarts don't strand in-flight jobs.
+# Rows are mirrored from the in-memory JOBS dict on every state change. On
+# /jobs/<id>, an in-memory miss falls back to a Delta lookup so a redeploy
+# mid-poll surfaces a real result instead of "job not found".
+JOBS_TABLE = f"{CATALOG}.{SCHEMA}.discovery_jobs"
+
+
+def _persist_job_state(job_id, job):
+    """Mirror the current in-memory job state into the Delta jobs table.
+    Best-effort: failures are logged but don't crash the worker."""
+    try:
+        result_json = json.dumps(job.get("result")) if job.get("result") is not None else ""
+        finished_at = job.get("finished_at") or 0.0
+        sql_run(
+            f"MERGE INTO {JOBS_TABLE} AS t "
+            f"USING (SELECT :job_id AS job_id) AS s ON t.job_id = s.job_id "
+            f"WHEN MATCHED THEN UPDATE SET "
+            f"  state = :state, finished_at = :finished_at, "
+            f"  result = :result, error = :error "
+            f"WHEN NOT MATCHED THEN INSERT "
+            f"  (job_id, task_type, creator_email, state, started_at, finished_at, result, error) "
+            f"VALUES "
+            f"  (:job_id, :task_type, :creator_email, :state, :started_at, :finished_at, :result, :error)",
+            {
+                "job_id": job_id,
+                "task_type": job.get("task_type", ""),
+                "creator_email": job.get("creator_email", ""),
+                "state": job.get("state", ""),
+                "started_at": str(job.get("started_at", 0.0)),
+                "finished_at": str(finished_at),
+                "result": result_json,
+                "error": str(job.get("error") or ""),
+            },
+        )
+    except Exception as e:
+        print(f"[jobs persist] {job_id} write failed: {e}", flush=True)
+
+
+def _load_job_from_delta(job_id):
+    """Look up a job in Delta when not present in the in-memory dict (e.g. after
+    an app restart). Returns the job dict or None."""
+    try:
+        rows = sql_exec(
+            f"SELECT job_id, task_type, creator_email, state, started_at, "
+            f"finished_at, result, error FROM {JOBS_TABLE} WHERE job_id = :j",
+            {"j": job_id},
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        try:
+            result = json.loads(r.get("result") or "null")
+        except (json.JSONDecodeError, TypeError):
+            result = None
+        try:
+            started_at = float(r.get("started_at") or 0.0)
+        except (ValueError, TypeError):
+            started_at = 0.0
+        return {
+            "state": r.get("state") or "",
+            "task_type": r.get("task_type") or "",
+            "creator_email": r.get("creator_email") or "",
+            "started_at": started_at,
+            "result": result,
+            "error": r.get("error") or "",
+        }
+    except Exception as e:
+        print(f"[jobs persist] read {job_id} failed: {e}", flush=True)
+        return None
+
+
+def _recover_orphan_jobs():
+    """At startup, mark any Delta rows still in 'pending' state as 'failed'.
+    Their worker threads died with the previous app process, so they will
+    never finish. Without this they'd poll forever."""
+    try:
+        sql_run(
+            f"UPDATE {JOBS_TABLE} SET state = 'failed', "
+            f"error = 'App restarted before job finished. Please retry.' "
+            f"WHERE state = 'pending'"
+        )
+    except Exception as e:
+        print(f"[jobs persist] orphan recovery failed: {e}", flush=True)
+
 
 def _user_error(label, exc):
     """Log the full exception + traceback under `label`, return a clean
@@ -168,22 +252,35 @@ def register_task(name):
 
 
 def _cleanup_old_jobs():
-    """Evict jobs older than TTL. Called on each /start request -- amortized."""
+    """Evict jobs older than TTL. Called on each /start request -- amortized.
+    Cleans both the in-memory dict and the Delta jobs table."""
     now = time.time()
     with JOBS_LOCK:
         stale = [jid for jid, j in JOBS.items() if now - j["started_at"] > JOB_TTL_SECONDS]
         for jid in stale:
             del JOBS[jid]
+    cutoff = now - JOB_TTL_SECONDS
+    try:
+        sql_run(
+            f"DELETE FROM {JOBS_TABLE} WHERE started_at < :cutoff",
+            {"cutoff": str(cutoff)},
+        )
+    except Exception as e:
+        print(f"[jobs persist] cleanup failed: {e}", flush=True)
 
 
 def _run_job(job_id, task_type, payload):
-    """Background-thread worker. Updates JOBS with result or error."""
+    """Background-thread worker. Updates JOBS with result or error and
+    mirrors state changes into the Delta jobs table."""
     handler = TASK_HANDLERS.get(task_type)
     if not handler:
         with JOBS_LOCK:
             if job_id in JOBS:
                 JOBS[job_id]["state"] = "failed"
                 JOBS[job_id]["error"] = f"Unknown task_type: {task_type}"
+                JOBS[job_id]["finished_at"] = time.time()
+                snapshot = dict(JOBS[job_id])
+        _persist_job_state(job_id, snapshot)
         return
     try:
         result = handler(payload)
@@ -191,11 +288,21 @@ def _run_job(job_id, task_type, payload):
             if job_id in JOBS:
                 JOBS[job_id]["state"] = "done"
                 JOBS[job_id]["result"] = result
+                JOBS[job_id]["finished_at"] = time.time()
+                snapshot = dict(JOBS[job_id])
+            else:
+                snapshot = None
     except Exception as e:
         with JOBS_LOCK:
             if job_id in JOBS:
                 JOBS[job_id]["state"] = "failed"
                 JOBS[job_id]["error"] = _user_error(f"jobs:{task_type}:{job_id}", e)
+                JOBS[job_id]["finished_at"] = time.time()
+                snapshot = dict(JOBS[job_id])
+            else:
+                snapshot = None
+    if snapshot:
+        _persist_job_state(job_id, snapshot)
 
 
 @app.route("/api/jobs/start", methods=["POST"])
@@ -249,9 +356,12 @@ def jobs_start():
             "task_type": task_type,
             "creator_email": creator_email,
             "started_at": time.time(),
+            "finished_at": 0.0,
             "result": None,
             "error": None,
         }
+        snapshot = dict(JOBS[job_id])
+    _persist_job_state(job_id, snapshot)
 
     t = threading.Thread(target=_run_job, args=(job_id, task_type, payload), daemon=True)
     t.start()
@@ -262,23 +372,29 @@ def jobs_start():
 def jobs_status(job_id):
     """Return current state of a job. Only the user who created the job can
     read it -- prevents leakage if a job_id is exposed (logs, etc.).
+
+    Falls back to the Delta jobs table if the in-memory dict has been
+    cleared (app restart), so a poll mid-restart returns the persisted
+    final state instead of "job not found".
     """
     requester = (get_current_user() or "").strip().lower()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
+    if not job:
+        # App may have restarted; check Delta
+        job = _load_job_from_delta(job_id)
         if not job:
             return jsonify({"error": "job not found"}), 404
-        if requester and job.get("creator_email") and requester != job["creator_email"]:
-            # 404 (not 403) so the existence of the job isn't disclosed
-            return jsonify({"error": "job not found"}), 404
-        snapshot = {
-            "state": job["state"],
-            "task_type": job["task_type"],
-            "result": job["result"],
-            "error": job["error"],
-            "age_seconds": int(time.time() - job["started_at"]),
-        }
-    return jsonify(snapshot)
+    if requester and job.get("creator_email") and requester != job["creator_email"]:
+        # 404 (not 403) so the existence of the job isn't disclosed
+        return jsonify({"error": "job not found"}), 404
+    return jsonify({
+        "state": job.get("state", ""),
+        "task_type": job.get("task_type", ""),
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "age_seconds": int(time.time() - (job.get("started_at") or time.time())),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +552,17 @@ def ensure_table():
         if col not in existing:
             sql_run(f"ALTER TABLE {TABLE} ADD COLUMN {col} STRING")
 
+    # Async job runner persistence -- so app restarts don't strand in-flight jobs.
+    sql_run(
+        f"CREATE TABLE IF NOT EXISTS {JOBS_TABLE} ("
+        f"job_id STRING, task_type STRING, creator_email STRING, "
+        f"state STRING, started_at DOUBLE, finished_at DOUBLE, "
+        f"result STRING, error STRING"
+        f") USING DELTA"
+    )
+
 ensure_table()
+_recover_orphan_jobs()
 
 
 # ---------------------------------------------------------------------------
