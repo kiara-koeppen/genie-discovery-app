@@ -97,6 +97,11 @@ export default function Engagement({ readOnly = false }: Props) {
         5: s["5"] || {},
         6: s["6"] || {},
       });
+      // Reset the SN URL autosave skip flag BEFORE setMeta. The
+      // useEffect-on-meta-change pattern's "skip first run" only fires once
+      // at component mount; without this, hydrating meta from the load
+      // would trip the effect and queue a no-op autosave.
+      snUrlInitialLoad.current = true;
       setMeta({
         genie_space_name: String(eng.genie_space_name || ""),
         business_owner_name: String(eng.business_owner_name || ""),

@@ -452,20 +452,57 @@ def sql_exec(query, params=None):
     return []
 
 
-def sql_run(query, params=None):
+def sql_run(query, params=None, *, must_succeed=False):
+    """Execute a write statement.
+
+    By default this is fire-and-forget for back-compat -- ensure_table()'s
+    CREATE TABLE IF NOT EXISTS calls would otherwise crash startup if the
+    app SP lacks CREATE TABLE on the schema (the table may already exist;
+    permission is checked before IF NOT EXISTS short-circuits).
+
+    Pass must_succeed=True for writes where silent failure is unacceptable
+    (engagement saves, soft-delete, plan persistence). That path waits for
+    completion and raises on any non-SUCCEEDED state.
+    """
     sdk_params = None
     if params:
         sdk_params = [
             StatementParameterListItem(name=k, value=str(v) if v is not None else "")
             for k, v in params.items()
         ]
-    w.statement_execution.execute_statement(
+    if not must_succeed:
+        # Best-effort fire-and-forget. Wait briefly so quick statements
+        # commit before we return, but don't raise on failure.
+        w.statement_execution.execute_statement(
+            warehouse_id=WAREHOUSE_ID,
+            statement=query,
+            parameters=sdk_params,
+            catalog=CATALOG,
+            schema=SCHEMA,
+            wait_timeout="10s",
+        )
+        return
+
+    resp = w.statement_execution.execute_statement(
         warehouse_id=WAREHOUSE_ID,
         statement=query,
         parameters=sdk_params,
         catalog=CATALOG,
         schema=SCHEMA,
+        wait_timeout="30s",
     )
+    state = str(resp.status.state) if resp.status else ""
+    statement_id = resp.statement_id
+    deadline = time.time() + 60
+    while statement_id and ("PENDING" in state or "RUNNING" in state):
+        if time.time() > deadline:
+            raise RuntimeError(f"sql_run timed out after 90s: {query[:80]}...")
+        time.sleep(1.0)
+        resp = w.statement_execution.get_statement(statement_id)
+        state = str(resp.status.state) if resp.status else ""
+    if "SUCCEEDED" not in state:
+        err = resp.status.error.message if (resp.status and resp.status.error) else state
+        raise RuntimeError(f"sql_run failed [{state}]: {err}; query: {query[:200]}")
 
 
 def now_ts():
