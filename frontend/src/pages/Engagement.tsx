@@ -70,6 +70,11 @@ export default function Engagement({ readOnly = false }: Props) {
   // Last-known updated_at for the engagement, used as an If-Match optimistic-
   // lock token. Advances after every successful save; reset on load/refresh.
   const updatedAtRef = useRef<string>("");
+  // The session number that received the most recent updateDraft call.
+  // Autosave saves THIS session, not the currently-visible tab, so flipping
+  // tabs after an edit doesn't redirect the save to a session the user never
+  // touched. Initial value 1 is fine -- skipNextAutosave gates the first run.
+  const lastEditedSessionRef = useRef<number>(1);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -135,7 +140,10 @@ export default function Engagement({ readOnly = false }: Props) {
     }
   }, [id, sessionDrafts, load]);
 
-  // Debounced autosave: fires AUTOSAVE_DELAY_MS after the last draft change
+  // Debounced autosave: fires AUTOSAVE_DELAY_MS after a real edit (not after
+  // a tab change). `tab` is intentionally NOT in the deps so navigating
+  // between tabs without editing doesn't queue a save. Saves the session the
+  // user actually modified, captured in lastEditedSessionRef by updateDraft.
   useEffect(() => {
     if (readOnly || !id) return;
     if (skipNextAutosave.current) {
@@ -145,12 +153,12 @@ export default function Engagement({ readOnly = false }: Props) {
     setSaveStatus("dirty");
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     autosaveTimer.current = setTimeout(() => {
-      persistSession(tab + 1);
+      persistSession(lastEditedSessionRef.current);
     }, AUTOSAVE_DELAY_MS);
     return () => {
       if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     };
-  }, [sessionDrafts, tab, readOnly, id, persistSession]);
+  }, [sessionDrafts, readOnly, id, persistSession]);
 
   const handleManualSave = async () => {
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
@@ -159,6 +167,7 @@ export default function Engagement({ readOnly = false }: Props) {
   };
 
   const updateDraft = (sessionNum: number, section: string, value: any) => {
+    lastEditedSessionRef.current = sessionNum;
     setSessionDrafts((prev) => ({
       ...prev,
       [sessionNum]: { ...prev[sessionNum], [section]: value },
