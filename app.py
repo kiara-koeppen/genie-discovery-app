@@ -202,6 +202,14 @@ def _run_job(job_id, task_type, payload):
 def jobs_start():
     """Kick off a background task. Returns a job_id for polling.
 
+    Authorization model:
+    - If payload contains an `engagement_id`, the calling user must be the
+      analyst, the BO, or a COE-group member for that engagement. Without
+      this check the job runner would bypass the per-engagement gate that
+      protects the sync `/api/engagements/<eid>/...` routes.
+    - The job is bound to the creator's email so /jobs/<id> can verify
+      that the requester is the same user.
+
     Auto-injects the request's OBO token into payload["_user_token"] so
     background tasks that need to run UC queries under the user's grants
     can do so. The token is held on the worker thread's stack only -- it
@@ -215,6 +223,21 @@ def jobs_start():
     if task_type not in TASK_HANDLERS:
         return jsonify({"error": f"unknown task_type: {task_type}"}), 400
 
+    # Engagement authorization: every task we currently register is bound to
+    # an engagement_id, and the sync analogues are gated. Apply the same gate
+    # here for parity. Tasks without an engagement_id are rejected for now;
+    # if we ever add a global task, this check can be relaxed deliberately.
+    eid_in_payload = (payload.get("engagement_id") or "").strip()
+    if not eid_in_payload:
+        return jsonify({"error": "payload.engagement_id is required"}), 400
+    _, err = _authorize_engagement(eid_in_payload)
+    if err:
+        return err
+
+    creator_email = (get_current_user() or "").strip().lower()
+    if not creator_email:
+        return jsonify({"error": "User email not available; cannot start job"}), 401
+
     payload["_user_token"] = request.headers.get("X-Forwarded-Access-Token") or ""
 
     _cleanup_old_jobs()
@@ -224,6 +247,7 @@ def jobs_start():
         JOBS[job_id] = {
             "state": "pending",
             "task_type": task_type,
+            "creator_email": creator_email,
             "started_at": time.time(),
             "result": None,
             "error": None,
@@ -236,10 +260,16 @@ def jobs_start():
 
 @app.route("/api/jobs/<job_id>", methods=["GET"])
 def jobs_status(job_id):
-    """Return current state of a job. Frontend polls this endpoint."""
+    """Return current state of a job. Only the user who created the job can
+    read it -- prevents leakage if a job_id is exposed (logs, etc.).
+    """
+    requester = (get_current_user() or "").strip().lower()
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if not job:
+            return jsonify({"error": "job not found"}), 404
+        if requester and job.get("creator_email") and requester != job["creator_email"]:
+            # 404 (not 403) so the existence of the job isn't disclosed
             return jsonify({"error": "job not found"}), 404
         snapshot = {
             "state": job["state"],
@@ -392,14 +422,14 @@ def ensure_table():
         f"analyst_name STRING, analyst_email STRING, "
         f"servicenow_ticket_url STRING, "
         f"current_session INT, status STRING, "
-        f"created_at STRING, updated_at STRING, "
+        f"created_at STRING, updated_at STRING, deleted_at STRING, "
         f"{section_ddl}"
         f") USING DELTA"
     )
     rows = sql_exec(f"DESCRIBE TABLE {TABLE}")
     existing = {r.get("col_name", "") for r in rows}
     # Top-level metadata columns added since v1
-    for top_col in ("servicenow_ticket_url",):
+    for top_col in ("servicenow_ticket_url", "deleted_at"):
         if top_col not in existing:
             sql_run(f"ALTER TABLE {TABLE} ADD COLUMN {top_col} STRING")
     for col in ALL_SECTION_COLS:
@@ -586,19 +616,23 @@ def list_engagements():
     engagements if the caller is a COE-group reviewer.
     """
     current = (get_current_user() or "").strip().lower()
+    # Soft-deleted rows (deleted_at IS NOT NULL/empty) are hidden from the list.
+    # The row stays in Delta so an admin can recover it via direct URL/SQL.
+    not_deleted = "(deleted_at IS NULL OR deleted_at = '')"
     if _user_is_coe_member(_user_workspace_client()):
         rows = sql_exec(
             f"SELECT engagement_id, genie_space_name, business_owner_name, "
             f"analyst_name, current_session, status, created_at, updated_at "
-            f"FROM {TABLE} ORDER BY updated_at DESC"
+            f"FROM {TABLE} WHERE {not_deleted} ORDER BY updated_at DESC"
         )
     else:
         rows = sql_exec(
             f"SELECT engagement_id, genie_space_name, business_owner_name, "
             f"analyst_name, current_session, status, created_at, updated_at "
             f"FROM {TABLE} "
-            f"WHERE LOWER(TRIM(analyst_email)) = :u "
-            f"   OR LOWER(TRIM(business_owner_email)) = :u "
+            f"WHERE {not_deleted} AND ("
+            f"LOWER(TRIM(analyst_email)) = :u "
+            f"OR LOWER(TRIM(business_owner_email)) = :u) "
             f"ORDER BY updated_at DESC",
             {"u": current},
         )
@@ -611,20 +645,25 @@ def check_engagement_name():
 
     Optional `exclude_eid` query param: when renaming an existing engagement,
     its own current name should not count as a conflict.
+    Soft-deleted engagements DO NOT count as conflicts -- the name is freed
+    for reuse once the row is deleted.
     """
     name = request.args.get("name", "").strip()
     exclude_eid = request.args.get("exclude_eid", "").strip()
     if not name:
         return jsonify({"available": False})
+    not_deleted = "(deleted_at IS NULL OR deleted_at = '')"
     if exclude_eid and _UUID_RE.match(exclude_eid):
         rows = sql_exec(
             f"SELECT COUNT(*) AS cnt FROM {TABLE} "
-            f"WHERE genie_space_name = :name AND engagement_id != :eid",
+            f"WHERE genie_space_name = :name AND engagement_id != :eid "
+            f"AND {not_deleted}",
             {"name": name, "eid": exclude_eid},
         )
     else:
         rows = sql_exec(
-            f"SELECT COUNT(*) AS cnt FROM {TABLE} WHERE genie_space_name = :name",
+            f"SELECT COUNT(*) AS cnt FROM {TABLE} "
+            f"WHERE genie_space_name = :name AND {not_deleted}",
             {"name": name},
         )
     count = int(rows[0]["cnt"]) if rows else 0
@@ -645,7 +684,9 @@ def create_engagement():
     # Check uniqueness
     name = data["genie_space_name"].strip()
     existing = sql_exec(
-        f"SELECT COUNT(*) AS cnt FROM {TABLE} WHERE genie_space_name = :name",
+        f"SELECT COUNT(*) AS cnt FROM {TABLE} "
+        f"WHERE genie_space_name = :name "
+        f"AND (deleted_at IS NULL OR deleted_at = '')",
         {"name": name},
     )
     if existing and int(existing[0]["cnt"]) > 0:
@@ -703,10 +744,11 @@ def update_engagement(eid):
     if not name:
         return jsonify({"error": "genie_space_name is required"}), 400
 
-    # Uniqueness check, scoped to other engagements
+    # Uniqueness check, scoped to other (non-soft-deleted) engagements
     dup = sql_exec(
         f"SELECT COUNT(*) AS cnt FROM {TABLE} "
-        f"WHERE genie_space_name = :name AND engagement_id != :eid",
+        f"WHERE genie_space_name = :name AND engagement_id != :eid "
+        f"AND (deleted_at IS NULL OR deleted_at = '')",
         {"name": name, "eid": eid},
     )
     if dup and int(dup[0]["cnt"]) > 0:
@@ -739,7 +781,17 @@ def update_engagement(eid):
 
 @app.route("/api/engagements/<eid>", methods=["DELETE"])
 def delete_engagement(eid):
-    sql_run(f"DELETE FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    """Soft-delete: mark deleted_at instead of hard-removing the row.
+    The row stays in Delta so a careless click doesn't lose months of work.
+    Hidden from list_engagements + name-uniqueness checks; recoverable via
+    direct URL or by clearing deleted_at via SQL.
+    """
+    ts = now_ts()
+    sql_run(
+        f"UPDATE {TABLE} SET deleted_at = :ts, updated_at = :ts "
+        f"WHERE engagement_id = :eid",
+        {"eid": eid, "ts": ts},
+    )
     return jsonify({"success": True})
 
 
