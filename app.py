@@ -893,10 +893,26 @@ def create_engagement():
 
 @app.route("/api/engagements/<eid>", methods=["GET"])
 def get_engagement(eid):
-    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    # SELECT * returns updated_at / created_at as TIMESTAMP, but we hand the
+    # value out to clients as the optimistic-lock token. Cast to STRING so
+    # the load value matches what _check_optimistic_lock will compare against
+    # later (Spark's canonical TIMESTAMP-string format).
+    rows = sql_exec(
+        f"SELECT *, "
+        f"CAST(updated_at AS STRING) AS updated_at_str, "
+        f"CAST(created_at AS STRING) AS created_at_str "
+        f"FROM {TABLE} WHERE engagement_id = :eid",
+        {"eid": eid},
+    )
     if not rows:
         return jsonify({"error": "Not found"}), 404
-    return jsonify(parse_row(rows[0]))
+    parsed = parse_row(rows[0])
+    # Overwrite the TIMESTAMP-typed fields with their string aliases
+    if "updated_at_str" in rows[0]:
+        parsed["updated_at"] = rows[0].get("updated_at_str") or ""
+    if "created_at_str" in rows[0]:
+        parsed["created_at"] = rows[0].get("created_at_str") or ""
+    return jsonify(parsed)
 
 
 @app.route("/api/engagements/<eid>", methods=["PUT"])
@@ -954,7 +970,7 @@ def update_engagement(eid):
             "ts": ts,
         },
     )
-    return jsonify({"success": True, "updated_at": ts})
+    return jsonify({"success": True, "updated_at": _read_updated_at(eid)})
 
 
 @app.route("/api/engagements/<eid>", methods=["DELETE"])
@@ -989,25 +1005,42 @@ class StaleEngagementError(Exception):
 def _check_optimistic_lock(eid):
     """If the request carries `If-Match: <updated_at>`, verify it matches
     the row's current updated_at. Raises StaleEngagementError on conflict.
-    No header = no check (back-compat)."""
+    No header = no check (back-compat).
+
+    Reads updated_at via CAST AS STRING so the comparison uses Spark's
+    canonical TIMESTAMP-string format (the column is TIMESTAMP, not STRING,
+    so a raw read can come back in different shapes).
+    """
     expected = (request.headers.get("If-Match") or "").strip()
     if not expected:
         return
+    actual = _read_updated_at(eid)
+    if not actual:
+        raise ValueError("Engagement not found")
+    if actual != expected:
+        raise StaleEngagementError(actual)
+
+
+def _read_updated_at(eid):
+    """Read engagement.updated_at AS STRING so we get the same canonical
+    Spark-formatted value we'd compare against later (avoids round-trip
+    format mismatches between Python's isoformat and Spark's TIMESTAMP
+    string display)."""
     rows = sql_exec(
-        f"SELECT updated_at FROM {TABLE} WHERE engagement_id = :eid",
+        f"SELECT CAST(updated_at AS STRING) AS updated_at "
+        f"FROM {TABLE} WHERE engagement_id = :eid",
         {"eid": eid},
     )
     if not rows:
-        raise ValueError("Engagement not found")
-    actual = (rows[0].get("updated_at") or "").strip()
-    if actual and actual != expected:
-        raise StaleEngagementError(actual)
+        return ""
+    return (rows[0].get("updated_at") or "").strip()
 
 
 def save_session(eid, session_num, data):
     """Update session columns for an engagement. Returns the new updated_at
-    timestamp on success. Raises StaleEngagementError if the request's
-    If-Match header doesn't match the row's current updated_at."""
+    timestamp (in Spark's canonical string format) on success. Raises
+    StaleEngagementError if the request's If-Match header doesn't match
+    the row's current updated_at."""
     _check_optimistic_lock(eid)
 
     cols = SESSION_COLS[session_num]
@@ -1035,7 +1068,10 @@ def save_session(eid, session_num, data):
     set_sql = ", ".join(set_parts)
 
     sql_run(f"UPDATE {TABLE} SET {set_sql} WHERE engagement_id = :eid", params)
-    return ts
+    # Return the canonical stored value -- not Python's isoformat -- so the
+    # client's next If-Match round-trips correctly. updated_at is a TIMESTAMP
+    # column and Spark reformats on read.
+    return _read_updated_at(eid)
 
 
 def _save_session_response(eid, session_num):
