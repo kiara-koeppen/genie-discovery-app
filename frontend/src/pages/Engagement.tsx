@@ -67,6 +67,9 @@ export default function Engagement({ readOnly = false }: Props) {
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const skipNextAutosave = useRef(true);
+  // Last-known updated_at for the engagement, used as an If-Match optimistic-
+  // lock token. Advances after every successful save; reset on load/refresh.
+  const updatedAtRef = useRef<string>("");
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -78,6 +81,7 @@ export default function Engagement({ readOnly = false }: Props) {
       ]);
       setData(eng);
       setIsCoeMember(coe.is_member);
+      updatedAtRef.current = String(eng.updated_at || "");
       const s = eng.sessions || {};
       skipNextAutosave.current = true;
       setSessionDrafts({
@@ -110,13 +114,26 @@ export default function Engagement({ readOnly = false }: Props) {
     if (!id) return;
     setSaveStatus("saving");
     try {
-      await api.saveSession(id, sessionNum, sessionDrafts[sessionNum]);
+      const res = await api.saveSession(
+        id,
+        sessionNum,
+        sessionDrafts[sessionNum],
+        updatedAtRef.current,
+      );
+      if (res.updated_at) updatedAtRef.current = res.updated_at;
       setSaveStatus("saved");
     } catch (err: any) {
       setSaveStatus("error");
-      setToast(`Error saving: ${err.message}`);
+      const msg = err?.message || "Save failed";
+      // 409 stale: backend message is friendly. Reload to recover.
+      if (msg.toLowerCase().includes("updated by another user")) {
+        setToast("This engagement was updated elsewhere. Reloading...");
+        await load();
+      } else {
+        setToast(`Error saving: ${msg}`);
+      }
     }
-  }, [id, sessionDrafts]);
+  }, [id, sessionDrafts, load]);
 
   // Debounced autosave: fires AUTOSAVE_DELAY_MS after the last draft change
   useEffect(() => {
@@ -169,12 +186,23 @@ export default function Engagement({ readOnly = false }: Props) {
     snUrlSaveTimer.current = setTimeout(async () => {
       setSaveStatus("saving");
       try {
-        await api.updateEngagement(id, { ...meta, status: data?.status || "in_progress" });
+        const res = await api.updateEngagement(
+          id,
+          { ...meta, status: data?.status || "in_progress" },
+          updatedAtRef.current,
+        );
+        if (res.updated_at) updatedAtRef.current = res.updated_at;
         setData((prev: any) => (prev ? { ...prev, servicenow_ticket_url: meta.servicenow_ticket_url } : prev));
         setSaveStatus("saved");
       } catch (err: any) {
         setSaveStatus("error");
-        setToast(`Error saving ServiceNow link: ${err?.message || "unknown"}`);
+        const msg = err?.message || "unknown";
+        if (msg.toLowerCase().includes("updated by another user")) {
+          setToast("This engagement was updated elsewhere. Reloading...");
+          await load();
+        } else {
+          setToast(`Error saving ServiceNow link: ${msg}`);
+        }
       }
     }, AUTOSAVE_DELAY_MS);
     return () => {
@@ -240,13 +268,23 @@ export default function Engagement({ readOnly = false }: Props) {
     setSavingMeta(true);
     setMetaError("");
     try {
-      await api.updateEngagement(id, { ...draftMeta, status: data?.status || "in_progress" });
+      const res = await api.updateEngagement(
+        id,
+        { ...draftMeta, status: data?.status || "in_progress" },
+        updatedAtRef.current,
+      );
+      if (res.updated_at) updatedAtRef.current = res.updated_at;
       setMeta(draftMeta);
       setData((prev: any) => (prev ? { ...prev, ...draftMeta } : prev));
       setSaveStatus("saved");
       setEditOpen(false);
     } catch (err: any) {
-      setMetaError(err?.message || "Save failed");
+      const msg = err?.message || "Save failed";
+      if (msg.toLowerCase().includes("updated by another user")) {
+        setMetaError("This engagement was updated elsewhere. Close this dialog and refresh.");
+      } else {
+        setMetaError(msg);
+      }
     }
     setSavingMeta(false);
   };

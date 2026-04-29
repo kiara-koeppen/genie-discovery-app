@@ -744,6 +744,18 @@ def update_engagement(eid):
     if not name:
         return jsonify({"error": "genie_space_name is required"}), 400
 
+    # Optimistic-lock check (no-op if If-Match header is absent)
+    try:
+        _check_optimistic_lock(eid)
+    except StaleEngagementError as e:
+        return jsonify({
+            "error": "stale",
+            "current_updated_at": e.current_updated_at,
+            "message": "This engagement was updated by another user. Refresh to continue.",
+        }), 409
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+
     # Uniqueness check, scoped to other (non-soft-deleted) engagements
     dup = sql_exec(
         f"SELECT COUNT(*) AS cnt FROM {TABLE} "
@@ -776,7 +788,7 @@ def update_engagement(eid):
             "ts": ts,
         },
     )
-    return jsonify({"success": True})
+    return jsonify({"success": True, "updated_at": ts})
 
 
 @app.route("/api/engagements/<eid>", methods=["DELETE"])
@@ -799,11 +811,43 @@ def delete_engagement(eid):
 # API: Session saves
 # ---------------------------------------------------------------------------
 
+class StaleEngagementError(Exception):
+    """Raised when an optimistic-lock check on engagement.updated_at fails.
+    The HTTP layer translates this into 409 with the current updated_at so
+    the client can refresh + retry."""
+    def __init__(self, current_updated_at):
+        super().__init__("stale engagement")
+        self.current_updated_at = current_updated_at
+
+
+def _check_optimistic_lock(eid):
+    """If the request carries `If-Match: <updated_at>`, verify it matches
+    the row's current updated_at. Raises StaleEngagementError on conflict.
+    No header = no check (back-compat)."""
+    expected = (request.headers.get("If-Match") or "").strip()
+    if not expected:
+        return
+    rows = sql_exec(
+        f"SELECT updated_at FROM {TABLE} WHERE engagement_id = :eid",
+        {"eid": eid},
+    )
+    if not rows:
+        raise ValueError("Engagement not found")
+    actual = (rows[0].get("updated_at") or "").strip()
+    if actual and actual != expected:
+        raise StaleEngagementError(actual)
+
+
 def save_session(eid, session_num, data):
-    """Update session columns for an engagement."""
+    """Update session columns for an engagement. Returns the new updated_at
+    timestamp on success. Raises StaleEngagementError if the request's
+    If-Match header doesn't match the row's current updated_at."""
+    _check_optimistic_lock(eid)
+
     cols = SESSION_COLS[session_num]
     set_parts = []
-    params = {"eid": eid, "ts": now_ts()}
+    ts = now_ts()
+    params = {"eid": eid, "ts": ts}
 
     for col in cols:
         set_parts.append(f"{col} = :{col}")
@@ -825,42 +869,53 @@ def save_session(eid, session_num, data):
     set_sql = ", ".join(set_parts)
 
     sql_run(f"UPDATE {TABLE} SET {set_sql} WHERE engagement_id = :eid", params)
+    return ts
+
+
+def _save_session_response(eid, session_num):
+    """Shared wrapper for the per-session save routes: handles optimistic-lock
+    conflicts and returns the new updated_at so the client can carry it forward."""
+    try:
+        ts = save_session(eid, session_num, request.json)
+    except StaleEngagementError as e:
+        return jsonify({
+            "error": "stale",
+            "current_updated_at": e.current_updated_at,
+            "message": "This engagement was updated by another user. Refresh to continue.",
+        }), 409
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    return jsonify({"success": True, "updated_at": ts})
 
 
 @app.route("/api/engagements/<eid>/sessions/1", methods=["PUT"])
 def save_session_1(eid):
-    save_session(eid, 1, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 1)
 
 
 @app.route("/api/engagements/<eid>/sessions/2", methods=["PUT"])
 def save_session_2(eid):
-    save_session(eid, 2, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 2)
 
 
 @app.route("/api/engagements/<eid>/sessions/3", methods=["PUT"])
 def save_session_3(eid):
-    save_session(eid, 3, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 3)
 
 
 @app.route("/api/engagements/<eid>/sessions/4", methods=["PUT"])
 def save_session_4(eid):
-    save_session(eid, 4, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 4)
 
 
 @app.route("/api/engagements/<eid>/sessions/5", methods=["PUT"])
 def save_session_5(eid):
-    save_session(eid, 5, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 5)
 
 
 @app.route("/api/engagements/<eid>/sessions/6", methods=["PUT"])
 def save_session_6(eid):
-    save_session(eid, 6, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 6)
 
 
 # ---------------------------------------------------------------------------

@@ -167,20 +167,38 @@ export const api = {
   getEngagement: (id: string) =>
     json<Record<string, unknown>>(`/engagements/${id}`),
 
-  updateEngagement: (id: string, data: Record<string, unknown>) =>
-    json<{ success: boolean }>(`/engagements/${id}`, {
-      method: "PUT",
-      body: JSON.stringify(data),
-    }),
+  updateEngagement: (
+    id: string,
+    data: Record<string, unknown>,
+    ifMatch?: string,
+  ) => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (ifMatch) headers["If-Match"] = ifMatch;
+    return json<{ success: boolean; updated_at?: string }>(
+      `/engagements/${id}`,
+      { method: "PUT", headers, body: JSON.stringify(data) },
+    );
+  },
 
   deleteEngagement: (id: string) =>
     json<{ success: boolean }>(`/engagements/${id}`, { method: "DELETE" }),
 
-  saveSession: (id: string, sessionNum: number, data: Record<string, unknown>) =>
-    json<{ success: boolean }>(`/engagements/${id}/sessions/${sessionNum}`, {
-      method: "PUT",
-      body: JSON.stringify(data),
-    }),
+  /** Save a session. If `ifMatch` is provided (the engagement's last-known
+   * updated_at), the server returns 409 if the row has been changed by
+   * another user since. Returns the new updated_at on success. */
+  saveSession: (
+    id: string,
+    sessionNum: number,
+    data: Record<string, unknown>,
+    ifMatch?: string,
+  ) => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (ifMatch) headers["If-Match"] = ifMatch;
+    return json<{ success: boolean; updated_at?: string }>(
+      `/engagements/${id}/sessions/${sessionNum}`,
+      { method: "PUT", headers, body: JSON.stringify(data) },
+    );
+  },
 
   coeApprove: (id: string, data: { status: string; notes: string }) =>
     json<{ success: boolean }>(`/engagements/${id}/coe-approve`, {
