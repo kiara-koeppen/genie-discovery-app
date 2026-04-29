@@ -44,6 +44,7 @@ SESSION_COLS = {
         "data_gaps", "scope_boundaries", "global_filter",
         "metric_view_yaml", "metric_view_fqn"],
     4: ["analyst_commentary", "auto_summary", "data_plan", "benchmark_questions",
+        "brief_unacknowledged_gaps",
         "coe_approval_status", "coe_approval_notes", "coe_reviewer_email"],
     5: ["genie_space_id", "genie_space_config",
         "plan_general_instructions", "plan_sample_questions", "plan_narrative",
@@ -53,15 +54,31 @@ SESSION_COLS = {
     6: ["prototype_results", "fixes_log", "benchmarks", "phrasing_notes"],
 }
 
-# Columns that store plain strings (not JSON arrays)
+# Columns that store plain strings (not JSON-encoded structured data).
+# `analyst_commentary` was here historically but is now a JSON object
+# {gap_responses, resolved_gaps, legacy_notes?}; removed so save/load
+# treat it as JSON.
 SCALAR_COLS = {
     "global_filter",
-    "metric_view_yaml", "metric_view_fqn", "analyst_commentary", "auto_summary",
+    "metric_view_yaml", "metric_view_fqn", "auto_summary",
     "coe_approval_status", "coe_approval_notes", "coe_reviewer_email",
     "genie_space_id", "genie_space_config",
     "plan_general_instructions", "plan_narrative", "plan_warehouse_id",
     "genie_space_url", "genie_space_pushed_at",
 }
+
+# Columns whose JSON shape is an object (not an array). Used to pick the
+# right empty-default and the right fallback when parse fails.
+OBJECT_COLS = {"analyst_commentary"}
+
+
+def _default_section_value(col):
+    """The empty-default for a section column (string scalar, [] for arrays, {} for objects)."""
+    if col in SCALAR_COLS:
+        return ""
+    if col in OBJECT_COLS:
+        return "{}"
+    return "[]"
 
 # All section columns
 ALL_SECTION_COLS = sorted(set(col for cols in SESSION_COLS.values() for col in cols))
@@ -272,6 +289,50 @@ def get_current_user():
         return "unknown"
 
 
+def _empty_for_col(col):
+    """In-memory empty for a column (after parse): str / list / dict."""
+    if col in SCALAR_COLS:
+        return ""
+    if col in OBJECT_COLS:
+        return {}
+    return []
+
+
+def _decode_section_value(col, raw):
+    """Decode a stored JSON section column. Falls back to per-column legacy
+    recovery for analyst_commentary, which used to be either a plain prose
+    string OR a Python repr (str(dict)) due to a prior storage bug."""
+    if not raw:
+        return _empty_for_col(col)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        if col == "analyst_commentary":
+            return _migrate_legacy_commentary(raw)
+        return _empty_for_col(col)
+
+
+def _migrate_legacy_commentary(raw):
+    """Recover analyst_commentary that was stored either as Python repr
+    `str(dict)` (single-quote bug) or as plain prose (pre-feature). Always
+    returns the new structured shape; preserves any human-written prose
+    under `legacy_notes` so it isn't silently dropped on upgrade."""
+    s = str(raw).strip()
+    # Try Python literal_eval for the single-quote dict-repr case
+    try:
+        import ast
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, dict) and ("gap_responses" in parsed or "resolved_gaps" in parsed):
+            return {
+                "gap_responses": dict(parsed.get("gap_responses") or {}),
+                "resolved_gaps": dict(parsed.get("resolved_gaps") or {}),
+            }
+    except (ValueError, SyntaxError):
+        pass
+    # Otherwise treat as plain prose -- keep it visible to the analyst as Legacy Notes
+    return {"gap_responses": {}, "resolved_gaps": {}, "legacy_notes": s}
+
+
 def parse_row(row):
     """Parse a raw DB row: decode JSON section columns, build sessions dict."""
     eng = {}
@@ -280,10 +341,7 @@ def parse_row(row):
             if k in SCALAR_COLS:
                 eng[k] = v or ""
             else:
-                try:
-                    eng[k] = json.loads(v) if v else []
-                except (json.JSONDecodeError, TypeError):
-                    eng[k] = []
+                eng[k] = _decode_section_value(k, v)
         else:
             eng[k] = v
 
@@ -291,7 +349,7 @@ def parse_row(row):
     for snum, cols in SESSION_COLS.items():
         session = {}
         for c in cols:
-            session[c] = eng.get(c, "" if c in SCALAR_COLS else [])
+            session[c] = eng.get(c, _empty_for_col(c))
         eng["sessions"][str(snum)] = session
     return eng
 
@@ -579,7 +637,7 @@ def create_engagement():
     for col in ALL_SECTION_COLS:
         param_name = f"default_{col}"
         section_defaults.append(f":{param_name}")
-        section_params[param_name] = "" if col in SCALAR_COLS else "[]"
+        section_params[param_name] = _default_section_value(col)
 
     sql_run(
         f"INSERT INTO {TABLE} "
@@ -678,7 +736,9 @@ def save_session(eid, session_num, data):
         if col in SCALAR_COLS:
             params[col] = data.get(col, "")
         else:
-            params[col] = json.dumps(data.get(col, []))
+            # OBJECT_COLS default to {} (dict), arrays default to []
+            default = {} if col in OBJECT_COLS else []
+            params[col] = json.dumps(data.get(col, default))
 
     if session_num < 6:
         set_parts.append(f"current_session = GREATEST(current_session, {session_num + 1})")

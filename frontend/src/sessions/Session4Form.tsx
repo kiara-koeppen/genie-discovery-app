@@ -54,13 +54,15 @@ function findCarryoverKey(
   return bestScore >= 0.5 ? bestKey : null;
 }
 function normalizeCommentary(raw: any): AnalystCommentary {
-  if (!raw || typeof raw === "string") {
-    // Legacy commentary was a freeform string -- silently discard per design.
-    return { gap_responses: {}, resolved_gaps: {} };
+  if (!raw) return { gap_responses: {}, resolved_gaps: {} };
+  if (typeof raw === "string") {
+    // Frontend received a string somehow (legacy load path). Preserve text.
+    return { gap_responses: {}, resolved_gaps: {}, legacy_notes: raw };
   }
   return {
     gap_responses: raw.gap_responses || {},
     resolved_gaps: raw.resolved_gaps || {},
+    legacy_notes: raw.legacy_notes || undefined,
   };
 }
 
@@ -662,6 +664,21 @@ export default function Session4Form({
           </Stack>
         </AccordionSummary>
         <AccordionDetails>
+          {commentary.legacy_notes && (
+            <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
+              <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Legacy Notes (read-only)</Typography>
+              <Typography
+                variant="body2"
+                sx={{ whiteSpace: "pre-wrap", fontStyle: "italic" }}
+              >
+                {commentary.legacy_notes}
+              </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+                This text was saved before the structured per-gap commentary was introduced.
+                Copy whatever's still relevant into the gap response cards below.
+              </Typography>
+            </Alert>
+          )}
           {currentGaps.length === 0 ? (
             <Alert severity="info" variant="outlined">
               {summary

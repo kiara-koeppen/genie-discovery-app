@@ -56,6 +56,11 @@ export interface BriefGap {
 export interface AnalystCommentary {
   gap_responses?: Record<string, string>;
   resolved_gaps?: Record<string, { title: string; severity: string; response: string }>;
+  /**
+   * Free-form text from a pre-structured-commentary engagement, preserved
+   * verbatim so it doesn't disappear at upgrade time. Read-only.
+   */
+  legacy_notes?: string;
 }
 
 async function json<T>(url: string, opts?: RequestInit): Promise<T> {
