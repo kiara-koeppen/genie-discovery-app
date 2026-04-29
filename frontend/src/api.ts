@@ -116,6 +116,26 @@ export async function pollJob<T>(
   }
 }
 
+/** One-shot helper: kick off a background task and resolve when it's done.
+ *  Use for any LLM call that might exceed the gateway's ~60s sync timeout.
+ */
+export async function runJob<T>(
+  task_type: string,
+  payload: Record<string, unknown>,
+  opts?: {
+    onProgress?: (ageSeconds: number) => void;
+    intervalMs?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  },
+): Promise<T> {
+  const { job_id } = await json<{ job_id: string }>("/jobs/start", {
+    method: "POST",
+    body: JSON.stringify({ task_type, payload }),
+  });
+  return pollJob<T>(job_id, opts);
+}
+
 export const api = {
   getUser: () => json<{ email: string }>("/user"),
 
@@ -168,19 +188,25 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  draftBenchmarks: (id: string, count?: number) =>
-    json<{ benchmarks: BenchmarkQuestion[] }>(`/engagements/${id}/draft-benchmarks`, {
-      method: "POST",
-      body: JSON.stringify({ count: count ?? 12 }),
-    }),
+  draftBenchmarks: (
+    id: string,
+    count?: number,
+    onProgress?: (s: number) => void,
+  ) =>
+    runJob<{ benchmarks: BenchmarkQuestion[] }>(
+      "draft_benchmarks",
+      { engagement_id: id, count: count ?? 12 },
+      { onProgress },
+    ),
 
   draftBenchmarkSql: (
     id: string,
     question: string,
     warehouse_id?: string,
     validate?: boolean,
+    onProgress?: (s: number) => void,
   ) =>
-    json<{
+    runJob<{
       sql: string;
       explanation?: string;
       validation?: {
@@ -189,14 +215,16 @@ export const api = {
         retried: boolean;
         sample_result: BenchmarkSampleResult | null;
       } | null;
-    }>(`/engagements/${id}/draft-benchmark-sql`, {
-      method: "POST",
-      body: JSON.stringify({
+    }>(
+      "draft_benchmark_sql",
+      {
+        engagement_id: id,
         question,
         warehouse_id: warehouse_id || "",
         validate: !!validate,
-      }),
-    }),
+      },
+      { onProgress },
+    ),
 
   draftBenchmarkSummary: (id: string, question: string, sql: string) =>
     json<{ explanation: string }>(`/engagements/${id}/draft-benchmark-summary`, {
@@ -223,8 +251,12 @@ export const api = {
       unacknowledged_gaps?: BriefGap[];
     }>(`/engagements/${id}/auto-summary`),
 
-  generatePlan: (id: string, warehouse_id?: string) =>
-    json<{
+  generatePlan: (
+    id: string,
+    warehouse_id?: string,
+    onProgress?: (s: number) => void,
+  ) =>
+    runJob<{
       general_instructions: string;
       sample_questions: string[];
       sql_filters: SqlSnippet[];
@@ -234,15 +266,21 @@ export const api = {
       joins: UcJoin[];
       narrative: string;
       warnings?: string[];
-    }>(`/engagements/${id}/generate-plan`, {
-      method: "POST",
-      body: JSON.stringify({ warehouse_id: warehouse_id || "" }),
-    }),
+    }>(
+      "generate_plan",
+      { engagement_id: id, warehouse_id: warehouse_id || "" },
+      { onProgress },
+    ),
 
-  draftMetricViewYaml: (id: string, warehouse_id?: string) =>
-    json<{ yaml: string; source_table: string; suggested_name: string; warnings?: string[] }>(
-      `/engagements/${id}/draft-metric-view-yaml`,
-      { method: "POST", body: JSON.stringify({ warehouse_id: warehouse_id || "" }) },
+  draftMetricViewYaml: (
+    id: string,
+    warehouse_id?: string,
+    onProgress?: (s: number) => void,
+  ) =>
+    runJob<{ yaml: string; source_table: string; suggested_name: string; warnings?: string[] }>(
+      "draft_mv_yaml",
+      { engagement_id: id, warehouse_id: warehouse_id || "" },
+      { onProgress },
     ),
 
   getMvPromptPreview: (id: string) =>

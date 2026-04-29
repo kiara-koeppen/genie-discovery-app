@@ -188,14 +188,22 @@ def _run_job(job_id, task_type, payload):
 
 @app.route("/api/jobs/start", methods=["POST"])
 def jobs_start():
-    """Kick off a background task. Returns a job_id for polling."""
+    """Kick off a background task. Returns a job_id for polling.
+
+    Auto-injects the request's OBO token into payload["_user_token"] so
+    background tasks that need to run UC queries under the user's grants
+    can do so. The token is held on the worker thread's stack only -- it
+    is never written into JOBS state, so it doesn't leak via /jobs/<id>.
+    """
     body = request.json or {}
     task_type = (body.get("task_type") or "").strip()
-    payload = body.get("payload") or {}
+    payload = dict(body.get("payload") or {})  # copy so we can safely mutate
     if not task_type:
         return jsonify({"error": "task_type is required"}), 400
     if task_type not in TASK_HANDLERS:
         return jsonify({"error": f"unknown task_type: {task_type}"}), 400
+
+    payload["_user_token"] = request.headers.get("X-Forwarded-Access-Token") or ""
 
     _cleanup_old_jobs()
 
@@ -398,20 +406,22 @@ def api_user():
     return jsonify({"email": get_current_user()})
 
 
-def _user_workspace_client():
-    """Build a WorkspaceClient using the forwarded user access token (OBO).
-
-    Forces PAT auth via explicit Config so it does not accidentally combine
-    with the app service principal's OAuth creds from env vars.
-    Returns None if no user token is available.
-    """
-    user_token = request.headers.get("X-Forwarded-Access-Token")
+def _user_workspace_client_from_token(user_token):
+    """Build a WorkspaceClient from an explicit OBO token. Used by background
+    job threads which can't access Flask's request context."""
     if not user_token:
         return None
     from databricks.sdk import WorkspaceClient as WC
     from databricks.sdk.core import Config
     cfg = Config(host=w.config.host, token=user_token, auth_type="pat")
     return WC(config=cfg)
+
+
+def _user_workspace_client():
+    """Build a WorkspaceClient using the forwarded user access token (OBO).
+    Pulls the token from the current Flask request. Returns None if no token.
+    """
+    return _user_workspace_client_from_token(request.headers.get("X-Forwarded-Access-Token"))
 
 
 def _user_is_coe_member(user_w):
@@ -1608,17 +1618,50 @@ def _call_llm(prompt, model=None, label=None):
     return json.loads(text)
 
 
-@app.route("/api/engagements/<eid>/generate-plan", methods=["POST"])
-def generate_plan(eid):
-    """Use the configured LLM to synthesize a Genie Space configuration plan."""
+def _do_generate_plan(eid, user_token, warehouse_id):
+    """Core generate-plan logic. Used by sync endpoint and async task.
+
+    NOTE: this function persists results to Delta on success, so failures
+    leave Session 5 untouched (consistent rollback semantics).
+    """
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
-        return jsonify({"error": "Not found"}), 404
+        raise ValueError("Engagement not found")
     eng = parse_row(rows[0])
 
-    body = request.get_json(silent=True) or {}
-    warehouse_id = (body.get("warehouse_id") or "").strip()
+    user_w = _user_workspace_client_from_token(user_token)
+    return _do_generate_plan_inner(eid, eng, user_w, warehouse_id)
 
+
+@register_task("generate_plan")
+def _task_generate_plan(payload):
+    return _do_generate_plan(
+        eid=(payload.get("engagement_id") or "").strip(),
+        user_token=payload.get("_user_token", ""),
+        warehouse_id=(payload.get("warehouse_id") or "").strip(),
+    )
+
+
+@app.route("/api/engagements/<eid>/generate-plan", methods=["POST"])
+def generate_plan(eid):
+    """Legacy sync endpoint. New callers should use the async job runner
+    (POST /api/jobs/start with task_type=generate_plan)."""
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(_do_generate_plan(
+            eid,
+            user_token=request.headers.get("X-Forwarded-Access-Token") or "",
+            warehouse_id=(body.get("warehouse_id") or "").strip(),
+        ))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[generate-plan sync] ERROR: {e}\n{tb}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+def _do_generate_plan_inner(eid, eng, user_w, warehouse_id):
     warnings = []
     s4 = eng["sessions"]["4"]
 
@@ -1639,7 +1682,8 @@ def generate_plan(eid):
     ]
     scope_mv_fqns = [t for t in scope_mv_fqns if t and t.count(".") == 2]
 
-    user_w = _user_workspace_client()
+    # user_w is now passed in (built from token by the outer wrapper)
+    # so this function is safe to call from a background thread.
 
     # Resolve a warehouse once; both schema DESCRIBE and MV SHOW CREATE TABLE
     # need it under OBO. Prefer UI-supplied warehouse_id, else first visible.
@@ -1690,17 +1734,8 @@ def generate_plan(eid):
                 + ". Falling back to Session 3 YAML if available."
             )
 
-    try:
-        prompt = _build_plan_prompt(eng, schemas=schemas, mv_definitions=mv_definitions)
-        plan = _call_llm(prompt)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[generate-plan] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({
-            "error": f"{type(e).__name__}: {e}",
-            "endpoint": LLM_ENDPOINT,
-            "traceback": tb.splitlines()[-5:],
-        }), 500
+    prompt = _build_plan_prompt(eng, schemas=schemas, mv_definitions=mv_definitions)
+    plan = _call_llm(prompt, label="plan")
 
     # Normalize shape
     def _norm_list(v):
@@ -1778,7 +1813,7 @@ def generate_plan(eid):
         },
     )
 
-    return jsonify({
+    return {
         "general_instructions": general_instructions,
         "sample_questions": sample_questions,
         "sql_filters": sql_filters,
@@ -1788,7 +1823,7 @@ def generate_plan(eid):
         "joins": joins,
         "narrative": narrative,
         "warnings": warnings,
-    })
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1944,30 +1979,22 @@ Constraints on the final {count}:
 Return ONLY the JSON array of {count} final picks, highest-value first. No markdown fences, no preamble, no commentary about the candidate pool."""
 
 
-@app.route("/api/engagements/<eid>/draft-benchmarks", methods=["POST"])
-def draft_benchmarks(eid):
-    """Draft benchmark questions from Sessions 1-3 context."""
+def _do_draft_benchmarks(eid, count=12):
+    """Core draft-benchmarks logic. Used by both sync endpoint and async task."""
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
-        return jsonify({"error": "Not found"}), 404
+        raise ValueError("Engagement not found")
     eng = parse_row(rows[0])
 
-    body = request.json or {}
     try:
-        count = int(body.get("count") or 12)
+        count = int(count)
     except (TypeError, ValueError):
         count = 12
     count = max(1, min(50, count))
 
-    try:
-        prompt = _build_benchmark_draft_prompt(eng, count=count)
-        result = _call_llm(prompt)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[draft-benchmarks] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    prompt = _build_benchmark_draft_prompt(eng, count=count)
+    result = _call_llm(prompt, label="benchmark-draft")
 
-    # Normalize — LLM might return a dict with "benchmarks" key or a raw array
     if isinstance(result, dict):
         items = result.get("benchmarks") or result.get("questions") or []
     else:
@@ -1994,32 +2021,82 @@ def draft_benchmarks(eid):
             "notes": "",
             "bo_approved": False,
         })
+    return {"benchmarks": drafted}
 
-    return jsonify({"benchmarks": drafted})
+
+@register_task("draft_benchmarks")
+def _task_draft_benchmarks(payload):
+    return _do_draft_benchmarks(
+        (payload.get("engagement_id") or "").strip(),
+        count=payload.get("count", 12),
+    )
 
 
-@app.route("/api/engagements/<eid>/draft-benchmark-sql", methods=["POST"])
-def draft_benchmark_sql(eid):
-    """Draft SQL for a single benchmark question using Session 3 technical context."""
+@app.route("/api/engagements/<eid>/draft-benchmarks", methods=["POST"])
+def draft_benchmarks(eid):
+    """Legacy sync endpoint. New callers should use the async job runner."""
+    body = request.json or {}
+    try:
+        return jsonify(_do_draft_benchmarks(eid, count=body.get("count", 12)))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[draft-benchmarks sync] ERROR: {e}\n{tb}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+def _do_draft_benchmark_sql(eid, question, warehouse_id, validate, user_token):
+    """Core draft-benchmark-sql logic. Used by sync endpoint and async task."""
+    question = (question or "").strip()
+    if not question:
+        raise ValueError("question is required")
+
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
-        return jsonify({"error": "Not found"}), 404
+        raise ValueError("Engagement not found")
     eng = parse_row(rows[0])
-
-    body = request.json or {}
-    question = (body.get("question") or "").strip()
-    warehouse_id = (body.get("warehouse_id") or "").strip()
-    validate = bool(body.get("validate"))
-    if not question:
-        return jsonify({"error": "question is required"}), 400
 
     s3 = eng["sessions"]["3"]
     s4 = eng["sessions"]["4"]
 
-    # Collect actual column schemas for every in-scope table so the LLM has
-    # ground truth to reference and doesn't invent columns. Uses OBO so we
-    # inherit the user's UC grants.
-    user_w = _user_workspace_client()
+    user_w = _user_workspace_client_from_token(user_token)
+    return _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user_w)
+
+
+@register_task("draft_benchmark_sql")
+def _task_draft_benchmark_sql(payload):
+    return _do_draft_benchmark_sql(
+        eid=(payload.get("engagement_id") or "").strip(),
+        question=payload.get("question", ""),
+        warehouse_id=(payload.get("warehouse_id") or "").strip(),
+        validate=bool(payload.get("validate")),
+        user_token=payload.get("_user_token", ""),
+    )
+
+
+@app.route("/api/engagements/<eid>/draft-benchmark-sql", methods=["POST"])
+def draft_benchmark_sql(eid):
+    """Legacy sync endpoint. New callers should use the async job runner
+    (POST /api/jobs/start with task_type=draft_benchmark_sql)."""
+    body = request.json or {}
+    try:
+        return jsonify(_do_draft_benchmark_sql(
+            eid,
+            question=body.get("question", ""),
+            warehouse_id=(body.get("warehouse_id") or "").strip(),
+            validate=bool(body.get("validate")),
+            user_token=request.headers.get("X-Forwarded-Access-Token") or "",
+        ))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[draft-benchmark-sql sync] ERROR: {e}\n{tb}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+def _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user_w):
     in_scope_tables = [
         (d.get("table_or_view") or "").strip()
         for d in s4.get("data_plan", [])
@@ -2084,22 +2161,19 @@ Rules:
 - Single SQL statement. If you need CTEs, use WITH.
 - Return ONLY the JSON. No markdown fences, no preamble."""
 
-    try:
-        result = _call_llm(prompt)
-        if isinstance(result, dict):
-            sql_text = str(result.get("sql", "")).strip()
-        else:
-            sql_text = str(result or "").strip()
-        # Strip code fences if any
-        if sql_text.startswith("```"):
-            sql_text = sql_text.split("\n", 1)[1] if "\n" in sql_text else sql_text
-            if sql_text.endswith("```"):
-                sql_text = sql_text.rsplit("\n", 1)[0] if "\n" in sql_text else sql_text[:-3]
-            sql_text = sql_text.strip()
-            if sql_text.lower().startswith("sql"):
-                sql_text = sql_text[3:].lstrip()
-    except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    result = _call_llm(prompt, label="benchmark-sql")
+    if isinstance(result, dict):
+        sql_text = str(result.get("sql", "")).strip()
+    else:
+        sql_text = str(result or "").strip()
+    # Strip code fences if any
+    if sql_text.startswith("```"):
+        sql_text = sql_text.split("\n", 1)[1] if "\n" in sql_text else sql_text
+        if sql_text.endswith("```"):
+            sql_text = sql_text.rsplit("\n", 1)[0] if "\n" in sql_text else sql_text[:-3]
+        sql_text = sql_text.strip()
+        if sql_text.lower().startswith("sql"):
+            sql_text = sql_text[3:].lstrip()
 
     # Optional validation pass: run the drafted SQL on the chosen warehouse.
     # If it fails, do ONE auto-fix retry with the error message so the LLM
@@ -2186,11 +2260,11 @@ Return JSON: {{"sql": "the corrected SQL"}}. No markdown fences, no commentary."
         except Exception as e:
             print(f"[draft-benchmark-sql] summary generation failed: {type(e).__name__}: {e}", flush=True)
 
-    return jsonify({
+    return {
         "sql": sql_text,
         "explanation": explanation,
         "validation": validation,
-    })
+    }
 
 
 def _summarize_benchmark_sql(question, sql_text):
@@ -2771,23 +2845,45 @@ def mv_prompt_preview(eid):
 
 @app.route("/api/engagements/<eid>/draft-metric-view-yaml", methods=["POST"])
 def draft_metric_view_yaml(eid):
-    """Draft a UC Metric View YAML from Sessions 1-3."""
-    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
-    if not rows:
-        return jsonify({"error": "Not found"}), 404
-    eng = parse_row(rows[0])
-
+    """Legacy sync endpoint. New callers should use the async job runner
+    (POST /api/jobs/start with task_type=draft_mv_yaml)."""
     body = request.json or {}
-    user_w = _user_workspace_client()
-    warehouse_id = (body.get("warehouse_id") or "").strip()
-
     try:
-        prompt = _build_mv_yaml_prompt(eng, user_w, warehouse_id)
-        result = _call_llm(prompt)
+        return jsonify(_do_draft_mv_yaml(
+            eid,
+            user_token=request.headers.get("X-Forwarded-Access-Token") or "",
+            warehouse_id=(body.get("warehouse_id") or "").strip(),
+        ))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[draft-mv-yaml] ERROR: {e}\n{tb}", flush=True)
+        print(f"[draft-mv-yaml sync] ERROR: {e}\n{tb}", flush=True)
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+def _do_draft_mv_yaml(eid, user_token, warehouse_id):
+    """Core MV YAML draft logic. Used by both sync endpoint and async task."""
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        raise ValueError("Engagement not found")
+    eng = parse_row(rows[0])
+    user_w = _user_workspace_client_from_token(user_token)
+    return _do_draft_mv_yaml_inner(eng, user_w, warehouse_id)
+
+
+@register_task("draft_mv_yaml")
+def _task_draft_mv_yaml(payload):
+    return _do_draft_mv_yaml(
+        eid=(payload.get("engagement_id") or "").strip(),
+        user_token=payload.get("_user_token", ""),
+        warehouse_id=(payload.get("warehouse_id") or "").strip(),
+    )
+
+
+def _do_draft_mv_yaml_inner(eng, user_w, warehouse_id):
+    prompt = _build_mv_yaml_prompt(eng, user_w, warehouse_id)
+    result = _call_llm(prompt, label="mv-yaml")
 
     yaml_text = _strip_yaml_fences(str(result.get("yaml", "")))
     source_table = str(result.get("source_table", "")).strip()
@@ -2846,12 +2942,12 @@ Return JSON with exactly: {{"yaml": "...", "source_table": "...", "suggested_nam
                 f"{', '.join(missing)}. Fix these before creating the metric view."
             )
 
-    return jsonify({
+    return {
         "yaml": yaml_text,
         "source_table": source_table,
         "suggested_name": suggested_name,
         "warnings": warnings,
-    })
+    }
 
 
 def _sql_exec_obo(user_w, query, warehouse_id, catalog=None, schema=None):
