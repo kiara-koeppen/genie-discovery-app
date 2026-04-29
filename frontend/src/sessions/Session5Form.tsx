@@ -22,12 +22,15 @@ interface Props {
   session3Data?: Record<string, any>;
   session4Data?: Record<string, any>;
   engagementId?: string;
+  /** Called after a successful push so the parent can refresh its
+   *  optimistic-lock token (updatedAtRef) and avoid 409s on autosave. */
+  onPushed?: (updatedAt: string) => void;
 }
 
 type SnippetKey = "plan_sql_filters" | "plan_sql_dimensions" | "plan_sql_measures";
 
 export default function Session5Form({
-  data, onChange, readOnly, session4Data, engagementId,
+  data, onChange, readOnly, session4Data, engagementId, onPushed,
 }: Props) {
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string>("");
@@ -183,6 +186,9 @@ export default function Session5Form({
       if (mode === "existing") body.space_id = data.genie_space_id || "";
       else { body.new_title = newTitle; body.new_description = newDescription; }
       const res = await api.pushToGenie(engagementId, body);
+      // Refresh parent's optimistic-lock token BEFORE the onChange cascade
+      // so the next autosave doesn't 409.
+      if (res.updated_at) onPushed?.(res.updated_at);
       onChange("genie_space_id", res.space_id);
       onChange("genie_space_url", res.space_url);
       onChange("genie_space_pushed_at", new Date().toISOString());

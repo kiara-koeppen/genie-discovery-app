@@ -1,6 +1,8 @@
 import json
 import os
 import secrets
+import threading
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -42,6 +44,7 @@ SESSION_COLS = {
         "data_gaps", "scope_boundaries", "global_filter",
         "metric_view_yaml", "metric_view_fqn"],
     4: ["analyst_commentary", "auto_summary", "data_plan", "benchmark_questions",
+        "brief_unacknowledged_gaps",
         "coe_approval_status", "coe_approval_notes", "coe_reviewer_email"],
     5: ["genie_space_id", "genie_space_config",
         "plan_general_instructions", "plan_sample_questions", "plan_narrative",
@@ -51,18 +54,378 @@ SESSION_COLS = {
     6: ["prototype_results", "fixes_log", "benchmarks", "phrasing_notes"],
 }
 
-# Columns that store plain strings (not JSON arrays)
+# Columns that store plain strings (not JSON-encoded structured data).
+# `analyst_commentary` was here historically but is now a JSON object
+# {gap_responses, resolved_gaps, legacy_notes?}; removed so save/load
+# treat it as JSON.
 SCALAR_COLS = {
     "global_filter",
-    "metric_view_yaml", "metric_view_fqn", "analyst_commentary", "auto_summary",
+    "metric_view_yaml", "metric_view_fqn", "auto_summary",
     "coe_approval_status", "coe_approval_notes", "coe_reviewer_email",
     "genie_space_id", "genie_space_config",
     "plan_general_instructions", "plan_narrative", "plan_warehouse_id",
     "genie_space_url", "genie_space_pushed_at",
 }
 
+# Columns whose JSON shape is an object (not an array). Used to pick the
+# right empty-default and the right fallback when parse fails.
+OBJECT_COLS = {"analyst_commentary"}
+
+
+def _default_section_value(col):
+    """The empty-default for a section column (string scalar, [] for arrays, {} for objects)."""
+    if col in SCALAR_COLS:
+        return ""
+    if col in OBJECT_COLS:
+        return "{}"
+    return "[]"
+
 # All section columns
 ALL_SECTION_COLS = sorted(set(col for cols in SESSION_COLS.values() for col in cols))
+
+
+# ---------------------------------------------------------------------------
+# Form-key tolerant accessors
+#
+# The frontend Session 2 form writes `question_text` (Question Bank) and
+# `what_they_mean` (Vocabulary). Several prompt builders historically looked
+# for `question` / `definition`, which silently returned empty strings and
+# made every LLM-generated artifact (brief, plan, benchmarks, MV YAML)
+# blind to the BO-captured questions and vocabulary. These helpers normalize
+# access and tolerate a couple of legacy/alternative keys.
+# ---------------------------------------------------------------------------
+
+def _qb_question(q):
+    """Return the question text from a question_bank entry, or empty string."""
+    if not isinstance(q, dict):
+        return ""
+    return (q.get("question_text") or q.get("question") or q.get("text") or "").strip()
+
+
+def _vm_definition(v):
+    """Return the definition/meaning from a vocabulary_metrics entry."""
+    if not isinstance(v, dict):
+        return ""
+    return (v.get("what_they_mean") or v.get("definition") or v.get("description") or "").strip()
+
+
+def _er_what(r):
+    """Return what an existing_reports entry shows."""
+    if not isinstance(r, dict):
+        return ""
+    return (r.get("what_it_shows") or r.get("description") or r.get("key_metrics") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Async job runner
+#
+# Long-running LLM calls (Readiness Brief, plan generation, etc.) routinely
+# exceed the Databricks Apps frontend gateway's ~60s HTTP request timeout.
+# This module lets us run those tasks in a background thread and have the
+# frontend poll for completion via short, fast HTTP requests.
+#
+# Architecture:
+#   - JOBS: in-memory dict keyed by uuid; values track state + result.
+#   - TASK_HANDLERS: registry mapping task_type strings to callables.
+#     Decorate a function with @register_task("name") to make it dispatchable.
+#   - POST /api/jobs/start launches a daemon thread, returns job_id immediately.
+#   - GET /api/jobs/<id> returns current state, result (when done), or error.
+#   - Old jobs (>1h) are evicted opportunistically on each /start call.
+#
+# Tradeoffs:
+#   - In-memory state dies on app restart. For this single-instance app that's
+#     acceptable: the worst case is the user clicks Regenerate and we run again.
+#   - No cancel signal -- a cancelled job's LLM call still completes server-side,
+#     we just stop returning the result to the client.
+# ---------------------------------------------------------------------------
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 3600  # 1 hour
+TASK_HANDLERS = {}
+
+# Delta table for job persistence so app restarts don't strand in-flight jobs.
+# Rows are mirrored from the in-memory JOBS dict on every state change. On
+# /jobs/<id>, an in-memory miss falls back to a Delta lookup so a redeploy
+# mid-poll surfaces a real result instead of "job not found".
+JOBS_TABLE = f"{CATALOG}.{SCHEMA}.discovery_jobs"
+
+# LLM cost / usage telemetry. Every _call_llm / _call_llm_raw call appends a
+# row here so the customer can see total token spend, per-feature breakdowns,
+# and historical latency without standing up a separate dashboard. Best-effort:
+# write failures don't break the LLM call.
+LLM_USAGE_TABLE = f"{CATALOG}.{SCHEMA}.discovery_llm_usage"
+
+
+def _log_llm_usage(
+    label, endpoint, prompt_chars, output_chars, latency_ms,
+    prompt_tokens=0, completion_tokens=0, success=True, error="",
+):
+    try:
+        sql_run(
+            f"INSERT INTO {LLM_USAGE_TABLE} VALUES "
+            f"(:ts, :label, :endpoint, :pc, :oc, :pt, :ct, :lm, :ok, :err)",
+            {
+                "ts": now_ts(),
+                "label": label or "",
+                "endpoint": endpoint or "",
+                "pc": str(int(prompt_chars or 0)),
+                "oc": str(int(output_chars or 0)),
+                "pt": str(int(prompt_tokens or 0)),
+                "ct": str(int(completion_tokens or 0)),
+                "lm": str(int(latency_ms or 0)),
+                "ok": "true" if success else "false",
+                "err": str(error or "")[:500],
+            },
+        )
+    except Exception as e:
+        print(f"[llm-usage] log failed: {e}", flush=True)
+
+
+def _persist_job_state(job_id, job):
+    """Mirror the current in-memory job state into the Delta jobs table.
+    Best-effort: failures are logged but don't crash the worker."""
+    try:
+        result_json = json.dumps(job.get("result")) if job.get("result") is not None else ""
+        finished_at = job.get("finished_at") or 0.0
+        sql_run(
+            f"MERGE INTO {JOBS_TABLE} AS t "
+            f"USING (SELECT :job_id AS job_id) AS s ON t.job_id = s.job_id "
+            f"WHEN MATCHED THEN UPDATE SET "
+            f"  state = :state, finished_at = :finished_at, "
+            f"  result = :result, error = :error "
+            f"WHEN NOT MATCHED THEN INSERT "
+            f"  (job_id, task_type, creator_email, state, started_at, finished_at, result, error) "
+            f"VALUES "
+            f"  (:job_id, :task_type, :creator_email, :state, :started_at, :finished_at, :result, :error)",
+            {
+                "job_id": job_id,
+                "task_type": job.get("task_type", ""),
+                "creator_email": job.get("creator_email", ""),
+                "state": job.get("state", ""),
+                "started_at": str(job.get("started_at", 0.0)),
+                "finished_at": str(finished_at),
+                "result": result_json,
+                "error": str(job.get("error") or ""),
+            },
+        )
+    except Exception as e:
+        print(f"[jobs persist] {job_id} write failed: {e}", flush=True)
+
+
+def _load_job_from_delta(job_id):
+    """Look up a job in Delta when not present in the in-memory dict (e.g. after
+    an app restart). Returns the job dict or None."""
+    try:
+        rows = sql_exec(
+            f"SELECT job_id, task_type, creator_email, state, started_at, "
+            f"finished_at, result, error FROM {JOBS_TABLE} WHERE job_id = :j",
+            {"j": job_id},
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        try:
+            result = json.loads(r.get("result") or "null")
+        except (json.JSONDecodeError, TypeError):
+            result = None
+        try:
+            started_at = float(r.get("started_at") or 0.0)
+        except (ValueError, TypeError):
+            started_at = 0.0
+        return {
+            "state": r.get("state") or "",
+            "task_type": r.get("task_type") or "",
+            "creator_email": r.get("creator_email") or "",
+            "started_at": started_at,
+            "result": result,
+            "error": r.get("error") or "",
+        }
+    except Exception as e:
+        print(f"[jobs persist] read {job_id} failed: {e}", flush=True)
+        return None
+
+
+def _recover_orphan_jobs():
+    """At startup, mark any Delta rows still in 'pending' state as 'failed'.
+    Their worker threads died with the previous app process, so they will
+    never finish. Without this they'd poll forever."""
+    try:
+        sql_run(
+            f"UPDATE {JOBS_TABLE} SET state = 'failed', "
+            f"error = 'App restarted before job finished. Please retry.' "
+            f"WHERE state = 'pending'"
+        )
+    except Exception as e:
+        print(f"[jobs persist] orphan recovery failed: {e}", flush=True)
+
+
+def _user_error(label, exc):
+    """Log the full exception + traceback under `label`, return a clean
+    user-facing string. Strips the exception class name prefix so the UI
+    doesn't show 'ValueError: required field missing' to non-engineers --
+    just 'required field missing'. Falls back to a generic message for
+    blank exception strings."""
+    tb = traceback.format_exc()
+    print(f"[{label}] {type(exc).__name__}: {exc}\n{tb}", flush=True)
+    msg = str(exc).strip()
+    if not msg:
+        return f"Something went wrong. Check server logs for details (label: {label})."
+    return msg
+
+
+def register_task(name):
+    """Decorator: register a function as the handler for a task_type."""
+    def decorator(fn):
+        TASK_HANDLERS[name] = fn
+        return fn
+    return decorator
+
+
+def _cleanup_old_jobs():
+    """Evict jobs older than TTL. Called on each /start request -- amortized.
+    Cleans both the in-memory dict and the Delta jobs table."""
+    now = time.time()
+    with JOBS_LOCK:
+        stale = [jid for jid, j in JOBS.items() if now - j["started_at"] > JOB_TTL_SECONDS]
+        for jid in stale:
+            del JOBS[jid]
+    cutoff = now - JOB_TTL_SECONDS
+    try:
+        sql_run(
+            f"DELETE FROM {JOBS_TABLE} WHERE started_at < :cutoff",
+            {"cutoff": str(cutoff)},
+        )
+    except Exception as e:
+        print(f"[jobs persist] cleanup failed: {e}", flush=True)
+
+
+def _run_job(job_id, task_type, payload):
+    """Background-thread worker. Updates JOBS with result or error and
+    mirrors state changes into the Delta jobs table."""
+    handler = TASK_HANDLERS.get(task_type)
+    if not handler:
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id]["state"] = "failed"
+                JOBS[job_id]["error"] = f"Unknown task_type: {task_type}"
+                JOBS[job_id]["finished_at"] = time.time()
+                snapshot = dict(JOBS[job_id])
+        _persist_job_state(job_id, snapshot)
+        return
+    try:
+        result = handler(payload)
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id]["state"] = "done"
+                JOBS[job_id]["result"] = result
+                JOBS[job_id]["finished_at"] = time.time()
+                snapshot = dict(JOBS[job_id])
+            else:
+                snapshot = None
+    except Exception as e:
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id]["state"] = "failed"
+                JOBS[job_id]["error"] = _user_error(f"jobs:{task_type}:{job_id}", e)
+                JOBS[job_id]["finished_at"] = time.time()
+                snapshot = dict(JOBS[job_id])
+            else:
+                snapshot = None
+    if snapshot:
+        _persist_job_state(job_id, snapshot)
+
+
+@app.route("/api/jobs/start", methods=["POST"])
+def jobs_start():
+    """Kick off a background task. Returns a job_id for polling.
+
+    Authorization model:
+    - If payload contains an `engagement_id`, the calling user must be the
+      analyst, the BO, or a COE-group member for that engagement. Without
+      this check the job runner would bypass the per-engagement gate that
+      protects the sync `/api/engagements/<eid>/...` routes.
+    - The job is bound to the creator's email so /jobs/<id> can verify
+      that the requester is the same user.
+
+    Auto-injects the request's OBO token into payload["_user_token"] so
+    background tasks that need to run UC queries under the user's grants
+    can do so. The token is held on the worker thread's stack only -- it
+    is never written into JOBS state, so it doesn't leak via /jobs/<id>.
+    """
+    body = request.json or {}
+    task_type = (body.get("task_type") or "").strip()
+    payload = dict(body.get("payload") or {})  # copy so we can safely mutate
+    if not task_type:
+        return jsonify({"error": "task_type is required"}), 400
+    if task_type not in TASK_HANDLERS:
+        return jsonify({"error": f"unknown task_type: {task_type}"}), 400
+
+    # Engagement authorization: every task we currently register is bound to
+    # an engagement_id, and the sync analogues are gated. Apply the same gate
+    # here for parity. Tasks without an engagement_id are rejected for now;
+    # if we ever add a global task, this check can be relaxed deliberately.
+    eid_in_payload = (payload.get("engagement_id") or "").strip()
+    if not eid_in_payload:
+        return jsonify({"error": "payload.engagement_id is required"}), 400
+    _, err = _authorize_engagement(eid_in_payload)
+    if err:
+        return err
+
+    creator_email = (get_current_user() or "").strip().lower()
+    if not creator_email:
+        return jsonify({"error": "User email not available; cannot start job"}), 401
+
+    payload["_user_token"] = request.headers.get("X-Forwarded-Access-Token") or ""
+
+    _cleanup_old_jobs()
+
+    job_id = uuid.uuid4().hex
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "state": "pending",
+            "task_type": task_type,
+            "creator_email": creator_email,
+            "started_at": time.time(),
+            "finished_at": 0.0,
+            "result": None,
+            "error": None,
+        }
+        snapshot = dict(JOBS[job_id])
+    _persist_job_state(job_id, snapshot)
+
+    t = threading.Thread(target=_run_job, args=(job_id, task_type, payload), daemon=True)
+    t.start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/jobs/<job_id>", methods=["GET"])
+def jobs_status(job_id):
+    """Return current state of a job. Only the user who created the job can
+    read it -- prevents leakage if a job_id is exposed (logs, etc.).
+
+    Falls back to the Delta jobs table if the in-memory dict has been
+    cleared (app restart), so a poll mid-restart returns the persisted
+    final state instead of "job not found".
+    """
+    requester = (get_current_user() or "").strip().lower()
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        # App may have restarted; check Delta
+        job = _load_job_from_delta(job_id)
+        if not job:
+            return jsonify({"error": "job not found"}), 404
+    if requester and job.get("creator_email") and requester != job["creator_email"]:
+        # 404 (not 403) so the existence of the job isn't disclosed
+        return jsonify({"error": "job not found"}), 404
+    return jsonify({
+        "state": job.get("state", ""),
+        "task_type": job.get("task_type", ""),
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "age_seconds": int(time.time() - (job.get("started_at") or time.time())),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -89,20 +452,57 @@ def sql_exec(query, params=None):
     return []
 
 
-def sql_run(query, params=None):
+def sql_run(query, params=None, *, must_succeed=False):
+    """Execute a write statement.
+
+    By default this is fire-and-forget for back-compat -- ensure_table()'s
+    CREATE TABLE IF NOT EXISTS calls would otherwise crash startup if the
+    app SP lacks CREATE TABLE on the schema (the table may already exist;
+    permission is checked before IF NOT EXISTS short-circuits).
+
+    Pass must_succeed=True for writes where silent failure is unacceptable
+    (engagement saves, soft-delete, plan persistence). That path waits for
+    completion and raises on any non-SUCCEEDED state.
+    """
     sdk_params = None
     if params:
         sdk_params = [
             StatementParameterListItem(name=k, value=str(v) if v is not None else "")
             for k, v in params.items()
         ]
-    w.statement_execution.execute_statement(
+    if not must_succeed:
+        # Best-effort fire-and-forget. Wait briefly so quick statements
+        # commit before we return, but don't raise on failure.
+        w.statement_execution.execute_statement(
+            warehouse_id=WAREHOUSE_ID,
+            statement=query,
+            parameters=sdk_params,
+            catalog=CATALOG,
+            schema=SCHEMA,
+            wait_timeout="10s",
+        )
+        return
+
+    resp = w.statement_execution.execute_statement(
         warehouse_id=WAREHOUSE_ID,
         statement=query,
         parameters=sdk_params,
         catalog=CATALOG,
         schema=SCHEMA,
+        wait_timeout="30s",
     )
+    state = str(resp.status.state) if resp.status else ""
+    statement_id = resp.statement_id
+    deadline = time.time() + 60
+    while statement_id and ("PENDING" in state or "RUNNING" in state):
+        if time.time() > deadline:
+            raise RuntimeError(f"sql_run timed out after 90s: {query[:80]}...")
+        time.sleep(1.0)
+        resp = w.statement_execution.get_statement(statement_id)
+        state = str(resp.status.state) if resp.status else ""
+    if "SUCCEEDED" not in state:
+        err = resp.status.error.message if (resp.status and resp.status.error) else state
+        raise RuntimeError(f"sql_run failed [{state}]: {err}; query: {query[:200]}")
 
 
 def now_ts():
@@ -123,6 +523,50 @@ def get_current_user():
         return "unknown"
 
 
+def _empty_for_col(col):
+    """In-memory empty for a column (after parse): str / list / dict."""
+    if col in SCALAR_COLS:
+        return ""
+    if col in OBJECT_COLS:
+        return {}
+    return []
+
+
+def _decode_section_value(col, raw):
+    """Decode a stored JSON section column. Falls back to per-column legacy
+    recovery for analyst_commentary, which used to be either a plain prose
+    string OR a Python repr (str(dict)) due to a prior storage bug."""
+    if not raw:
+        return _empty_for_col(col)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        if col == "analyst_commentary":
+            return _migrate_legacy_commentary(raw)
+        return _empty_for_col(col)
+
+
+def _migrate_legacy_commentary(raw):
+    """Recover analyst_commentary that was stored either as Python repr
+    `str(dict)` (single-quote bug) or as plain prose (pre-feature). Always
+    returns the new structured shape; preserves any human-written prose
+    under `legacy_notes` so it isn't silently dropped on upgrade."""
+    s = str(raw).strip()
+    # Try Python literal_eval for the single-quote dict-repr case
+    try:
+        import ast
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, dict) and ("gap_responses" in parsed or "resolved_gaps" in parsed):
+            return {
+                "gap_responses": dict(parsed.get("gap_responses") or {}),
+                "resolved_gaps": dict(parsed.get("resolved_gaps") or {}),
+            }
+    except (ValueError, SyntaxError):
+        pass
+    # Otherwise treat as plain prose -- keep it visible to the analyst as Legacy Notes
+    return {"gap_responses": {}, "resolved_gaps": {}, "legacy_notes": s}
+
+
 def parse_row(row):
     """Parse a raw DB row: decode JSON section columns, build sessions dict."""
     eng = {}
@@ -131,10 +575,7 @@ def parse_row(row):
             if k in SCALAR_COLS:
                 eng[k] = v or ""
             else:
-                try:
-                    eng[k] = json.loads(v) if v else []
-                except (json.JSONDecodeError, TypeError):
-                    eng[k] = []
+                eng[k] = _decode_section_value(k, v)
         else:
             eng[k] = v
 
@@ -142,7 +583,7 @@ def parse_row(row):
     for snum, cols in SESSION_COLS.items():
         session = {}
         for c in cols:
-            session[c] = eng.get(c, "" if c in SCALAR_COLS else [])
+            session[c] = eng.get(c, _empty_for_col(c))
         eng["sessions"][str(snum)] = session
     return eng
 
@@ -163,18 +604,42 @@ def ensure_table():
         f"engagement_id STRING, genie_space_name STRING, "
         f"business_owner_name STRING, business_owner_email STRING, "
         f"analyst_name STRING, analyst_email STRING, "
+        f"servicenow_ticket_url STRING, "
         f"current_session INT, status STRING, "
-        f"created_at STRING, updated_at STRING, "
+        f"created_at STRING, updated_at STRING, deleted_at STRING, "
         f"{section_ddl}"
         f") USING DELTA"
     )
     rows = sql_exec(f"DESCRIBE TABLE {TABLE}")
     existing = {r.get("col_name", "") for r in rows}
+    # Top-level metadata columns added since v1
+    for top_col in ("servicenow_ticket_url", "deleted_at"):
+        if top_col not in existing:
+            sql_run(f"ALTER TABLE {TABLE} ADD COLUMN {top_col} STRING")
     for col in ALL_SECTION_COLS:
         if col not in existing:
             sql_run(f"ALTER TABLE {TABLE} ADD COLUMN {col} STRING")
 
+    # Async job runner persistence -- so app restarts don't strand in-flight jobs.
+    sql_run(
+        f"CREATE TABLE IF NOT EXISTS {JOBS_TABLE} ("
+        f"job_id STRING, task_type STRING, creator_email STRING, "
+        f"state STRING, started_at DOUBLE, finished_at DOUBLE, "
+        f"result STRING, error STRING"
+        f") USING DELTA"
+    )
+    # LLM cost / usage telemetry table.
+    sql_run(
+        f"CREATE TABLE IF NOT EXISTS {LLM_USAGE_TABLE} ("
+        f"ts STRING, label STRING, endpoint STRING, "
+        f"prompt_chars BIGINT, output_chars BIGINT, "
+        f"prompt_tokens BIGINT, completion_tokens BIGINT, "
+        f"latency_ms BIGINT, success BOOLEAN, error STRING"
+        f") USING DELTA"
+    )
+
 ensure_table()
+_recover_orphan_jobs()
 
 
 # ---------------------------------------------------------------------------
@@ -186,20 +651,22 @@ def api_user():
     return jsonify({"email": get_current_user()})
 
 
-def _user_workspace_client():
-    """Build a WorkspaceClient using the forwarded user access token (OBO).
-
-    Forces PAT auth via explicit Config so it does not accidentally combine
-    with the app service principal's OAuth creds from env vars.
-    Returns None if no user token is available.
-    """
-    user_token = request.headers.get("X-Forwarded-Access-Token")
+def _user_workspace_client_from_token(user_token):
+    """Build a WorkspaceClient from an explicit OBO token. Used by background
+    job threads which can't access Flask's request context."""
     if not user_token:
         return None
     from databricks.sdk import WorkspaceClient as WC
     from databricks.sdk.core import Config
     cfg = Config(host=w.config.host, token=user_token, auth_type="pat")
     return WC(config=cfg)
+
+
+def _user_workspace_client():
+    """Build a WorkspaceClient using the forwarded user access token (OBO).
+    Pulls the token from the current Flask request. Returns None if no token.
+    """
+    return _user_workspace_client_from_token(request.headers.get("X-Forwarded-Access-Token"))
 
 
 def _user_is_coe_member(user_w):
@@ -352,19 +819,23 @@ def list_engagements():
     engagements if the caller is a COE-group reviewer.
     """
     current = (get_current_user() or "").strip().lower()
+    # Soft-deleted rows (deleted_at IS NOT NULL/empty) are hidden from the list.
+    # The row stays in Delta so an admin can recover it via direct URL/SQL.
+    not_deleted = "(deleted_at IS NULL OR deleted_at = '')"
     if _user_is_coe_member(_user_workspace_client()):
         rows = sql_exec(
             f"SELECT engagement_id, genie_space_name, business_owner_name, "
             f"analyst_name, current_session, status, created_at, updated_at "
-            f"FROM {TABLE} ORDER BY updated_at DESC"
+            f"FROM {TABLE} WHERE {not_deleted} ORDER BY updated_at DESC"
         )
     else:
         rows = sql_exec(
             f"SELECT engagement_id, genie_space_name, business_owner_name, "
             f"analyst_name, current_session, status, created_at, updated_at "
             f"FROM {TABLE} "
-            f"WHERE LOWER(TRIM(analyst_email)) = :u "
-            f"   OR LOWER(TRIM(business_owner_email)) = :u "
+            f"WHERE {not_deleted} AND ("
+            f"LOWER(TRIM(analyst_email)) = :u "
+            f"OR LOWER(TRIM(business_owner_email)) = :u) "
             f"ORDER BY updated_at DESC",
             {"u": current},
         )
@@ -373,14 +844,31 @@ def list_engagements():
 
 @app.route("/api/engagements/check-name")
 def check_engagement_name():
-    """Check if an engagement name is already taken."""
+    """Check if an engagement name is already taken.
+
+    Optional `exclude_eid` query param: when renaming an existing engagement,
+    its own current name should not count as a conflict.
+    Soft-deleted engagements DO NOT count as conflicts -- the name is freed
+    for reuse once the row is deleted.
+    """
     name = request.args.get("name", "").strip()
+    exclude_eid = request.args.get("exclude_eid", "").strip()
     if not name:
         return jsonify({"available": False})
-    rows = sql_exec(
-        f"SELECT COUNT(*) AS cnt FROM {TABLE} WHERE genie_space_name = :name",
-        {"name": name},
-    )
+    not_deleted = "(deleted_at IS NULL OR deleted_at = '')"
+    if exclude_eid and _UUID_RE.match(exclude_eid):
+        rows = sql_exec(
+            f"SELECT COUNT(*) AS cnt FROM {TABLE} "
+            f"WHERE genie_space_name = :name AND engagement_id != :eid "
+            f"AND {not_deleted}",
+            {"name": name, "eid": exclude_eid},
+        )
+    else:
+        rows = sql_exec(
+            f"SELECT COUNT(*) AS cnt FROM {TABLE} "
+            f"WHERE genie_space_name = :name AND {not_deleted}",
+            {"name": name},
+        )
     count = int(rows[0]["cnt"]) if rows else 0
     return jsonify({"available": count == 0})
 
@@ -399,7 +887,9 @@ def create_engagement():
     # Check uniqueness
     name = data["genie_space_name"].strip()
     existing = sql_exec(
-        f"SELECT COUNT(*) AS cnt FROM {TABLE} WHERE genie_space_name = :name",
+        f"SELECT COUNT(*) AS cnt FROM {TABLE} "
+        f"WHERE genie_space_name = :name "
+        f"AND (deleted_at IS NULL OR deleted_at = '')",
         {"name": name},
     )
     if existing and int(existing[0]["cnt"]) > 0:
@@ -413,14 +903,15 @@ def create_engagement():
     for col in ALL_SECTION_COLS:
         param_name = f"default_{col}"
         section_defaults.append(f":{param_name}")
-        section_params[param_name] = "" if col in SCALAR_COLS else "[]"
+        section_params[param_name] = _default_section_value(col)
 
     sql_run(
         f"INSERT INTO {TABLE} "
         f"(engagement_id, genie_space_name, business_owner_name, business_owner_email, "
-        f"analyst_name, analyst_email, current_session, status, created_at, updated_at, "
+        f"analyst_name, analyst_email, servicenow_ticket_url, "
+        f"current_session, status, created_at, updated_at, "
         f"{section_cols_sql}) "
-        f"VALUES (:eid, :space_name, :bo_name, :bo_email, :a_name, :a_email, "
+        f"VALUES (:eid, :space_name, :bo_name, :bo_email, :a_name, :a_email, :sn_url, "
         f"1, 'draft', :ts, :ts, {', '.join(section_defaults)})",
         {
             "eid": eid,
@@ -429,6 +920,7 @@ def create_engagement():
             "bo_email": data.get("business_owner_email", "").strip(),
             "a_name": data.get("analyst_name", "").strip(),
             "a_email": data.get("analyst_email", "").strip(),
+            "sn_url": (data.get("servicenow_ticket_url") or "").strip(),
             "ts": ts,
             **section_params,
         },
@@ -438,41 +930,99 @@ def create_engagement():
 
 @app.route("/api/engagements/<eid>", methods=["GET"])
 def get_engagement(eid):
-    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    # SELECT * returns updated_at / created_at as TIMESTAMP, but we hand the
+    # value out to clients as the optimistic-lock token. Cast to STRING so
+    # the load value matches what _check_optimistic_lock will compare against
+    # later (Spark's canonical TIMESTAMP-string format).
+    rows = sql_exec(
+        f"SELECT *, "
+        f"CAST(updated_at AS STRING) AS updated_at_str, "
+        f"CAST(created_at AS STRING) AS created_at_str "
+        f"FROM {TABLE} WHERE engagement_id = :eid",
+        {"eid": eid},
+    )
     if not rows:
         return jsonify({"error": "Not found"}), 404
-    return jsonify(parse_row(rows[0]))
+    parsed = parse_row(rows[0])
+    # Overwrite the TIMESTAMP-typed fields with their string aliases
+    if "updated_at_str" in rows[0]:
+        parsed["updated_at"] = rows[0].get("updated_at_str") or ""
+    if "created_at_str" in rows[0]:
+        parsed["created_at"] = rows[0].get("created_at_str") or ""
+    return jsonify(parsed)
 
 
 @app.route("/api/engagements/<eid>", methods=["PUT"])
 def update_engagement(eid):
-    data = request.json
+    """Update engagement metadata. Validates genie_space_name uniqueness against
+    every OTHER engagement (the current row's own name does not count as a
+    conflict, so saving without renaming is always fine).
+    """
+    data = request.json or {}
+    name = (data.get("genie_space_name") or "").strip()
+    if not name:
+        return jsonify({"error": "genie_space_name is required"}), 400
+
+    # Optimistic-lock check (no-op if If-Match header is absent)
+    try:
+        _check_optimistic_lock(eid)
+    except StaleEngagementError as e:
+        return jsonify({
+            "error": "stale",
+            "current_updated_at": e.current_updated_at,
+            "message": "This engagement was updated by another user. Refresh to continue.",
+        }), 409
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+
+    # Uniqueness check, scoped to other (non-soft-deleted) engagements
+    dup = sql_exec(
+        f"SELECT COUNT(*) AS cnt FROM {TABLE} "
+        f"WHERE genie_space_name = :name AND engagement_id != :eid "
+        f"AND (deleted_at IS NULL OR deleted_at = '')",
+        {"name": name, "eid": eid},
+    )
+    if dup and int(dup[0]["cnt"]) > 0:
+        return jsonify({"error": "An engagement with this name already exists"}), 409
+
     ts = now_ts()
     sql_run(
         f"UPDATE {TABLE} SET "
         f"genie_space_name = :space_name, business_owner_name = :bo_name, "
         f"business_owner_email = :bo_email, analyst_name = :a_name, "
-        f"analyst_email = :a_email, current_session = :session_num, "
+        f"analyst_email = :a_email, servicenow_ticket_url = :sn_url, "
+        f"current_session = :session_num, "
         f"status = :status, updated_at = :ts "
         f"WHERE engagement_id = :eid",
         {
             "eid": eid,
-            "space_name": data.get("genie_space_name", ""),
-            "bo_name": data.get("business_owner_name", ""),
-            "bo_email": data.get("business_owner_email", ""),
-            "a_name": data.get("analyst_name", ""),
-            "a_email": data.get("analyst_email", ""),
+            "space_name": name,
+            "bo_name": (data.get("business_owner_name") or "").strip(),
+            "bo_email": (data.get("business_owner_email") or "").strip(),
+            "a_name": (data.get("analyst_name") or "").strip(),
+            "a_email": (data.get("analyst_email") or "").strip(),
+            "sn_url": (data.get("servicenow_ticket_url") or "").strip(),
             "session_num": str(data.get("current_session", 1)),
             "status": data.get("status", "draft"),
             "ts": ts,
         },
     )
-    return jsonify({"success": True})
+    return jsonify({"success": True, "updated_at": _read_updated_at(eid)})
 
 
 @app.route("/api/engagements/<eid>", methods=["DELETE"])
 def delete_engagement(eid):
-    sql_run(f"DELETE FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    """Soft-delete: mark deleted_at instead of hard-removing the row.
+    The row stays in Delta so a careless click doesn't lose months of work.
+    Hidden from list_engagements + name-uniqueness checks; recoverable via
+    direct URL or by clearing deleted_at via SQL.
+    """
+    ts = now_ts()
+    sql_run(
+        f"UPDATE {TABLE} SET deleted_at = :ts, updated_at = :ts "
+        f"WHERE engagement_id = :eid",
+        {"eid": eid, "ts": ts},
+    )
     return jsonify({"success": True})
 
 
@@ -480,18 +1030,69 @@ def delete_engagement(eid):
 # API: Session saves
 # ---------------------------------------------------------------------------
 
+class StaleEngagementError(Exception):
+    """Raised when an optimistic-lock check on engagement.updated_at fails.
+    The HTTP layer translates this into 409 with the current updated_at so
+    the client can refresh + retry."""
+    def __init__(self, current_updated_at):
+        super().__init__("stale engagement")
+        self.current_updated_at = current_updated_at
+
+
+def _check_optimistic_lock(eid):
+    """If the request carries `If-Match: <updated_at>`, verify it matches
+    the row's current updated_at. Raises StaleEngagementError on conflict.
+    No header = no check (back-compat).
+
+    Reads updated_at via CAST AS STRING so the comparison uses Spark's
+    canonical TIMESTAMP-string format (the column is TIMESTAMP, not STRING,
+    so a raw read can come back in different shapes).
+    """
+    expected = (request.headers.get("If-Match") or "").strip()
+    if not expected:
+        return
+    actual = _read_updated_at(eid)
+    if not actual:
+        raise ValueError("Engagement not found")
+    if actual != expected:
+        raise StaleEngagementError(actual)
+
+
+def _read_updated_at(eid):
+    """Read engagement.updated_at AS STRING so we get the same canonical
+    Spark-formatted value we'd compare against later (avoids round-trip
+    format mismatches between Python's isoformat and Spark's TIMESTAMP
+    string display)."""
+    rows = sql_exec(
+        f"SELECT CAST(updated_at AS STRING) AS updated_at "
+        f"FROM {TABLE} WHERE engagement_id = :eid",
+        {"eid": eid},
+    )
+    if not rows:
+        return ""
+    return (rows[0].get("updated_at") or "").strip()
+
+
 def save_session(eid, session_num, data):
-    """Update session columns for an engagement."""
+    """Update session columns for an engagement. Returns the new updated_at
+    timestamp (in Spark's canonical string format) on success. Raises
+    StaleEngagementError if the request's If-Match header doesn't match
+    the row's current updated_at."""
+    _check_optimistic_lock(eid)
+
     cols = SESSION_COLS[session_num]
     set_parts = []
-    params = {"eid": eid, "ts": now_ts()}
+    ts = now_ts()
+    params = {"eid": eid, "ts": ts}
 
     for col in cols:
         set_parts.append(f"{col} = :{col}")
         if col in SCALAR_COLS:
             params[col] = data.get(col, "")
         else:
-            params[col] = json.dumps(data.get(col, []))
+            # OBJECT_COLS default to {} (dict), arrays default to []
+            default = {} if col in OBJECT_COLS else []
+            params[col] = json.dumps(data.get(col, default))
 
     if session_num < 6:
         set_parts.append(f"current_session = GREATEST(current_session, {session_num + 1})")
@@ -504,42 +1105,56 @@ def save_session(eid, session_num, data):
     set_sql = ", ".join(set_parts)
 
     sql_run(f"UPDATE {TABLE} SET {set_sql} WHERE engagement_id = :eid", params)
+    # Return the canonical stored value -- not Python's isoformat -- so the
+    # client's next If-Match round-trips correctly. updated_at is a TIMESTAMP
+    # column and Spark reformats on read.
+    return _read_updated_at(eid)
+
+
+def _save_session_response(eid, session_num):
+    """Shared wrapper for the per-session save routes: handles optimistic-lock
+    conflicts and returns the new updated_at so the client can carry it forward."""
+    try:
+        ts = save_session(eid, session_num, request.json)
+    except StaleEngagementError as e:
+        return jsonify({
+            "error": "stale",
+            "current_updated_at": e.current_updated_at,
+            "message": "This engagement was updated by another user. Refresh to continue.",
+        }), 409
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    return jsonify({"success": True, "updated_at": ts})
 
 
 @app.route("/api/engagements/<eid>/sessions/1", methods=["PUT"])
 def save_session_1(eid):
-    save_session(eid, 1, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 1)
 
 
 @app.route("/api/engagements/<eid>/sessions/2", methods=["PUT"])
 def save_session_2(eid):
-    save_session(eid, 2, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 2)
 
 
 @app.route("/api/engagements/<eid>/sessions/3", methods=["PUT"])
 def save_session_3(eid):
-    save_session(eid, 3, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 3)
 
 
 @app.route("/api/engagements/<eid>/sessions/4", methods=["PUT"])
 def save_session_4(eid):
-    save_session(eid, 4, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 4)
 
 
 @app.route("/api/engagements/<eid>/sessions/5", methods=["PUT"])
 def save_session_5(eid):
-    save_session(eid, 5, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 5)
 
 
 @app.route("/api/engagements/<eid>/sessions/6", methods=["PUT"])
 def save_session_6(eid):
-    save_session(eid, 6, request.json)
-    return jsonify({"success": True})
+    return _save_session_response(eid, 6)
 
 
 # ---------------------------------------------------------------------------
@@ -581,76 +1196,417 @@ def coe_approve(eid):
 # API: Auto-summary (structured, no LLM)
 # ---------------------------------------------------------------------------
 
-@app.route("/api/engagements/<eid>/auto-summary")
-def auto_summary(eid):
-    """Generate a structured summary of sessions 1-3."""
+BRIEF_MODEL = os.getenv("BRIEF_LLM_ENDPOINT_NAME") or "databricks-claude-haiku-4-5"
+
+
+def _generate_readiness_brief(eid):
+    """Core Readiness Brief logic. Used by both the legacy sync endpoint and
+    the async job task. Returns dict {summary, unacknowledged_gaps}.
+    Raises on engagement-not-found or LLM/parse failure.
+
+    Uses BRIEF_MODEL (default Haiku 4.5) instead of the default Sonnet, since
+    this task is structured extraction with citations -- a small fast model
+    handles it well, and Sonnet was hitting 5+ minute generation times.
+    """
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
-        return jsonify({"summary": ""}), 404
+        raise ValueError("Engagement not found")
     eng = parse_row(rows[0])
-    s1 = eng["sessions"]["1"]
-    s2 = eng["sessions"]["2"]
-    s3 = eng["sessions"]["3"]
 
-    parts = []
-    parts.append(f"## Engagement: {eng.get('genie_space_name', 'Untitled')}")
-    parts.append(f"**Business Owner:** {eng.get('business_owner_name', '')} ({eng.get('business_owner_email', '')})")
-    parts.append(f"**Analyst:** {eng.get('analyst_name', '')} ({eng.get('analyst_email', '')})")
-    parts.append("")
+    prompt = _build_readiness_brief_prompt(eng)
+    raw = _call_llm_raw(prompt, model=BRIEF_MODEL, label="brief")
 
-    # Session 1
-    pain_points = s1.get("pain_points", [])
-    reports = s1.get("existing_reports", [])
-    parts.append("### Session 1: Business Context")
-    if pain_points:
-        parts.append(f"**Pain Points:** {len(pain_points)}")
-        for pp in pain_points:
-            parts.append(f"- {pp.get('description', '')}")
-    if reports:
-        parts.append(f"**Existing Reports:** {len(reports)}")
-        for r in reports:
-            parts.append(f"- {r.get('report_name', '')}: {r.get('what_it_shows', '')}")
-    parts.append("")
+    # Output format:
+    # <markdown brief>
+    # ---STRUCTURED-GAPS---
+    # <JSON array of gap objects>
+    SENTINEL = "---STRUCTURED-GAPS---"
+    brief = ""
+    gaps_raw = []
+    if SENTINEL in raw:
+        parts = raw.split(SENTINEL, 1)
+        brief = parts[0].strip()
+        gaps_text = parts[1].strip()
+        if gaps_text.startswith("```"):
+            gaps_text = gaps_text.split("\n", 1)[1] if "\n" in gaps_text else gaps_text
+            if gaps_text.endswith("```"):
+                gaps_text = gaps_text.rsplit("\n", 1)[0] if "\n" in gaps_text else gaps_text[:-3]
+            gaps_text = gaps_text.strip()
+            if gaps_text.lower().startswith("json"):
+                gaps_text = gaps_text[4:].lstrip()
+        try:
+            gaps_raw = json.loads(gaps_text)
+        except Exception as e:
+            print(f"[readiness-brief] gap JSON parse failed: {e}; tail: {raw[-500:]}", flush=True)
+            gaps_raw = []
+    else:
+        brief = raw.strip()
+        print("[readiness-brief] sentinel missing; full output treated as brief", flush=True)
 
-    # Session 2
-    questions = s2.get("question_bank", [])
-    vocab = s2.get("vocabulary_metrics", [])
-    parts.append("### Session 2: Questions & Vocabulary")
-    parts.append(f"**Questions Captured:** {len(questions)}")
-    parts.append(f"**Vocabulary Terms:** {len(vocab)}")
-    if vocab:
-        terms_list = ", ".join(v.get("business_term", "") for v in vocab[:10])
-        parts.append(f"**Terms:** {terms_list}")
-    parts.append("")
+    if brief.startswith("```"):
+        brief = brief.split("\n", 1)[1] if "\n" in brief else brief
+        if brief.endswith("```"):
+            brief = brief.rsplit("\n", 1)[0] if "\n" in brief else brief[:-3]
+        brief = brief.strip()
+        if brief.lower().startswith("markdown"):
+            brief = brief[8:].lstrip()
 
-    # Session 3
-    classifications = s3.get("term_classifications", [])
-    sql_exprs = s3.get("sql_expressions", [])
-    text_instrs = s3.get("text_instructions", [])
-    data_gaps = s3.get("data_gaps", [])
-    scope = s3.get("scope_boundaries", [])
-    parts.append("### Session 3: Technical Design")
-    parts.append(f"**Classified Terms:** {len(classifications)}")
-    parts.append(f"**SQL Expressions (Metrics):** {len(sql_exprs)}")
+    if not brief:
+        raise RuntimeError("LLM returned empty brief")
+
+    gaps = []
+    if isinstance(gaps_raw, list):
+        for g in gaps_raw:
+            if not isinstance(g, dict):
+                continue
+            title = str(g.get("title", "")).strip()
+            if not title:
+                continue
+            severity = str(g.get("severity", "Medium")).strip().capitalize()
+            if severity not in {"Low", "Medium", "High"}:
+                severity = "Medium"
+            summary = str(g.get("summary", "")).strip()
+            cits = g.get("citations") or []
+            if not isinstance(cits, list):
+                cits = []
+            cits = [str(c).strip() for c in cits if str(c).strip()]
+            gid = str(g.get("id", "")).strip() or _slug(title)
+            gaps.append({
+                "id": gid,
+                "title": title,
+                "severity": severity,
+                "summary": summary,
+                "citations": cits,
+            })
+
+    return {"summary": brief, "unacknowledged_gaps": gaps}
+
+
+@register_task("readiness_brief")
+def _task_readiness_brief(payload):
+    """Async task wrapper for the Readiness Brief generator."""
+    eid = (payload.get("engagement_id") or "").strip()
+    if not eid:
+        raise ValueError("engagement_id is required")
+    return _generate_readiness_brief(eid)
+
+
+@app.route("/api/engagements/<eid>/auto-summary")
+def auto_summary(eid):
+    """Legacy synchronous endpoint. Kept for backward compat; will 504 on long
+    briefs. New callers should use POST /api/jobs/start with task_type=
+    "readiness_brief" instead.
+    """
+    try:
+        result = _generate_readiness_brief(eid)
+    except ValueError as e:
+        return jsonify({"summary": "", "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": _user_error("readiness-brief sync", e)}), 500
+    return jsonify(result)
+
+
+def _slug(text):
+    """Lowercase, alnum + dashes only, collapse runs. Used to derive stable gap IDs."""
+    import re
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower())
+    return s.strip("-")
+
+
+def _build_readiness_brief_prompt(eng):
+    """Build the LLM prompt that produces a COE-facing Readiness Brief."""
+    s1 = eng["sessions"].get("1", {}) or {}
+    s2 = eng["sessions"].get("2", {}) or {}
+    s3 = eng["sessions"].get("3", {}) or {}
+    s4 = eng["sessions"].get("4", {}) or {}
+
+    lines = []
+    lines.append(f"# Engagement: {eng.get('genie_space_name', 'Untitled')}")
+    lines.append(f"Business Owner: {eng.get('business_owner_name', '')} <{eng.get('business_owner_email', '')}>")
+    lines.append(f"Analyst: {eng.get('analyst_name', '')} <{eng.get('analyst_email', '')}>")
+    lines.append("")
+
+    # ----- SESSION 1 -----
+    lines.append("## SESSION 1: Business Context")
+    bc = s1.get("business_context", []) or []
+    if bc:
+        lines.append("### Business Context Q&A (BO answers)")
+        for b in bc:
+            if not isinstance(b, dict):
+                continue
+            q = (b.get("question") or "").strip()
+            why = (b.get("why_it_matters") or "").strip()
+            notes = (b.get("response") or "").strip()
+            if not (q or notes):
+                continue
+            lines.append(f"- **Q:** {q}")
+            if why:
+                lines.append(f"  - *Why it matters:* {why}")
+            if notes:
+                lines.append(f"  - **BO answer:** {notes}")
+    pps = s1.get("pain_points", []) or []
+    if pps:
+        lines.append("### Pain Points")
+        for pp in pps:
+            d = (pp.get("description") if isinstance(pp, dict) else str(pp)) or ""
+            d = d.strip()
+            if d:
+                lines.append(f"- {d}")
+    er = s1.get("existing_reports", []) or []
+    if er:
+        lines.append("### Existing Reports")
+        for r in er:
+            if not isinstance(r, dict):
+                continue
+            name = (r.get("report_name") or "").strip()
+            what = (r.get("what_it_shows") or "").strip()
+            freq = (r.get("frequency") or "").strip()
+            issues = (r.get("known_issues") or "").strip()
+            if not (name or what):
+                continue
+            line = f"- **{name}**"
+            if freq:
+                line += f" ({freq})"
+            if what:
+                line += f": {what}"
+            lines.append(line)
+            if issues:
+                lines.append(f"  - Known issues: {issues}")
+    lines.append("")
+
+    # ----- SESSION 2 -----
+    lines.append("## SESSION 2: Questions & Vocabulary")
+    qb = s2.get("question_bank", []) or []
+    if qb:
+        lines.append("### Question Bank")
+        for i, q in enumerate(qb, 1):
+            text = _qb_question(q)
+            if not text:
+                continue
+            decision = (q.get("decision_it_drives") or "").strip() if isinstance(q, dict) else ""
+            lines.append(f"- **Q{i}:** {text}")
+            if decision:
+                lines.append(f"  - Drives decision: {decision}")
+    vm = s2.get("vocabulary_metrics", []) or []
+    if vm:
+        lines.append("### Vocabulary & Metric Definitions")
+        for v in vm:
+            if not isinstance(v, dict):
+                continue
+            term = (v.get("business_term") or "").strip()
+            defn = _vm_definition(v)
+            synonyms = (v.get("synonyms") or "").strip()
+            if not term:
+                continue
+            line = f"- **{term}**"
+            if defn:
+                line += f": {defn}"
+            if synonyms:
+                line += f" (synonyms: {synonyms})"
+            lines.append(line)
+    lines.append("")
+
+    # ----- SESSION 3 -----
+    lines.append("## SESSION 3: Technical Design")
+    tc = s3.get("term_classifications", []) or []
+    if tc:
+        lines.append("### Term Classifications")
+        for t in tc:
+            if not isinstance(t, dict):
+                continue
+            term = (t.get("business_term") or t.get("term") or "").strip()
+            types = t.get("types") or []
+            if isinstance(types, list):
+                types_str = ", ".join(str(x) for x in types)
+            else:
+                types_str = str(types)
+            if term:
+                lines.append(f"- **{term}** → {types_str}")
+    sb = s3.get("scope_boundaries", []) or []
+    if sb:
+        lines.append("### Scope Boundaries")
+        for b in sb:
+            if not isinstance(b, dict):
+                continue
+            item = (b.get("item") or b.get("topic") or "").strip()
+            scope_status = (b.get("in_scope") or b.get("status") or "").strip()
+            notes = (b.get("notes") or b.get("rationale") or b.get("description") or "").strip()
+            if item:
+                line = f"- **{item}** ({scope_status})"
+                if notes:
+                    line += f": {notes}"
+                lines.append(line)
+    dg = s3.get("data_gaps", []) or []
+    if dg:
+        lines.append("### Data Gaps (analyst-acknowledged)")
+        for g in dg:
+            if not isinstance(g, dict):
+                continue
+            bq = (g.get("business_question") or g.get("topic") or g.get("gap") or "").strip()
+            avail = (g.get("data_available") or "").strip()
+            gap = (g.get("gap_description") or g.get("description") or g.get("detail") or "").strip()
+            res = (g.get("proposed_resolution") or "").strip()
+            if not (bq or gap):
+                continue
+            line = f"- **{bq}**"
+            if avail:
+                line += f" (data available: {avail})"
+            if gap:
+                line += f" — {gap}"
+            lines.append(line)
+            if res:
+                lines.append(f"  - Proposed resolution: {res}")
+    gf = (s3.get("global_filter") or "").strip()
+    if gf:
+        lines.append("### Global Filter")
+        lines.append(f"```\n{gf}\n```")
+    sql_exprs = s3.get("sql_expressions", []) or []
     if sql_exprs:
+        lines.append("### SQL Expressions (the core technical design)")
         for e in sql_exprs:
-            parts.append(f"- {e.get('metric_name', '')}: `{e.get('uc_table', '')}`")
-    parts.append(f"**Text Instructions:** {len(text_instrs)}")
-    parts.append(f"**Data Gaps:** {len(data_gaps)}")
-    parts.append(f"**Scope Boundaries:** {len(scope)}")
+            if not isinstance(e, dict):
+                continue
+            name = (e.get("metric_name") or "").strip()
+            tbl = (e.get("uc_table") or "").strip()
+            sql = (e.get("sql_code") or "").strip()
+            display = (e.get("display_name") or "").strip()
+            synonyms = (e.get("synonyms") or "").strip()
+            if not (name or sql):
+                continue
+            line = f"- **{name}**"
+            if display and display != name:
+                line += f" (display: {display})"
+            if tbl:
+                line += f" on `{tbl}`"
+            lines.append(line)
+            if sql:
+                lines.append(f"  - SQL: `{sql}`")
+            if synonyms:
+                lines.append(f"  - Synonyms: {synonyms}")
+    ti = s3.get("text_instructions", []) or []
+    if ti:
+        lines.append("### Text Instructions / Rules")
+        for t in ti:
+            if not isinstance(t, dict):
+                continue
+            title = (t.get("title") or "").strip()
+            instr = (t.get("instruction") or "").strip()
+            if title or instr:
+                lines.append(f"- **{title}**: {instr}")
+    mv_yaml = (s3.get("metric_view_yaml") or "").strip()
+    if mv_yaml:
+        lines.append("### Generated Metric View YAML")
+        # Truncate very long YAML to keep prompt size + LLM latency bounded.
+        # The brief mainly needs to know what dimensions/measures exist; the
+        # full text isn't required.
+        mv_lines = mv_yaml.splitlines()
+        if len(mv_lines) > 60:
+            shown = "\n".join(mv_lines[:60])
+            lines.append(f"```yaml\n{shown}\n# ... ({len(mv_lines) - 60} more lines truncated for brief generation; full YAML lives in S3)\n```")
+        else:
+            lines.append(f"```yaml\n{mv_yaml}\n```")
+    mv_fqn = (s3.get("metric_view_fqn") or "").strip()
+    if mv_fqn:
+        lines.append(f"### Created Metric View: `{mv_fqn}`")
+    lines.append("")
 
-    # Tables identified
-    tables = set()
-    for e in sql_exprs:
-        t = e.get("uc_table", "")
-        if t and len(t.split(".")) == 3:
-            tables.add(t)
-    if tables:
-        parts.append(f"\n**Tables Identified ({len(tables)}):**")
-        for t in sorted(tables):
-            parts.append(f"- `{t}`")
+    # ----- SESSION 4 (data plan only — not the brief itself) -----
+    dp = s4.get("data_plan", []) or []
+    if dp:
+        lines.append("## SESSION 4: Data Plan (current state)")
+        for d in dp:
+            if not isinstance(d, dict):
+                continue
+            tbl = (d.get("table_or_view") or "").strip()
+            typ = (d.get("type") or "").strip()
+            inc = (d.get("include_in_space") or "").strip()
+            notes = (d.get("notes") or "").strip()
+            if not tbl:
+                continue
+            line = f"- **{tbl}** ({typ}, include: {inc})"
+            if notes:
+                line += f" — {notes}"
+            lines.append(line)
+        lines.append("")
 
-    return jsonify({"summary": "\n".join(parts)})
+    context = "\n".join(lines)
+
+    return f"""You are preparing a READINESS BRIEF for a Center of Excellence (COE) reviewer who must approve or reject this Genie Space engagement.
+
+The brief gives the COE reviewer a clear, citation-backed picture of:
+1. Whether the analyst captured enough information from the business owner to scope a useful Genie Space
+2. Whether the technical design (SQL expressions, metric view, data plan) actually addresses what the BO needs
+3. What's still NOT addressed, distinguishing acknowledged gaps (analyst-flagged) from unacknowledged coverage gaps (red flags)
+
+CRITICAL RULES:
+- CITE your sources. Every concrete claim should reference where it came from. Use citations like `[S1 Pain Points]`, `[S2 Q3]`, `[S3 SQL: denial_rate_pct]`, `[S4 Data Plan]`. Never make a coverage claim without a citation.
+- Be SKEPTICAL. The COE is liable for what they approve. Find holes. Do NOT smooth over gaps to make the brief feel coherent. Adversarial review is the goal.
+- Distinguish ACKNOWLEDGED gaps (the analyst flagged these in S3 Data Gaps — they are FINE to have) from UNACKNOWLEDGED gaps (S2 questions or existing-report metrics not covered by the design and not flagged — these are RED FLAGS).
+- If S3 SQL Expressions, the data plan, or the question bank is empty/sparse, FLAG IT explicitly. Do not pretend the engagement is ready when it isn't.
+- The COE will read this in 3-5 minutes. Be specific and concise. No filler.
+- Use the BO's language where possible (from S1 Business Context Q&A and S2 Vocabulary) — not invented terminology.
+
+OUTPUT STRUCTURE (markdown). Each section header below appears EXACTLY ONCE, in this order. Do not duplicate any `##` heading. Do not invent extra top-level sections. Use bulleted lists, never markdown tables (the renderer doesn't support them).
+
+## TL;DR
+3-5 bullets: who the audience is, what they need, what was built, the headline risk.
+
+## What We Learned
+2-4 short paragraphs synthesizing S1+S2: the BO's day-to-day, decisions they make, pain points, existing reports they rely on, key vocabulary. Cite every paragraph.
+
+## Technical Approach
+2-3 short paragraphs on S3: source tables, key metrics defined, scope decisions, the metric view (or lack of one), the global filter if any. Cite specific SQL expressions or vocabulary terms. If you want to enumerate measures or dimensions, do it inline in prose — do NOT create a separate "Defined Measures" or duplicate "Data Plan" section for that.
+
+## Data Plan
+ONE bulleted list of tables and metric views being included in the Genie Space (from S4 Data Plan). Identifier + 1-line purpose each. If empty, flag this as a problem. Do NOT include another Data Plan section anywhere else in the brief.
+
+## Coverage Analysis
+Walk through the S2 Question Bank. For each question (group similar ones if there are many), output ONE bullet using this exact shape:
+
+- **Q1: <question text>** — ✅ Answerable | ⚠️ Partial | ❌ Not addressed. <one-sentence justification with citations like [S3 SQL: denial_rate_pct]>
+
+Use bulleted lists only — NEVER use markdown tables (`| col |` syntax) here, the renderer breaks on them. If the question bank is empty, say so explicitly and flag it as a problem.
+
+## Open Gaps & Risks
+
+### Acknowledged Gaps
+List what the analyst already flagged in `S3 Data Gaps`. Brief context per item. These are NOT blockers.
+
+### Unacknowledged Gaps
+Coverage failures the analyst did NOT flag — S2 questions or existing-report metrics not supported by the current design. Each with severity: **Low / Medium / High**. THIS IS WHERE COE FOCUSES.
+
+If there are none, say "None identified" — but only if you've genuinely cross-checked every S2 question and existing report against the design.
+
+## Reviewer Recommendation
+ONE sentence framing the question for COE. NOT a verdict. Examples:
+- "Recommended: approve — coverage is strong, residual gaps are acknowledged and bounded."
+- "Recommended: request changes — Q3, Q7, Q11 cannot be answered by the current design and were not flagged."
+- "Recommended: clarify before review — Session 3 SQL Expressions has only 2 entries; the engagement is not ready for COE evaluation."
+
+<engagement_context>
+{context}
+</engagement_context>
+
+OUTPUT FORMAT — emit the markdown brief, then a sentinel line, then a JSON array of structured unacknowledged gaps. Exactly this format:
+
+<the full markdown brief — every section above, in order, no JSON wrapping, no escaping needed, raw markdown>
+---STRUCTURED-GAPS---
+[
+  {{
+    "id": "<stable slug from the title; lowercase, dashes only, no spaces>",
+    "title": "<short headline, ~3-7 words>",
+    "severity": "Low" | "Medium" | "High",
+    "summary": "<1-2 sentences explaining the gap and why it matters>",
+    "citations": ["<source tags like 'S1 Business Context Q&A'>"]
+  }}
+]
+
+CRITICAL:
+- The literal sentinel `---STRUCTURED-GAPS---` MUST appear on its own line between the markdown and the JSON. No other use of that string anywhere.
+- The markdown brief comes first, raw — DO NOT wrap it in JSON, DO NOT escape its quotes or newlines, DO NOT put it inside a code fence.
+- The JSON array after the sentinel MUST contain exactly the same gaps you listed under `### Unacknowledged Gaps` in the markdown — same titles, same order, same severities. The JSON is the source of truth for downstream UI.
+- Do NOT include acknowledged gaps in the JSON array — only gaps the analyst did NOT flag in S3 Data Gaps.
+- If there are no unacknowledged gaps, the JSON array is just `[]`."""
 
 
 # ---------------------------------------------------------------------------
@@ -776,12 +1732,15 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
     lines.append("## Session 2: Questions & Vocabulary")
     lines.append("### Question Bank (candidates for sample questions)")
     for q in s2.get("question_bank", []):
-        text = q.get("question") or q.get("text") or ""
-        lines.append(f"- {text}")
+        text = _qb_question(q)
+        if text:
+            lines.append(f"- {text}")
     lines.append("### Vocabulary & Metric Definitions")
     for v in s2.get("vocabulary_metrics", []):
+        if not isinstance(v, dict):
+            continue
         term = v.get("business_term", "")
-        defn = v.get("definition") or v.get("description") or ""
+        defn = _vm_definition(v)
         lines.append(f"- **{term}**: {defn}")
     lines.append("")
 
@@ -961,15 +1920,54 @@ Return ONLY the JSON object. No markdown fences, no preamble, no trailing commen
     return prompt
 
 
-def _call_llm(prompt):
-    """Call the Databricks serving endpoint with the prompt. Returns parsed JSON."""
-    resp = w.serving_endpoints.query(
-        name=LLM_ENDPOINT,
-        messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-        max_tokens=16000,
-        temperature=0.2,
-    )
-    # Response shape varies: SDK object, dict, or OpenAI-style object
+def _call_llm_raw(prompt, max_tokens=16000, model=None, label=None):
+    """Call the Databricks serving endpoint and return the raw text content (no JSON parse).
+
+    Use this when the prompt asks for non-JSON output (e.g. markdown with a
+    structured trailer) — JSON-wrapping markdown content breaks on every
+    backtick or newline the LLM emits.
+
+    `model` overrides the default LLM_ENDPOINT for this single call. Useful
+    when a specific task (e.g. the Readiness Brief) wants a faster model
+    while other tasks keep using a stronger one.
+    `label` is a short tag for timing logs.
+    """
+    endpoint = model or LLM_ENDPOINT
+    tag = label or "llm"
+    prompt_chars = len(prompt)
+    started = time.time()
+    print(f"[{tag}] start endpoint={endpoint} prompt_chars={prompt_chars} max_tokens={max_tokens}", flush=True)
+    try:
+        resp = w.serving_endpoints.query(
+            name=endpoint,
+            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+    except Exception as e:
+        elapsed = time.time() - started
+        print(f"[{tag}] FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
+        _log_llm_usage(
+            tag, endpoint, prompt_chars, 0, int(elapsed * 1000),
+            success=False, error=f"{type(e).__name__}: {e}",
+        )
+        raise
+
+    # Best-effort: pull token counts off the response if the endpoint exposes
+    # a `usage` object. Handles both raw-dict and SDK-object response shapes.
+    prompt_tokens = 0
+    completion_tokens = 0
+    try:
+        if isinstance(resp, dict) and resp.get("usage"):
+            u = resp["usage"]
+            prompt_tokens = int(u.get("prompt_tokens") or 0)
+            completion_tokens = int(u.get("completion_tokens") or 0)
+        elif hasattr(resp, "usage") and resp.usage is not None:
+            prompt_tokens = int(getattr(resp.usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(resp.usage, "completion_tokens", 0) or 0)
+    except Exception:
+        pass
+
     if isinstance(resp, dict):
         d = resp
     elif hasattr(resp, "as_dict"):
@@ -977,8 +1975,19 @@ def _call_llm(prompt):
     else:
         d = {"choices": [{"message": {"content": resp.choices[0].message.content}}]}
     content = d["choices"][0]["message"]["content"]
+    elapsed = time.time() - started
+    print(f"[{tag}] done in {elapsed:.1f}s output_chars={len(content)} pt={prompt_tokens} ct={completion_tokens}", flush=True)
+    _log_llm_usage(
+        tag, endpoint, prompt_chars, len(content), int(elapsed * 1000),
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+        success=True,
+    )
+    return content
 
-    # Strip markdown fences if model ignored the instruction
+
+def _call_llm(prompt, model=None, label=None):
+    """Call the LLM and return parsed JSON. Tolerates ```json fences."""
+    content = _call_llm_raw(prompt, model=model, label=label)
     text = content.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text
@@ -987,21 +1996,51 @@ def _call_llm(prompt):
         text = text.strip()
         if text.startswith("json"):
             text = text[4:].strip()
-
     return json.loads(text)
+
+
+def _do_generate_plan(eid, user_token, warehouse_id):
+    """Core generate-plan logic. Used by sync endpoint and async task.
+
+    NOTE: this function persists results to Delta on success, so failures
+    leave Session 5 untouched (consistent rollback semantics).
+    """
+    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not rows:
+        raise ValueError("Engagement not found")
+    eng = parse_row(rows[0])
+
+    user_w = _user_workspace_client_from_token(user_token)
+    return _do_generate_plan_inner(eid, eng, user_w, warehouse_id)
+
+
+@register_task("generate_plan")
+def _task_generate_plan(payload):
+    return _do_generate_plan(
+        eid=(payload.get("engagement_id") or "").strip(),
+        user_token=payload.get("_user_token", ""),
+        warehouse_id=(payload.get("warehouse_id") or "").strip(),
+    )
 
 
 @app.route("/api/engagements/<eid>/generate-plan", methods=["POST"])
 def generate_plan(eid):
-    """Use the configured LLM to synthesize a Genie Space configuration plan."""
-    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
-    if not rows:
-        return jsonify({"error": "Not found"}), 404
-    eng = parse_row(rows[0])
-
+    """Legacy sync endpoint. New callers should use the async job runner
+    (POST /api/jobs/start with task_type=generate_plan)."""
     body = request.get_json(silent=True) or {}
-    warehouse_id = (body.get("warehouse_id") or "").strip()
+    try:
+        return jsonify(_do_generate_plan(
+            eid,
+            user_token=request.headers.get("X-Forwarded-Access-Token") or "",
+            warehouse_id=(body.get("warehouse_id") or "").strip(),
+        ))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": _user_error("generate-plan sync", e)}), 500
 
+
+def _do_generate_plan_inner(eid, eng, user_w, warehouse_id):
     warnings = []
     s4 = eng["sessions"]["4"]
 
@@ -1022,7 +2061,8 @@ def generate_plan(eid):
     ]
     scope_mv_fqns = [t for t in scope_mv_fqns if t and t.count(".") == 2]
 
-    user_w = _user_workspace_client()
+    # user_w is now passed in (built from token by the outer wrapper)
+    # so this function is safe to call from a background thread.
 
     # Resolve a warehouse once; both schema DESCRIBE and MV SHOW CREATE TABLE
     # need it under OBO. Prefer UI-supplied warehouse_id, else first visible.
@@ -1073,17 +2113,8 @@ def generate_plan(eid):
                 + ". Falling back to Session 3 YAML if available."
             )
 
-    try:
-        prompt = _build_plan_prompt(eng, schemas=schemas, mv_definitions=mv_definitions)
-        plan = _call_llm(prompt)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[generate-plan] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({
-            "error": f"{type(e).__name__}: {e}",
-            "endpoint": LLM_ENDPOINT,
-            "traceback": tb.splitlines()[-5:],
-        }), 500
+    prompt = _build_plan_prompt(eng, schemas=schemas, mv_definitions=mv_definitions)
+    plan = _call_llm(prompt, label="plan")
 
     # Normalize shape
     def _norm_list(v):
@@ -1161,7 +2192,7 @@ def generate_plan(eid):
         },
     )
 
-    return jsonify({
+    return {
         "general_instructions": general_instructions,
         "sample_questions": sample_questions,
         "sql_filters": sql_filters,
@@ -1171,7 +2202,7 @@ def generate_plan(eid):
         "joins": joins,
         "narrative": narrative,
         "warnings": warnings,
-    })
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1179,27 +2210,115 @@ def generate_plan(eid):
 # ---------------------------------------------------------------------------
 
 def _build_benchmark_draft_prompt(eng, count=12):
-    """Draft benchmark questions from Sessions 1-3 context."""
-    s1 = eng["sessions"]["1"]
-    s2 = eng["sessions"]["2"]
-    s3 = eng["sessions"]["3"]
-    s4 = eng["sessions"]["4"]
+    """Draft benchmark questions from full engagement context (Sessions 1-4)."""
+    s1 = eng["sessions"].get("1", {}) or {}
+    s2 = eng["sessions"].get("2", {}) or {}
+    s3 = eng["sessions"].get("3", {}) or {}
+    s4 = eng["sessions"].get("4", {}) or {}
 
     lines = []
     lines.append(f"Genie Space: {eng.get('genie_space_name', '')}")
+    lines.append("")
+
+    # S1: Business Context Q&A (the BO's own words about their work)
+    bc = s1.get("business_context", []) or []
+    if bc:
+        lines.append("Business Context (BO answers — use this language):")
+        for b in bc:
+            if not isinstance(b, dict):
+                continue
+            q = (b.get("question") or "").strip()
+            notes = (b.get("response") or "").strip()
+            if q and notes:
+                lines.append(f"- Q: {q}")
+                lines.append(f"  A: {notes}")
+
+    lines.append("")
     lines.append("Pain Points:")
-    for pp in s1.get("pain_points", []):
-        lines.append(f"- {pp.get('description', '')}")
-    lines.append("Question Bank (from business owner):")
-    for q in s2.get("question_bank", []):
-        lines.append(f"- {q.get('question') or q.get('text') or ''}")
+    for pp in s1.get("pain_points", []) or []:
+        if isinstance(pp, dict):
+            lines.append(f"- {pp.get('description', '')}")
+
+    lines.append("")
+    lines.append("Question Bank (from business owner — prefer this phrasing):")
+    qb = s2.get("question_bank", []) or []
+    qb_lines = [f"- {t}" for t in (_qb_question(q) for q in qb) if t]
+    if qb_lines:
+        lines.extend(qb_lines)
+    else:
+        lines.append("(empty — no BO-captured questions; rely on Business Context Q&A above for phrasing)")
+
+    # S2: Vocabulary with synonyms (critical for Edge Case generation)
+    vm = s2.get("vocabulary_metrics", []) or []
+    if vm:
+        lines.append("")
+        lines.append("Vocabulary & Synonyms (use these in Edge Case questions to test synonym handling):")
+        for v in vm:
+            if not isinstance(v, dict):
+                continue
+            term = (v.get("business_term") or "").strip()
+            defn = _vm_definition(v)
+            synonyms = (v.get("synonyms") or "").strip()
+            if term:
+                line = f"- {term}"
+                if defn:
+                    line += f" — {defn}"
+                if synonyms:
+                    line += f" (synonyms: {synonyms})"
+                lines.append(line)
+
+    # S3: Scope boundaries (what's IN/OUT — questions must respect)
+    sb = s3.get("scope_boundaries", []) or []
+    if sb:
+        lines.append("")
+        lines.append("Scope Boundaries (do NOT generate questions outside scope):")
+        for b in sb:
+            if isinstance(b, dict):
+                item = (b.get("item") or b.get("topic") or "").strip()
+                scope_status = (b.get("in_scope") or b.get("status") or "").strip()
+                if item:
+                    lines.append(f"- {item}: {scope_status}")
+
+    lines.append("")
     lines.append("Key Metrics / SQL Expressions:")
-    for e in s3.get("sql_expressions", []):
-        lines.append(f"- {e.get('metric_name','')} ({e.get('display_name','')}): `{e.get('sql_code','')}` on {e.get('uc_table','')}")
-    lines.append("Tables in scope:")
-    for d in s4.get("data_plan", []):
-        if d.get("include_in_space") == "Yes":
-            lines.append(f"- {d.get('table_or_view','')}")
+    for e in s3.get("sql_expressions", []) or []:
+        if isinstance(e, dict):
+            lines.append(
+                f"- {e.get('metric_name','')} ({e.get('display_name','')}): "
+                f"`{e.get('sql_code','')}` on {e.get('uc_table','')}"
+            )
+
+    # S3: Text instructions (rules the analyst flagged)
+    ti = s3.get("text_instructions", []) or []
+    if ti:
+        lines.append("")
+        lines.append("Analyst Rules / Instructions:")
+        for t in ti:
+            if isinstance(t, dict):
+                title = (t.get("title") or "").strip()
+                instr = (t.get("instruction") or "").strip()
+                if title or instr:
+                    lines.append(f"- {title}: {instr}")
+
+    # S3: Metric view YAML (the actual dimensions/measures Genie sees)
+    mv_yaml = (s3.get("metric_view_yaml") or "").strip()
+    if mv_yaml:
+        lines.append("")
+        lines.append("Generated Metric View YAML (the actual dimensions/measures the Genie Space exposes):")
+        lines.append("```yaml")
+        lines.append(mv_yaml)
+        lines.append("```")
+
+    # S4: Data plan WITH type (Table vs Metric View)
+    lines.append("")
+    lines.append("Data Plan (in-scope sources):")
+    for d in s4.get("data_plan", []) or []:
+        if isinstance(d, dict) and d.get("include_in_space") == "Yes":
+            tbl = (d.get("table_or_view") or "").strip()
+            typ = (d.get("type") or "Table").strip()
+            if tbl:
+                lines.append(f"- {tbl} ({typ})")
+
     context = "\n".join(lines)
 
     overgen = count + 10
@@ -1226,40 +2345,35 @@ Final output — a JSON array with exactly {count} items. Each item:
 
 Constraints on the final {count}:
 - Every major pain point is tested at least once.
-- Every in-scope table appears in at least one question.
-- About 70% Core (realistic questions), 30% Edge Case (ambiguous phrasing, boundary conditions, synonym tests, trick wording).
+- Every in-scope table or metric view appears in at least one question. If a Metric View is in scope, prioritize testing its measures and dimensions by name.
+- About 70% Core (realistic questions), 30% Edge Case. For Edge Cases:
+  * Use synonyms from the Vocabulary section to test synonym handling (e.g., if "BCBS" is a synonym for "Blue Cross", a question like "What's BCBS's denial rate?" tests whether Genie maps it correctly).
+  * Test ambiguous phrasing, boundary conditions, and trick wording.
+- Respect Scope Boundaries — do NOT generate questions about explicitly out-of-scope topics.
 - Difficulty reflects SQL complexity: Easy = single table, simple filter; Medium = aggregation + group by; Hard = multi-table joins or subqueries.
 - Include a mix of time-bound (last quarter, YTD) and aggregation styles.
-- Prefer the business owner's own phrasing when a matching question exists in their question bank.
+- Prefer the business owner's own phrasing — pull from the Question Bank when populated, and from the Business Context Q&A answers otherwise. Use the BO's actual words.
 - Do NOT draft SQL — just the questions. SQL will be drafted per-row later.
 
 Return ONLY the JSON array of {count} final picks, highest-value first. No markdown fences, no preamble, no commentary about the candidate pool."""
 
 
-@app.route("/api/engagements/<eid>/draft-benchmarks", methods=["POST"])
-def draft_benchmarks(eid):
-    """Draft benchmark questions from Sessions 1-3 context."""
+def _do_draft_benchmarks(eid, count=12):
+    """Core draft-benchmarks logic. Used by both sync endpoint and async task."""
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
-        return jsonify({"error": "Not found"}), 404
+        raise ValueError("Engagement not found")
     eng = parse_row(rows[0])
 
-    body = request.json or {}
     try:
-        count = int(body.get("count") or 12)
+        count = int(count)
     except (TypeError, ValueError):
         count = 12
     count = max(1, min(50, count))
 
-    try:
-        prompt = _build_benchmark_draft_prompt(eng, count=count)
-        result = _call_llm(prompt)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[draft-benchmarks] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    prompt = _build_benchmark_draft_prompt(eng, count=count)
+    result = _call_llm(prompt, label="benchmark-draft")
 
-    # Normalize — LLM might return a dict with "benchmarks" key or a raw array
     if isinstance(result, dict):
         items = result.get("benchmarks") or result.get("questions") or []
     else:
@@ -1286,31 +2400,78 @@ def draft_benchmarks(eid):
             "notes": "",
             "bo_approved": False,
         })
+    return {"benchmarks": drafted}
 
-    return jsonify({"benchmarks": drafted})
+
+@register_task("draft_benchmarks")
+def _task_draft_benchmarks(payload):
+    return _do_draft_benchmarks(
+        (payload.get("engagement_id") or "").strip(),
+        count=payload.get("count", 12),
+    )
 
 
-@app.route("/api/engagements/<eid>/draft-benchmark-sql", methods=["POST"])
-def draft_benchmark_sql(eid):
-    """Draft SQL for a single benchmark question using Session 3 technical context."""
+@app.route("/api/engagements/<eid>/draft-benchmarks", methods=["POST"])
+def draft_benchmarks(eid):
+    """Legacy sync endpoint. New callers should use the async job runner."""
+    body = request.json or {}
+    try:
+        return jsonify(_do_draft_benchmarks(eid, count=body.get("count", 12)))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": _user_error("draft-benchmarks sync", e)}), 500
+
+
+def _do_draft_benchmark_sql(eid, question, warehouse_id, validate, user_token):
+    """Core draft-benchmark-sql logic. Used by sync endpoint and async task."""
+    question = (question or "").strip()
+    if not question:
+        raise ValueError("question is required")
+
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
-        return jsonify({"error": "Not found"}), 404
+        raise ValueError("Engagement not found")
     eng = parse_row(rows[0])
-
-    body = request.json or {}
-    question = (body.get("question") or "").strip()
-    warehouse_id = (body.get("warehouse_id") or "").strip()
-    if not question:
-        return jsonify({"error": "question is required"}), 400
 
     s3 = eng["sessions"]["3"]
     s4 = eng["sessions"]["4"]
 
-    # Collect actual column schemas for every in-scope table so the LLM has
-    # ground truth to reference and doesn't invent columns. Uses OBO so we
-    # inherit the user's UC grants.
-    user_w = _user_workspace_client()
+    user_w = _user_workspace_client_from_token(user_token)
+    return _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user_w)
+
+
+@register_task("draft_benchmark_sql")
+def _task_draft_benchmark_sql(payload):
+    return _do_draft_benchmark_sql(
+        eid=(payload.get("engagement_id") or "").strip(),
+        question=payload.get("question", ""),
+        warehouse_id=(payload.get("warehouse_id") or "").strip(),
+        validate=bool(payload.get("validate")),
+        user_token=payload.get("_user_token", ""),
+    )
+
+
+@app.route("/api/engagements/<eid>/draft-benchmark-sql", methods=["POST"])
+def draft_benchmark_sql(eid):
+    """Legacy sync endpoint. New callers should use the async job runner
+    (POST /api/jobs/start with task_type=draft_benchmark_sql)."""
+    body = request.json or {}
+    try:
+        return jsonify(_do_draft_benchmark_sql(
+            eid,
+            question=body.get("question", ""),
+            warehouse_id=(body.get("warehouse_id") or "").strip(),
+            validate=bool(body.get("validate")),
+            user_token=request.headers.get("X-Forwarded-Access-Token") or "",
+        ))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": _user_error("draft-benchmark-sql sync", e)}), 500
+
+
+def _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user_w):
     in_scope_tables = [
         (d.get("table_or_view") or "").strip()
         for d in s4.get("data_plan", [])
@@ -1375,26 +2536,98 @@ Rules:
 - Single SQL statement. If you need CTEs, use WITH.
 - Return ONLY the JSON. No markdown fences, no preamble."""
 
-    try:
-        result = _call_llm(prompt)
-        if isinstance(result, dict):
-            sql_text = str(result.get("sql", "")).strip()
-        else:
-            sql_text = str(result or "").strip()
-        # Strip code fences if any
-        if sql_text.startswith("```"):
-            sql_text = sql_text.split("\n", 1)[1] if "\n" in sql_text else sql_text
-            if sql_text.endswith("```"):
-                sql_text = sql_text.rsplit("\n", 1)[0] if "\n" in sql_text else sql_text[:-3]
-            sql_text = sql_text.strip()
-            if sql_text.lower().startswith("sql"):
-                sql_text = sql_text[3:].lstrip()
-    except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    result = _call_llm(prompt, label="benchmark-sql")
+    if isinstance(result, dict):
+        sql_text = str(result.get("sql", "")).strip()
+    else:
+        sql_text = str(result or "").strip()
+    # Strip code fences if any
+    if sql_text.startswith("```"):
+        sql_text = sql_text.split("\n", 1)[1] if "\n" in sql_text else sql_text
+        if sql_text.endswith("```"):
+            sql_text = sql_text.rsplit("\n", 1)[0] if "\n" in sql_text else sql_text[:-3]
+        sql_text = sql_text.strip()
+        if sql_text.lower().startswith("sql"):
+            sql_text = sql_text[3:].lstrip()
 
-    # Second LLM call — summary is derived from the final SQL, not from the
-    # question. Guarantees the plain-English explanation describes what the
-    # query actually does.
+    # Optional validation pass: run the drafted SQL on the chosen warehouse.
+    # If it fails, do ONE auto-fix retry with the error message so the LLM
+    # can correct hallucinated columns / dialect issues. Mirrors the metric
+    # view YAML retry pattern.
+    validation = None
+    if validate and sql_text and warehouse_id:
+        validation = {"ran": False, "error": None, "retried": False, "sample_result": None}
+        run_result = _execute_benchmark_sql_obo(user_w, sql_text, warehouse_id)
+        if run_result.get("error"):
+            err_msg = run_result["error"]
+            print(f"[draft-benchmark-sql] validation failed: {err_msg}", flush=True)
+            # ONE retry with the error embedded in the prompt
+            retry_prompt = f"""Your drafted SQL failed when executed on Databricks. Fix it.
+
+<failed_sql>
+{sql_text}
+</failed_sql>
+
+<execution_error>
+{err_msg}
+</execution_error>
+
+<table_schemas>
+{schemas_text}
+</table_schemas>
+
+<known_metrics>
+{metrics_text}
+</known_metrics>
+
+<benchmark_question>
+{question}
+</benchmark_question>
+
+Common causes:
+- Column name doesn't exist (check the schema list above carefully)
+- Wrong dialect (this is Databricks SQL / Spark SQL — see common gotchas: DATE_ADD takes integer days; use ADD_MONTHS for months; DATEDIFF is (end, start); single quotes for strings)
+- Missing fully-qualified table reference
+
+Return JSON: {{"sql": "the corrected SQL"}}. No markdown fences, no commentary."""
+            try:
+                retry_result = _call_llm(retry_prompt)
+                if isinstance(retry_result, dict):
+                    retry_sql = str(retry_result.get("sql", "")).strip()
+                else:
+                    retry_sql = str(retry_result or "").strip()
+                if retry_sql.startswith("```"):
+                    retry_sql = retry_sql.split("\n", 1)[1] if "\n" in retry_sql else retry_sql
+                    if retry_sql.endswith("```"):
+                        retry_sql = retry_sql.rsplit("\n", 1)[0] if "\n" in retry_sql else retry_sql[:-3]
+                    retry_sql = retry_sql.strip()
+                    if retry_sql.lower().startswith("sql"):
+                        retry_sql = retry_sql[3:].lstrip()
+                if retry_sql:
+                    retry_run = _execute_benchmark_sql_obo(user_w, retry_sql, warehouse_id)
+                    validation["retried"] = True
+                    if retry_run.get("error"):
+                        # Both passes failed — keep the original SQL and surface the latest error
+                        validation["ran"] = False
+                        validation["error"] = retry_run["error"]
+                    else:
+                        # Retry succeeded — promote the corrected SQL
+                        sql_text = retry_sql
+                        validation["ran"] = True
+                        validation["error"] = None
+                        validation["sample_result"] = retry_run
+                else:
+                    validation["error"] = err_msg
+            except Exception as e:
+                print(f"[draft-benchmark-sql] retry failed: {type(e).__name__}: {e}", flush=True)
+                validation["error"] = err_msg
+        else:
+            validation["ran"] = True
+            validation["sample_result"] = run_result
+
+    # Second LLM call — summary is derived from the final SQL (post-retry if
+    # applicable), not from the question. Guarantees the plain-English
+    # explanation describes what the query actually does.
     explanation = ""
     if sql_text:
         try:
@@ -1402,7 +2635,11 @@ Rules:
         except Exception as e:
             print(f"[draft-benchmark-sql] summary generation failed: {type(e).__name__}: {e}", flush=True)
 
-    return jsonify({"sql": sql_text, "explanation": explanation})
+    return {
+        "sql": sql_text,
+        "explanation": explanation,
+        "validation": validation,
+    }
 
 
 def _summarize_benchmark_sql(question, sql_text):
@@ -1440,9 +2677,134 @@ def draft_benchmark_summary(eid):
     try:
         explanation = _summarize_benchmark_sql(question, sql_text)
     except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": _user_error("draft-benchmark-summary", e)}), 500
 
     return jsonify({"explanation": explanation})
+
+
+_SELECT_OR_WITH_RE = _re.compile(r"^\s*(?:WITH\b|SELECT\b)", _re.IGNORECASE | _re.DOTALL)
+_DESTRUCTIVE_KEYWORDS = (
+    "DELETE", "UPDATE", "INSERT", "MERGE", "DROP", "TRUNCATE", "ALTER",
+    "CREATE", "REPLACE", "GRANT", "REVOKE", "OPTIMIZE", "VACUUM", "ANALYZE",
+    "REFRESH", "RESTORE", "USE", "SET", "RESET", "COMMENT", "RENAME",
+)
+_DESTRUCTIVE_RE = _re.compile(
+    r"(?:^|[\s;])(" + "|".join(_DESTRUCTIVE_KEYWORDS) + r")\b",
+    _re.IGNORECASE,
+)
+
+
+def _is_safe_select(sql_text):
+    """Return (True, None) if the SQL is unambiguously a SELECT (or WITH...SELECT);
+    (False, reason) otherwise.
+
+    Defense-in-depth against an LLM hallucinating a destructive statement
+    that the user happens to have grants for. The outer SELECT * FROM (...)
+    wrapper would syntax-error on most DML/DDL anyway, but this is a
+    deliberate guard rather than relying on that accident.
+
+    Strips a leading SQL comment block and a single trailing semicolon
+    before matching; rejects multi-statement bodies.
+    """
+    s = (sql_text or "").strip()
+    if not s:
+        return False, "empty SQL"
+    # Strip leading line comments (--) and block comments (/* */)
+    while True:
+        if s.startswith("--"):
+            nl = s.find("\n")
+            s = (s[nl + 1:] if nl >= 0 else "").lstrip()
+            continue
+        if s.startswith("/*"):
+            end = s.find("*/")
+            if end < 0:
+                return False, "unterminated SQL comment"
+            s = s[end + 2:].lstrip()
+            continue
+        break
+    # Reject multi-statement bodies (one trailing semicolon is fine)
+    if ";" in s.rstrip().rstrip(";"):
+        return False, "multiple SQL statements are not allowed"
+    if not _SELECT_OR_WITH_RE.match(s):
+        return False, "only SELECT (or WITH ... SELECT) statements are allowed"
+    # Belt: scan for destructive keywords appearing as standalone words.
+    # False positives possible (e.g., a string literal containing 'DELETE')
+    # but for a defense-in-depth guard the trade-off is acceptable.
+    if _DESTRUCTIVE_RE.search(s):
+        return False, "SQL contains a disallowed keyword (DELETE/UPDATE/DROP/etc.)"
+    return True, None
+
+
+def _execute_benchmark_sql_obo(user_w, sql_text, warehouse_id, limit_cap=50):
+    """Run benchmark SQL via OBO; return a dict with columns/rows/row_count or error.
+
+    Always returns a dict (never raises). The caller can check for `error`.
+    Used by both `/run-benchmark-sql` (analyst-triggered) and the draft
+    validation pass (auto-triggered after SQL drafting).
+    """
+    if not user_w:
+        return {"error": "User auth unavailable — reload the app so OBO token is present"}
+    if not sql_text:
+        return {"error": "sql is required"}
+    if not warehouse_id:
+        return {"error": "warehouse_id is required"}
+
+    stmt = sql_text.rstrip().rstrip(";").strip()
+
+    # Hard guard: only SELECT / WITH ... SELECT bodies allowed. Defends against
+    # an LLM (or a user-edited benchmark) emitting a destructive statement.
+    safe, reason = _is_safe_select(stmt)
+    if not safe:
+        return {"error": f"SQL rejected by safety guard: {reason}"}
+
+    wrapped = f"SELECT * FROM (\n{stmt}\n) __bm LIMIT {limit_cap}"
+
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id,
+            statement=wrapped,
+            wait_timeout="50s",
+        )
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    statement_id = resp.statement_id
+    state = str(resp.status.state) if resp.status else ""
+    import time as _time
+    deadline = _time.time() + 120
+    while statement_id and "SUCCEEDED" not in state and "FAILED" not in state and "CANCELED" not in state and "CLOSED" not in state:
+        if _time.time() > deadline:
+            try:
+                user_w.statement_execution.cancel_execution(statement_id)
+            except Exception:
+                pass
+            return {"error": "Query timed out after 2 minutes waiting for the warehouse"}
+        _time.sleep(1.5)
+        try:
+            resp = user_w.statement_execution.get_statement(statement_id)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        state = str(resp.status.state) if resp.status else ""
+
+    if "SUCCEEDED" not in state:
+        err = resp.status.error.message if (resp.status and resp.status.error) else f"Statement state: {state}"
+        return {"error": err}
+
+    columns: list[str] = []
+    out_rows: list[list] = []
+    row_count = 0
+    if resp.manifest and resp.manifest.schema and resp.manifest.schema.columns:
+        columns = [c.name for c in resp.manifest.schema.columns]
+    if resp.result and resp.result.data_array:
+        out_rows = [list(r) for r in resp.result.data_array]
+        row_count = len(out_rows)
+    return {
+        "columns": columns,
+        "rows": out_rows,
+        "row_count": row_count,
+        "truncated": row_count >= limit_cap,
+        "limit": limit_cap,
+    }
 
 
 @app.route("/api/engagements/<eid>/run-benchmark-sql", methods=["POST"])
@@ -1455,75 +2817,9 @@ def run_benchmark_sql(eid):
     body = request.json or {}
     sql_text = (body.get("sql") or "").strip()
     warehouse_id = (body.get("warehouse_id") or "").strip()
-    if not sql_text:
-        return jsonify({"error": "sql is required"}), 400
-    if not warehouse_id:
-        return jsonify({"error": "warehouse_id is required"}), 400
-
     user_w = _user_workspace_client()
-    if not user_w:
-        return jsonify({"error": "User auth unavailable — reload the app so OBO token is present"}), 401
-
-    # Strip trailing semicolons so the wrapper doesn't break
-    stmt = sql_text.rstrip().rstrip(";").strip()
-
-    # Always wrap in an outer LIMIT so the BO preview can't pull huge result
-    # sets. Wrapping is safe whether the inner query has its own LIMIT,
-    # ORDER BY, or CTEs — the outer cap applies to whatever the inner returns.
-    limit_cap = 50
-    wrapped = f"SELECT * FROM (\n{stmt}\n) __bm LIMIT {limit_cap}"
-
-    try:
-        # wait_timeout=50s lets the call block up to 50s before returning
-        # PENDING/RUNNING. We still poll below so a cold warehouse start
-        # doesn't surface as a misleading error.
-        resp = user_w.statement_execution.execute_statement(
-            warehouse_id=warehouse_id,
-            statement=wrapped,
-            wait_timeout="50s",
-        )
-    except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 200
-
-    statement_id = resp.statement_id
-    state = str(resp.status.state) if resp.status else ""
-    import time as _time
-    deadline = _time.time() + 120  # up to 2 min total (warehouse cold start + query)
-    while statement_id and "SUCCEEDED" not in state and "FAILED" not in state and "CANCELED" not in state and "CLOSED" not in state:
-        if _time.time() > deadline:
-            try:
-                user_w.statement_execution.cancel_execution(statement_id)
-            except Exception:
-                pass
-            return jsonify({"error": "Query timed out after 2 minutes waiting for the warehouse"}), 200
-        _time.sleep(1.5)
-        try:
-            resp = user_w.statement_execution.get_statement(statement_id)
-        except Exception as e:
-            return jsonify({"error": f"{type(e).__name__}: {e}"}), 200
-        state = str(resp.status.state) if resp.status else ""
-
-    if "SUCCEEDED" not in state:
-        err = resp.status.error.message if (resp.status and resp.status.error) else f"Statement state: {state}"
-        return jsonify({"error": err}), 200
-
-    columns: list[str] = []
-    out_rows: list[list] = []
-    row_count = 0
-    if resp.manifest and resp.manifest.schema and resp.manifest.schema.columns:
-        columns = [c.name for c in resp.manifest.schema.columns]
-    if resp.result and resp.result.data_array:
-        out_rows = [list(r) for r in resp.result.data_array]
-        row_count = len(out_rows)
-    truncated = row_count >= limit_cap
-
-    return jsonify({
-        "columns": columns,
-        "rows": out_rows,
-        "row_count": row_count,
-        "truncated": truncated,
-        "limit": limit_cap,
-    })
+    result = _execute_benchmark_sql_obo(user_w, sql_text, warehouse_id)
+    return jsonify(result), 200
 
 
 # ---------------------------------------------------------------------------
@@ -1638,18 +2934,22 @@ def _build_mv_yaml_prompt(eng, user_w=None, warehouse_id=None):
         lines.append("## Existing Reports (S1) — metrics analysts already produce today")
         for r in er:
             if isinstance(r, dict):
-                lines.append(f"- **{r.get('report_name') or r.get('name','')}**: {r.get('description') or r.get('key_metrics') or ''}")
+                lines.append(f"- **{r.get('report_name') or r.get('name','')}**: {_er_what(r)}")
             else:
                 lines.append(f"- {r}")
         lines.append("")
 
     lines.append("## Business Questions (S2)")
     for q in s2.get("question_bank", []):
-        lines.append(f"- {q.get('question') or q.get('text') or ''}")
+        text = _qb_question(q)
+        if text:
+            lines.append(f"- {text}")
     lines.append("")
     lines.append("## Vocabulary & Metric Definitions (S2)")
     for v in s2.get("vocabulary_metrics", []):
-        lines.append(f"- **{v.get('business_term','')}**: {v.get('definition') or v.get('description') or ''}")
+        if not isinstance(v, dict):
+            continue
+        lines.append(f"- **{v.get('business_term','')}**: {_vm_definition(v)}")
     lines.append("")
 
     tc = s3.get("term_classifications", [])
@@ -1973,30 +3273,49 @@ def mv_prompt_preview(eid):
         prompt = _build_mv_yaml_prompt(eng)
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[mv-prompt-preview] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": _user_error("mv-prompt-preview", e)}), 500
     return jsonify({"prompt": prompt})
 
 
 @app.route("/api/engagements/<eid>/draft-metric-view-yaml", methods=["POST"])
 def draft_metric_view_yaml(eid):
-    """Draft a UC Metric View YAML from Sessions 1-3."""
+    """Legacy sync endpoint. New callers should use the async job runner
+    (POST /api/jobs/start with task_type=draft_mv_yaml)."""
+    body = request.json or {}
+    try:
+        return jsonify(_do_draft_mv_yaml(
+            eid,
+            user_token=request.headers.get("X-Forwarded-Access-Token") or "",
+            warehouse_id=(body.get("warehouse_id") or "").strip(),
+        ))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": _user_error("draft-mv-yaml sync", e)}), 500
+
+
+def _do_draft_mv_yaml(eid, user_token, warehouse_id):
+    """Core MV YAML draft logic. Used by both sync endpoint and async task."""
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
-        return jsonify({"error": "Not found"}), 404
+        raise ValueError("Engagement not found")
     eng = parse_row(rows[0])
+    user_w = _user_workspace_client_from_token(user_token)
+    return _do_draft_mv_yaml_inner(eng, user_w, warehouse_id)
 
-    body = request.json or {}
-    user_w = _user_workspace_client()
-    warehouse_id = (body.get("warehouse_id") or "").strip()
 
-    try:
-        prompt = _build_mv_yaml_prompt(eng, user_w, warehouse_id)
-        result = _call_llm(prompt)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[draft-mv-yaml] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+@register_task("draft_mv_yaml")
+def _task_draft_mv_yaml(payload):
+    return _do_draft_mv_yaml(
+        eid=(payload.get("engagement_id") or "").strip(),
+        user_token=payload.get("_user_token", ""),
+        warehouse_id=(payload.get("warehouse_id") or "").strip(),
+    )
+
+
+def _do_draft_mv_yaml_inner(eng, user_w, warehouse_id):
+    prompt = _build_mv_yaml_prompt(eng, user_w, warehouse_id)
+    result = _call_llm(prompt, label="mv-yaml")
 
     yaml_text = _strip_yaml_fences(str(result.get("yaml", "")))
     source_table = str(result.get("source_table", "")).strip()
@@ -2055,12 +3374,12 @@ Return JSON with exactly: {{"yaml": "...", "source_table": "...", "suggested_nam
                 f"{', '.join(missing)}. Fix these before creating the metric view."
             )
 
-    return jsonify({
+    return {
         "yaml": yaml_text,
         "source_table": source_table,
         "suggested_name": suggested_name,
         "warnings": warnings,
-    })
+    }
 
 
 def _sql_exec_obo(user_w, query, warehouse_id, catalog=None, schema=None):
@@ -2367,7 +3686,9 @@ def _build_serialized_space(eng, plan):
     if join_entries:
         serialized["instructions"]["join_specs"] = join_entries
 
-    # Benchmarks — top-level key. Only include rows with both question AND SQL.
+    # Benchmarks — top-level {"questions": [...]}. Each question has an
+    # answer: [{format: "SQL", content: [...]}] (array, single element).
+    # `content` is an array of strings — Genie joins them as the SQL.
     bm_entries = []
     for b in benchmarks_in:
         q = (b.get("question") or "").strip()
@@ -2377,11 +3698,11 @@ def _build_serialized_space(eng, plan):
         bm_entries.append({
             "id": _gen_hex_id(),
             "question": [q],
-            "sql_answer": [sql],
+            "answer": [{"format": "SQL", "content": [sql]}],
         })
     bm_entries.sort(key=lambda x: x["id"])
     if bm_entries:
-        serialized["benchmarks"] = bm_entries
+        serialized["benchmarks"] = {"questions": bm_entries}
 
     return serialized
 
@@ -2393,8 +3714,20 @@ def _genie_api_call(user_w, method, path, body=None):
         "Authorization": f"Bearer {user_w.config.token}",
         "Content-Type": "application/json",
     }
+    # DEBUG: log a sample of the body so we can see what's being sent on failure.
+    try:
+        body_for_log = json.dumps(body) if body else "<none>"
+        sample = body_for_log[:300] + (" ..." if len(body_for_log) > 300 else "")
+        print(f"[genie-api] {method} {path} body_chars={len(body_for_log)} sample={sample}", flush=True)
+    except Exception:
+        pass
     resp = requests.request(method, url, headers=headers, json=body, timeout=60)
     if not resp.ok:
+        # DEBUG: log full request body when failing so we can diagnose
+        print(f"[genie-api] FAILED {method} {path} status={resp.status_code}", flush=True)
+        print(f"[genie-api] response: {resp.text[:1000]}", flush=True)
+        if body:
+            print(f"[genie-api] full body: {json.dumps(body)[:5000]}", flush=True)
         raise RuntimeError(f"Genie API {method} {path} failed ({resp.status_code}): {resp.text[:500]}")
     return resp.json() if resp.text else {}
 
@@ -2459,7 +3792,7 @@ def push_to_genie(eid):
                 "description": new_description,
                 "parent_path": new_parent_path,
                 "warehouse_id": warehouse_id,
-                "serialized_space": json.dumps(serialized),
+                "serialized_space": json.dumps(serialized, ensure_ascii=False),
             }
             resp = _genie_api_call(user_w, "POST", "/api/2.0/genie/spaces", body)
             space_id = resp.get("space_id", "")
@@ -2472,7 +3805,7 @@ def push_to_genie(eid):
             body = {
                 "title": eng.get("genie_space_name", ""),
                 "warehouse_id": warehouse_id,
-                "serialized_space": json.dumps(serialized),
+                "serialized_space": json.dumps(serialized, ensure_ascii=False),
             }
             _genie_api_call(user_w, "PATCH", f"/api/2.0/genie/spaces/{space_id}", body)
             result["space_id"] = space_id
@@ -2500,6 +3833,9 @@ def push_to_genie(eid):
             "ts": ts,
         },
     )
+    # Return new updated_at so the client can refresh its optimistic-lock token
+    # and avoid 409s on the next autosave.
+    result["updated_at"] = ts
 
     return jsonify(result)
 

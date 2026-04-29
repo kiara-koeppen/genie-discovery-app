@@ -2,10 +2,13 @@ import { useEffect, useState, useCallback, useRef, type ReactElement } from "rea
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Box, Typography, Tabs, Tab, Button, CircularProgress, Alert, Snackbar,
-  Chip, IconButton, Paper, Tooltip,
+  Chip, IconButton, Paper, Tooltip, Dialog, DialogTitle, DialogContent,
+  DialogActions, TextField, Stack, Link,
 } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import LockIcon from "@mui/icons-material/Lock";
+import EditIcon from "@mui/icons-material/Edit";
+import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudSyncIcon from "@mui/icons-material/CloudSync";
 import CloudOffIcon from "@mui/icons-material/CloudOff";
@@ -34,6 +37,15 @@ interface Props {
   readOnly?: boolean;
 }
 
+interface EngagementMeta {
+  genie_space_name: string;
+  business_owner_name: string;
+  business_owner_email: string;
+  analyst_name: string;
+  analyst_email: string;
+  servicenow_ticket_url: string;
+}
+
 export default function Engagement({ readOnly = false }: Props) {
   const { id } = useParams<{ id: string }>();
   const nav = useNavigate();
@@ -42,10 +54,27 @@ export default function Engagement({ readOnly = false }: Props) {
   const [tab, setTab] = useState(0);
   const [toast, setToast] = useState("");
   const [sessionDrafts, setSessionDrafts] = useState<Record<number, any>>({});
+  const [meta, setMeta] = useState<EngagementMeta>({
+    genie_space_name: "",
+    business_owner_name: "",
+    business_owner_email: "",
+    analyst_name: "",
+    analyst_email: "",
+    servicenow_ticket_url: "",
+  });
+  const [metaError, setMetaError] = useState<string>("");
   const [isCoeMember, setIsCoeMember] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const skipNextAutosave = useRef(true);
+  // Last-known updated_at for the engagement, used as an If-Match optimistic-
+  // lock token. Advances after every successful save; reset on load/refresh.
+  const updatedAtRef = useRef<string>("");
+  // The session number that received the most recent updateDraft call.
+  // Autosave saves THIS session, not the currently-visible tab, so flipping
+  // tabs after an edit doesn't redirect the save to a session the user never
+  // touched. Initial value 1 is fine -- skipNextAutosave gates the first run.
+  const lastEditedSessionRef = useRef<number>(1);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -57,6 +86,7 @@ export default function Engagement({ readOnly = false }: Props) {
       ]);
       setData(eng);
       setIsCoeMember(coe.is_member);
+      updatedAtRef.current = String(eng.updated_at || "");
       const s = eng.sessions || {};
       skipNextAutosave.current = true;
       setSessionDrafts({
@@ -67,6 +97,20 @@ export default function Engagement({ readOnly = false }: Props) {
         5: s["5"] || {},
         6: s["6"] || {},
       });
+      // Reset the SN URL autosave skip flag BEFORE setMeta. The
+      // useEffect-on-meta-change pattern's "skip first run" only fires once
+      // at component mount; without this, hydrating meta from the load
+      // would trip the effect and queue a no-op autosave.
+      snUrlInitialLoad.current = true;
+      setMeta({
+        genie_space_name: String(eng.genie_space_name || ""),
+        business_owner_name: String(eng.business_owner_name || ""),
+        business_owner_email: String(eng.business_owner_email || ""),
+        analyst_name: String(eng.analyst_name || ""),
+        analyst_email: String(eng.analyst_email || ""),
+        servicenow_ticket_url: String(eng.servicenow_ticket_url || ""),
+      });
+      setMetaError("");
       setSaveStatus("idle");
     } catch {
       setData(null);
@@ -80,15 +124,31 @@ export default function Engagement({ readOnly = false }: Props) {
     if (!id) return;
     setSaveStatus("saving");
     try {
-      await api.saveSession(id, sessionNum, sessionDrafts[sessionNum]);
+      const res = await api.saveSession(
+        id,
+        sessionNum,
+        sessionDrafts[sessionNum],
+        updatedAtRef.current,
+      );
+      if (res.updated_at) updatedAtRef.current = res.updated_at;
       setSaveStatus("saved");
     } catch (err: any) {
       setSaveStatus("error");
-      setToast(`Error saving: ${err.message}`);
+      const msg = err?.message || "Save failed";
+      // 409 stale: backend message is friendly. Reload to recover.
+      if (msg.toLowerCase().includes("updated by another user")) {
+        setToast("This engagement was updated elsewhere. Reloading...");
+        await load();
+      } else {
+        setToast(`Error saving: ${msg}`);
+      }
     }
-  }, [id, sessionDrafts]);
+  }, [id, sessionDrafts, load]);
 
-  // Debounced autosave: fires AUTOSAVE_DELAY_MS after the last draft change
+  // Debounced autosave: fires AUTOSAVE_DELAY_MS after a real edit (not after
+  // a tab change). `tab` is intentionally NOT in the deps so navigating
+  // between tabs without editing doesn't queue a save. Saves the session the
+  // user actually modified, captured in lastEditedSessionRef by updateDraft.
   useEffect(() => {
     if (readOnly || !id) return;
     if (skipNextAutosave.current) {
@@ -98,12 +158,12 @@ export default function Engagement({ readOnly = false }: Props) {
     setSaveStatus("dirty");
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     autosaveTimer.current = setTimeout(() => {
-      persistSession(tab + 1);
+      persistSession(lastEditedSessionRef.current);
     }, AUTOSAVE_DELAY_MS);
     return () => {
       if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     };
-  }, [sessionDrafts, tab, readOnly, id, persistSession]);
+  }, [sessionDrafts, readOnly, id, persistSession]);
 
   const handleManualSave = async () => {
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
@@ -112,11 +172,137 @@ export default function Engagement({ readOnly = false }: Props) {
   };
 
   const updateDraft = (sessionNum: number, section: string, value: any) => {
+    lastEditedSessionRef.current = sessionNum;
     setSessionDrafts((prev) => ({
       ...prev,
       [sessionNum]: { ...prev[sessionNum], [section]: value },
     }));
   };
+
+  // --- ServiceNow URL: edited inline in Section 1, autosaved separately ---
+  // Lives in `meta` like the rest of the engagement metadata, but has its own
+  // autosave path because it's not part of the dialog flow.
+  const snUrlSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const snUrlInitialLoad = useRef(true);
+
+  const updateServiceNowUrl = useCallback((value: string) => {
+    setMeta((prev) => ({ ...prev, servicenow_ticket_url: value }));
+  }, []);
+
+  useEffect(() => {
+    if (readOnly || !id) return;
+    if (snUrlInitialLoad.current) {
+      snUrlInitialLoad.current = false;
+      return;
+    }
+    setSaveStatus("dirty");
+    if (snUrlSaveTimer.current) clearTimeout(snUrlSaveTimer.current);
+    snUrlSaveTimer.current = setTimeout(async () => {
+      setSaveStatus("saving");
+      try {
+        const res = await api.updateEngagement(
+          id,
+          { ...meta, status: data?.status || "in_progress" },
+          updatedAtRef.current,
+        );
+        if (res.updated_at) updatedAtRef.current = res.updated_at;
+        setData((prev: any) => (prev ? { ...prev, servicenow_ticket_url: meta.servicenow_ticket_url } : prev));
+        setSaveStatus("saved");
+      } catch (err: any) {
+        setSaveStatus("error");
+        const msg = err?.message || "unknown";
+        if (msg.toLowerCase().includes("updated by another user")) {
+          setToast("This engagement was updated elsewhere. Reloading...");
+          await load();
+        } else {
+          setToast(`Error saving ServiceNow link: ${msg}`);
+        }
+      }
+    }, AUTOSAVE_DELAY_MS);
+    return () => {
+      if (snUrlSaveTimer.current) clearTimeout(snUrlSaveTimer.current);
+    };
+  }, [meta.servicenow_ticket_url, readOnly, id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // --- Engagement metadata edit dialog ---
+  const [editOpen, setEditOpen] = useState(false);
+  const [draftMeta, setDraftMeta] = useState<EngagementMeta>(meta);
+  const [savingMeta, setSavingMeta] = useState(false);
+  const [nameAvailable, setNameAvailable] = useState<boolean | null>(null);
+  const [nameChecking, setNameChecking] = useState(false);
+  const nameCheckTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  const openEdit = () => {
+    setDraftMeta(meta);
+    setMetaError("");
+    setNameAvailable(null);
+    setEditOpen(true);
+  };
+  const closeEdit = () => {
+    if (nameCheckTimer.current) clearTimeout(nameCheckTimer.current);
+    setEditOpen(false);
+  };
+  const updateDraftMeta = (field: keyof EngagementMeta, value: string) => {
+    setDraftMeta((prev) => ({ ...prev, [field]: value }));
+  };
+
+  // Real-time name availability check (excludes the current engagement so the
+  // BO can save without renaming).
+  useEffect(() => {
+    if (!editOpen || !id || !draftMeta.genie_space_name.trim()) {
+      setNameAvailable(null);
+      return;
+    }
+    if (draftMeta.genie_space_name.trim() === meta.genie_space_name.trim()) {
+      // Unchanged — no need to flag it as available/unavailable
+      setNameAvailable(null);
+      return;
+    }
+    if (nameCheckTimer.current) clearTimeout(nameCheckTimer.current);
+    setNameChecking(true);
+    nameCheckTimer.current = setTimeout(async () => {
+      try {
+        const res = await api.checkNameAvailable(draftMeta.genie_space_name.trim(), id);
+        setNameAvailable(res.available);
+      } catch {
+        setNameAvailable(null);
+      }
+      setNameChecking(false);
+    }, 400);
+    return () => {
+      if (nameCheckTimer.current) clearTimeout(nameCheckTimer.current);
+    };
+  }, [draftMeta.genie_space_name, editOpen, id, meta.genie_space_name]);
+
+  const draftNameValid = !!draftMeta.genie_space_name.trim() && nameAvailable !== false;
+  const canSaveMeta = draftNameValid && !savingMeta;
+
+  const saveMeta = async () => {
+    if (!id || !canSaveMeta) return;
+    setSavingMeta(true);
+    setMetaError("");
+    try {
+      const res = await api.updateEngagement(
+        id,
+        { ...draftMeta, status: data?.status || "in_progress" },
+        updatedAtRef.current,
+      );
+      if (res.updated_at) updatedAtRef.current = res.updated_at;
+      setMeta(draftMeta);
+      setData((prev: any) => (prev ? { ...prev, ...draftMeta } : prev));
+      setSaveStatus("saved");
+      setEditOpen(false);
+    } catch (err: any) {
+      const msg = err?.message || "Save failed";
+      if (msg.toLowerCase().includes("updated by another user")) {
+        setMetaError("This engagement was updated elsewhere. Close this dialog and refresh.");
+      } else {
+        setMetaError(msg);
+      }
+    }
+    setSavingMeta(false);
+  };
+
 
   if (loading) {
     return (
@@ -169,9 +355,17 @@ export default function Engagement({ readOnly = false }: Props) {
         <IconButton onClick={() => nav("/")} size="small">
           <ArrowBackIcon />
         </IconButton>
-        <Typography variant="h5" sx={{ flexGrow: 1 }}>
+        <Typography variant="h5">
           {data.genie_space_name || "Untitled Space"}
         </Typography>
+        {!readOnly && (
+          <Tooltip title="Edit engagement info">
+            <IconButton size="small" onClick={openEdit} sx={{ ml: 0.5 }}>
+              <EditIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        )}
+        <Box sx={{ flexGrow: 1 }} />
         {renderSaveIndicator()}
         {readOnly && (
           <Chip icon={<LockIcon />} label="Read-Only View" color="info" size="small" />
@@ -183,9 +377,30 @@ export default function Engagement({ readOnly = false }: Props) {
         />
       </Box>
 
-      <Typography variant="body2" color="text.secondary" sx={{ ml: 6, mb: 3 }}>
-        Owner: {data.business_owner_name} &middot; Analyst: {data.analyst_name}
-      </Typography>
+      <Stack
+        direction="row"
+        alignItems="center"
+        spacing={1}
+        sx={{ ml: 6, mb: 3, color: "text.secondary", fontSize: 14 }}
+      >
+        <Typography variant="body2" color="text.secondary">
+          Owner: {data.business_owner_name} &middot; Analyst: {data.analyst_name}
+        </Typography>
+        {data.servicenow_ticket_url && (
+          <>
+            <Typography variant="body2" color="text.secondary">&middot;</Typography>
+            <Link
+              href={data.servicenow_ticket_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              variant="body2"
+              sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}
+            >
+              ServiceNow ticket <OpenInNewIcon sx={{ fontSize: 12 }} />
+            </Link>
+          </>
+        )}
+      </Stack>
 
       {/* Session Tabs */}
       <Paper sx={{ mb: 2 }}>
@@ -214,7 +429,13 @@ export default function Engagement({ readOnly = false }: Props) {
 
       {/* Session Content */}
       <Box sx={{ mb: 3 }}>
-        {tab === 0 && <Session1Form {...sessionProps(1)} />}
+        {tab === 0 && (
+          <Session1Form
+            {...sessionProps(1)}
+            serviceNowUrl={meta.servicenow_ticket_url}
+            onServiceNowUrlChange={updateServiceNowUrl}
+          />
+        )}
         {tab === 1 && <Session2Form {...sessionProps(2)} />}
         {tab === 2 && (
           <Session3Form
@@ -240,6 +461,7 @@ export default function Engagement({ readOnly = false }: Props) {
             session3Data={sessionDrafts[3]}
             session4Data={sessionDrafts[4]}
             engagementId={id}
+            onPushed={(ts) => { updatedAtRef.current = ts; }}
           />
         )}
         {tab === 5 && <Session6Form {...sessionProps(6)} />}
@@ -265,6 +487,86 @@ export default function Engagement({ readOnly = false }: Props) {
         onClose={() => setToast("")}
         message={toast}
       />
+
+      {/* Edit Engagement Info dialog -- triggered by the pencil next to the title */}
+      <Dialog open={editOpen} onClose={closeEdit} maxWidth="sm" fullWidth>
+        <DialogTitle>Edit Engagement Info</DialogTitle>
+        <DialogContent>
+          {metaError && (
+            <Alert severity="error" sx={{ mb: 2 }} onClose={() => setMetaError("")}>
+              {metaError}
+            </Alert>
+          )}
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField
+              label="Genie Space Name"
+              value={draftMeta.genie_space_name}
+              onChange={(e) => updateDraftMeta("genie_space_name", e.target.value)}
+              required
+              fullWidth
+              size="small"
+              error={nameAvailable === false || !draftMeta.genie_space_name.trim()}
+              helperText={
+                !draftMeta.genie_space_name.trim()
+                  ? "Required"
+                  : nameChecking
+                    ? "Checking availability..."
+                    : nameAvailable === false
+                      ? "Another engagement already uses this name"
+                      : nameAvailable === true
+                        ? "Name is available"
+                        : "Used as the unique identifier across all engagements"
+              }
+            />
+
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
+              <TextField
+                label="Business Owner Name"
+                value={draftMeta.business_owner_name}
+                onChange={(e) => updateDraftMeta("business_owner_name", e.target.value)}
+                fullWidth
+                size="small"
+              />
+              <TextField
+                label="Business Owner Email"
+                value={draftMeta.business_owner_email}
+                onChange={(e) => updateDraftMeta("business_owner_email", e.target.value)}
+                fullWidth
+                size="small"
+                type="email"
+              />
+            </Stack>
+
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
+              <TextField
+                label="Analyst Name"
+                value={draftMeta.analyst_name}
+                onChange={(e) => updateDraftMeta("analyst_name", e.target.value)}
+                fullWidth
+                size="small"
+              />
+              <TextField
+                label="Analyst Email"
+                value={draftMeta.analyst_email}
+                onChange={(e) => updateDraftMeta("analyst_email", e.target.value)}
+                fullWidth
+                size="small"
+                type="email"
+              />
+            </Stack>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={closeEdit} disabled={savingMeta}>Cancel</Button>
+          <Button
+            variant="contained"
+            onClick={saveMeta}
+            disabled={!canSaveMeta}
+          >
+            {savingMeta ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }

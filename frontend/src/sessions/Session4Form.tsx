@@ -14,10 +14,57 @@ import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
+import ReactMarkdown from "react-markdown";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
-import { api, BenchmarkQuestion } from "../api";
+import { api, pollJob, BenchmarkQuestion, BriefGap, AnalystCommentary } from "../api";
 import type { ColumnDef } from "../types";
+
+// --- Gap-matching helpers (for preserving analyst responses across regenerations) ---
+function slug(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function tokens(s: string): Set<string> {
+  return new Set(s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter(Boolean));
+}
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (!a.size && !b.size) return 0;
+  let inter = 0;
+  a.forEach((t) => b.has(t) && inter++);
+  return inter / (a.size + b.size - inter);
+}
+function findCarryoverKey(
+  gapId: string,
+  gapTitle: string,
+  oldResponses: Record<string, string>,
+  oldTitleByKey: Record<string, string>,
+): string | null {
+  if (oldResponses[gapId]) return gapId;
+  const newTokens = tokens(gapTitle);
+  let bestKey: string | null = null;
+  let bestScore = 0;
+  for (const k of Object.keys(oldResponses)) {
+    const oldTitle = oldTitleByKey[k] || k.replace(/-/g, " ");
+    const score = jaccard(newTokens, tokens(oldTitle));
+    if (score > bestScore) {
+      bestScore = score;
+      bestKey = k;
+    }
+  }
+  return bestScore >= 0.5 ? bestKey : null;
+}
+function normalizeCommentary(raw: any): AnalystCommentary {
+  if (!raw) return { gap_responses: {}, resolved_gaps: {} };
+  if (typeof raw === "string") {
+    // Frontend received a string somehow (legacy load path). Preserve text.
+    return { gap_responses: {}, resolved_gaps: {}, legacy_notes: raw };
+  }
+  return {
+    gap_responses: raw.gap_responses || {},
+    resolved_gaps: raw.resolved_gaps || {},
+    legacy_notes: raw.legacy_notes || undefined,
+  };
+}
 
 const DATA_PLAN_COLS: ColumnDef[] = [
   { key: "table_or_view", label: "Table / Metric View", type: "uc_table" },
@@ -42,6 +89,9 @@ export default function Session4Form({
 }: Props) {
   const [summary, setSummary] = useState("");
   const [loadingSummary, setLoadingSummary] = useState(false);
+  const [briefError, setBriefError] = useState("");
+  const [briefElapsed, setBriefElapsed] = useState(0);
+  const [currentGaps, setCurrentGaps] = useState<BriefGap[]>([]);
   const [approvalNotes, setApprovalNotes] = useState("");
   const [draftingBenchmarks, setDraftingBenchmarks] = useState(false);
   const [draftingSqlIdx, setDraftingSqlIdx] = useState<number | null>(null);
@@ -109,27 +159,118 @@ export default function Session4Form({
     onChange("data_plan", next);
   }, [mvFqn]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Fetch auto-summary
+  // Current analyst commentary (always normalized to structured form)
+  const commentary: AnalystCommentary = useMemo(
+    () => normalizeCommentary(data.analyst_commentary),
+    [data.analyst_commentary],
+  );
+
+  // Reconcile gaps from a fresh brief against existing analyst responses.
+  // Carry forward responses where the gap still exists; archive disappeared
+  // gaps in resolved_gaps so the analyst's writeup isn't lost.
+  const reconcileGaps = (newGaps: BriefGap[]) => {
+    const oldResponses = commentary.gap_responses || {};
+    const oldResolved = commentary.resolved_gaps || {};
+    // We don't have old titles persisted (only IDs), so use ID as proxy when
+    // matching by Jaccard. This is good enough for slug-style IDs.
+    const oldTitleByKey: Record<string, string> = {};
+    for (const k of Object.keys(oldResponses)) oldTitleByKey[k] = k.replace(/-/g, " ");
+
+    const nextResponses: Record<string, string> = {};
+    const consumedOldKeys = new Set<string>();
+
+    for (const g of newGaps) {
+      const carryKey = findCarryoverKey(g.id, g.title, oldResponses, oldTitleByKey);
+      if (carryKey) {
+        nextResponses[g.id] = oldResponses[carryKey];
+        consumedOldKeys.add(carryKey);
+      } else {
+        nextResponses[g.id] = "";
+      }
+    }
+    // Anything in oldResponses that wasn't consumed -> archive into resolved_gaps
+    const nextResolved = { ...oldResolved };
+    for (const k of Object.keys(oldResponses)) {
+      if (consumedOldKeys.has(k)) continue;
+      const text = oldResponses[k];
+      if (!text || !text.trim()) continue; // don't archive empty placeholders
+      nextResolved[k] = {
+        title: oldTitleByKey[k] || k,
+        severity: "Unknown",
+        response: text,
+      };
+    }
+    onChange("analyst_commentary", {
+      gap_responses: nextResponses,
+      resolved_gaps: nextResolved,
+    });
+  };
+
+  // Fetch auto-summary via async job runner (avoids the gateway 60s timeout).
+  // The brief LLM call frequently exceeds 60s wall-clock, which would 504 if
+  // we held a single HTTP request open. Instead: kick off a background job,
+  // then poll a fast status endpoint until the brief is ready.
   const fetchSummary = async () => {
     if (!engagementId) return;
     setLoadingSummary(true);
+    setBriefError("");
+    setBriefElapsed(0);
     try {
-      const res = await api.getAutoSummary(engagementId);
+      const { job_id } = await api.startJob("readiness_brief", {
+        engagement_id: engagementId,
+      });
+      const res = await pollJob<{
+        summary: string;
+        unacknowledged_gaps?: BriefGap[];
+      }>(job_id, {
+        intervalMs: 2000,
+        onProgress: (s) => setBriefElapsed(s),
+      });
       setSummary(res.summary);
       onChange("auto_summary", res.summary);
-    } catch {
-      setSummary("Failed to generate summary.");
+      const gaps = res.unacknowledged_gaps || [];
+      setCurrentGaps(gaps);
+      onChange("brief_unacknowledged_gaps", gaps);
+      reconcileGaps(gaps);
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      setBriefError(msg);
+      console.error("[readiness-brief] generate failed:", err);
     }
     setLoadingSummary(false);
+    setBriefElapsed(0);
+  };
+
+  // Format elapsed seconds as "0:42" / "1:15" for the button label.
+  const formatElapsed = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${s.toString().padStart(2, "0")}`;
   };
 
   useEffect(() => {
-    if (data.auto_summary) {
-      setSummary(data.auto_summary);
-    } else if (engagementId) {
-      fetchSummary();
-    }
+    if (data.auto_summary) setSummary(data.auto_summary);
+    if (data.brief_unacknowledged_gaps) setCurrentGaps(data.brief_unacknowledged_gaps);
+    if (!data.auto_summary && engagementId) fetchSummary();
   }, [engagementId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const updateGapResponse = (gapId: string, text: string) => {
+    onChange("analyst_commentary", {
+      ...commentary,
+      gap_responses: { ...(commentary.gap_responses || {}), [gapId]: text },
+    });
+  };
+
+  const severityColor = (s: string): "error" | "warning" | "info" | "default" => {
+    if (s === "High") return "error";
+    if (s === "Medium") return "warning";
+    if (s === "Low") return "info";
+    return "default";
+  };
+  const respondedCount = currentGaps.filter(
+    (g) => ((commentary.gap_responses || {})[g.id] || "").trim(),
+  ).length;
+  const resolvedEntries = Object.entries(commentary.resolved_gaps || {});
 
   // Benchmark handlers
   const updateBenchmark = (idx: number, field: keyof BenchmarkQuestion, value: any) => {
@@ -282,13 +423,46 @@ export default function Session4Form({
     next[idx] = rest;
     onChange("benchmark_questions", next);
   };
+  // Translate the backend validation field into the row's sample_result + a
+  // small "validation_status" tag the UI uses for the per-row chip.
+  type ValidationField = Awaited<ReturnType<typeof api.draftBenchmarkSql>>["validation"];
+  const applyValidationToPatch = (
+    patch: Record<string, any>,
+    validation: ValidationField | undefined,
+  ) => {
+    if (!validation) {
+      patch.validation_status = "skipped"; // no warehouse selected, or backend skipped
+      return;
+    }
+    if (validation.ran && validation.sample_result) {
+      patch.sample_result = {
+        ...validation.sample_result,
+        ran_at: new Date().toISOString(),
+        error: "",
+      };
+      patch.validation_status = validation.retried ? "retried_ok" : "ok";
+    } else if (validation.error) {
+      patch.sample_result = {
+        ran_at: new Date().toISOString(),
+        columns: [],
+        rows: [],
+        row_count: 0,
+        truncated: false,
+        limit: 50,
+        error: validation.error,
+      };
+      patch.validation_status = "failed";
+    }
+  };
+
   const draftSqlForRow = async (idx: number) => {
     if (!engagementId) return;
     const q = benchmarks[idx]?.question?.trim();
     if (!q) return;
     setDraftingSqlIdx(idx);
     try {
-      const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId);
+      const validate = !!benchmarkWarehouseId;
+      const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId, validate);
       const existing = benchmarks[idx];
       const patch: Record<string, any> = { expected_sql: res.sql };
       // Only populate notes with the plain-English explanation if the analyst
@@ -296,6 +470,7 @@ export default function Session4Form({
       if (res.explanation && !existing?.notes?.trim()) {
         patch.notes = res.explanation;
       }
+      if (validate) applyValidationToPatch(patch, res.validation);
       const next = [...benchmarks];
       next[idx] = { ...existing, ...patch };
       onChange("benchmark_questions", next);
@@ -317,10 +492,12 @@ export default function Session4Form({
       if (hasSql && hasNotes) continue; // fully filled, skip
       try {
         if (!hasSql) {
-          // Draft both SQL and plain-English summary in one call
-          const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId);
+          // Draft SQL (+ summary + auto-validate if warehouse selected) in one call
+          const validate = !!benchmarkWarehouseId;
+          const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId, validate);
           const patch: Record<string, any> = { expected_sql: res.sql };
           if (res.explanation && !hasNotes) patch.notes = res.explanation;
+          if (validate) applyValidationToPatch(patch, res.validation);
           next[i] = { ...next[i], ...patch };
         } else {
           // SQL exists but no summary — backfill from existing SQL
@@ -357,9 +534,6 @@ export default function Session4Form({
     }
   };
 
-  // Metric view YAML from Session 3
-  const metricViewYaml = session3Data?.metric_view_yaml || "";
-
   return (
     <Box>
       <Alert severity="info" sx={{ mb: 2 }}>
@@ -385,53 +559,6 @@ export default function Session4Form({
         </Alert>
       )}
 
-      {/* Analyst Commentary */}
-      <Accordion defaultExpanded>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography variant="h6">Analyst Commentary</Typography>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Summarize what you learned from the business owner, your technical approach,
-            and anything the COE should know when reviewing this engagement.
-          </Typography>
-          <ExpandableTextField
-            minRows={6}
-            placeholder="Describe your findings, approach, and recommendations for the COE..."
-            value={data.analyst_commentary || ""}
-            onChange={(v) => onChange("analyst_commentary", v)}
-            disabled={readOnly}
-            dialogTitle="Analyst Commentary"
-          />
-        </AccordionDetails>
-      </Accordion>
-
-      {/* Auto-Summary */}
-      <Accordion defaultExpanded>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography variant="h6">Sessions 1-3 Summary</Typography>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Auto-generated snapshot of what was captured in Sessions 1-3.
-          </Typography>
-          {!readOnly && (
-            <Button
-              size="small"
-              variant="outlined"
-              onClick={fetchSummary}
-              disabled={loadingSummary}
-              sx={{ mb: 2 }}
-            >
-              {loadingSummary ? "Generating..." : "Refresh Summary"}
-            </Button>
-          )}
-          <Paper variant="outlined" sx={{ p: 2, bgcolor: "grey.50", whiteSpace: "pre-wrap", fontSize: 14 }}>
-            {summary || "No summary available. Click Refresh to generate."}
-          </Paper>
-        </AccordionDetails>
-      </Accordion>
-
       {/* Data Plan */}
       <Accordion defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
@@ -447,7 +574,9 @@ export default function Session4Form({
         <AccordionDetails>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
             Tables and metric views that will be included in the Genie Space. Pre-populated
-            from Session 3. Add additional tables or metric views you have created.
+            from Session 3. Add additional tables or metric views you have created. The Readiness
+            Brief below uses this data plan as one of its inputs -- regenerate the brief after
+            any changes here.
           </Typography>
           <EditableTable
             columns={DATA_PLAN_COLS}
@@ -455,6 +584,183 @@ export default function Session4Form({
             onChange={(rows) => onChange("data_plan", rows)}
             readOnly={readOnly}
           />
+        </AccordionDetails>
+      </Accordion>
+
+      {/* Readiness Brief */}
+      <Accordion defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Stack direction="row" alignItems="center" spacing={1}>
+            <Typography variant="h6">Readiness Brief</Typography>
+            <Chip label="AI-generated" size="small" variant="outlined" icon={<AutoAwesomeIcon />} />
+          </Stack>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Citation-backed synthesis of Sessions 1-3 plus the Data Plan above. Includes coverage
+            analysis (which Question Bank items the design answers) and an explicit gaps section
+            that distinguishes analyst-acknowledged gaps from unacknowledged coverage failures.
+            Regenerate after any change to Sessions 1-3 or the Data Plan.
+          </Typography>
+          {!readOnly && (
+            <Button
+              size="small"
+              variant="outlined"
+              startIcon={loadingSummary ? <CircularProgress size={14} /> : <AutoAwesomeIcon />}
+              onClick={fetchSummary}
+              disabled={loadingSummary}
+              sx={{ mb: 2 }}
+            >
+              {loadingSummary
+                ? `Generating... ${formatElapsed(briefElapsed)}`
+                : (summary ? "Regenerate Brief" : "Generate Brief")}
+            </Button>
+          )}
+          {briefError && (
+            <Alert severity="error" sx={{ mb: 2 }} onClose={() => setBriefError("")}>
+              <strong>Brief generation failed:</strong>{" "}
+              <Box component="span" sx={{ fontFamily: "monospace", fontSize: 12 }}>
+                {briefError}
+              </Box>
+            </Alert>
+          )}
+          <Paper
+            variant="outlined"
+            sx={{
+              p: 3,
+              bgcolor: "grey.50",
+              fontSize: 14,
+              "& h1": { fontSize: "1.4rem", mt: 2, mb: 1 },
+              "& h2": { fontSize: "1.2rem", mt: 2.5, mb: 1, borderBottom: "1px solid", borderColor: "divider", pb: 0.5 },
+              "& h3": { fontSize: "1.05rem", mt: 2, mb: 0.5 },
+              "& p": { my: 1, lineHeight: 1.6 },
+              "& ul, & ol": { pl: 3, my: 1 },
+              "& li": { my: 0.25 },
+              "& code": { bgcolor: "grey.200", px: 0.5, borderRadius: 0.5, fontSize: "0.9em" },
+              "& pre": { bgcolor: "grey.900", color: "grey.100", p: 1.5, borderRadius: 1, overflowX: "auto" },
+              "& pre code": { bgcolor: "transparent", color: "inherit" },
+              "& strong": { fontWeight: 600 },
+            }}
+          >
+            {summary
+              ? <ReactMarkdown>{summary}</ReactMarkdown>
+              : <Typography variant="body2" color="text.secondary">No brief generated yet. Click Generate to synthesize Sessions 1-4 into a COE-ready brief.</Typography>}
+          </Paper>
+        </AccordionDetails>
+      </Accordion>
+
+      {/* Analyst Commentary -- structured gap responses */}
+      <Accordion defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Stack direction="row" alignItems="center" spacing={1}>
+            <Typography variant="h6">Analyst Commentary</Typography>
+            {currentGaps.length > 0 && (
+              <Chip
+                label={`${respondedCount} of ${currentGaps.length} addressed`}
+                size="small"
+                color={respondedCount === currentGaps.length ? "success" : "default"}
+              />
+            )}
+          </Stack>
+        </AccordionSummary>
+        <AccordionDetails>
+          {commentary.legacy_notes && (
+            <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
+              <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Legacy Notes (read-only)</Typography>
+              <Typography
+                variant="body2"
+                sx={{ whiteSpace: "pre-wrap", fontStyle: "italic" }}
+              >
+                {commentary.legacy_notes}
+              </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+                This text was saved before the structured per-gap commentary was introduced.
+                Copy whatever's still relevant into the gap response cards below.
+              </Typography>
+            </Alert>
+          )}
+          {currentGaps.length === 0 ? (
+            <Alert severity="info" variant="outlined">
+              {summary
+                ? "The Readiness Brief did not surface any unacknowledged gaps. Nothing to comment on here -- you're good to proceed."
+                : "Generate the Readiness Brief above to surface gaps. Each unacknowledged gap will appear here as a card for you to respond to."}
+            </Alert>
+          ) : (
+            <>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Each unacknowledged gap from the Readiness Brief is below. Explain to the COE why
+                each gap exists, how it will be addressed, or why it can ship as-is. Your responses
+                are preserved when you regenerate the brief, even if titles shift slightly.
+              </Typography>
+              <Stack spacing={2}>
+                {currentGaps.map((g) => {
+                  const resp = (commentary.gap_responses || {})[g.id] || "";
+                  return (
+                    <Paper key={g.id} variant="outlined" sx={{ p: 2 }}>
+                      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+                        <Chip label={g.severity} size="small" color={severityColor(g.severity)} />
+                        <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+                          {g.title}
+                        </Typography>
+                      </Stack>
+                      {g.summary && (
+                        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                          {g.summary}
+                        </Typography>
+                      )}
+                      {g.citations && g.citations.length > 0 && (
+                        <Stack direction="row" spacing={0.5} sx={{ mb: 1.5, flexWrap: "wrap", gap: 0.5 }}>
+                          {g.citations.map((c, i) => (
+                            <Chip key={i} label={c} size="small" variant="outlined" sx={{ fontSize: 11 }} />
+                          ))}
+                        </Stack>
+                      )}
+                      <ExpandableTextField
+                        minRows={2}
+                        placeholder="How will this gap be addressed? Why is it acceptable to ship as-is? What's the analyst's take?"
+                        value={resp}
+                        onChange={(v) => updateGapResponse(g.id, v)}
+                        disabled={readOnly}
+                        dialogTitle={`Response: ${g.title}`}
+                      />
+                    </Paper>
+                  );
+                })}
+              </Stack>
+              {resolvedEntries.length > 0 && (
+                <Accordion sx={{ mt: 2 }}>
+                  <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                    <Stack direction="row" alignItems="center" spacing={1}>
+                      <Typography variant="subtitle2" color="text.secondary">
+                        Resolved Gaps (archived)
+                      </Typography>
+                      <Chip label={resolvedEntries.length} size="small" />
+                    </Stack>
+                  </AccordionSummary>
+                  <AccordionDetails>
+                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                      Gaps that were flagged in a previous brief but no longer appear. Your prior
+                      responses are preserved here for audit trail. Read-only.
+                    </Typography>
+                    <Stack spacing={1.5}>
+                      {resolvedEntries.map(([k, v]) => (
+                        <Paper key={k} variant="outlined" sx={{ p: 1.5, bgcolor: "grey.50" }}>
+                          <Typography variant="subtitle2">{v.title}</Typography>
+                          <Typography
+                            variant="body2"
+                            color="text.secondary"
+                            sx={{ mt: 0.5, whiteSpace: "pre-wrap" }}
+                          >
+                            {v.response}
+                          </Typography>
+                        </Paper>
+                      ))}
+                    </Stack>
+                  </AccordionDetails>
+                </Accordion>
+              )}
+            </>
+          )}
         </AccordionDetails>
       </Accordion>
 
@@ -501,7 +807,7 @@ export default function Session4Form({
                 onClick={handleDraftBenchmarksClick}
                 disabled={draftingBenchmarks}
               >
-                {draftingBenchmarks ? "Drafting..." : `Draft ${draftCount} Benchmarks from Sessions 1-3`}
+                {draftingBenchmarks ? "Drafting..." : `Draft ${draftCount} Benchmarks from Sessions 1-4`}
               </Button>
               <Button
                 variant="outlined"
@@ -681,6 +987,26 @@ export default function Session4Form({
                         {b.expected_sql?.trim() && (
                           <Chip label="SQL drafted" size="small" variant="outlined" sx={{ height: 20 }} />
                         )}
+                        {(b as any).validation_status === "ok" && (
+                          <Tooltip title="SQL was validated against the warehouse on draft and ran successfully.">
+                            <Chip label="Validated" size="small" color="success" variant="outlined" sx={{ height: 20 }} />
+                          </Tooltip>
+                        )}
+                        {(b as any).validation_status === "retried_ok" && (
+                          <Tooltip title="First draft failed; auto-retry succeeded with corrected SQL.">
+                            <Chip label="Validated (retried)" size="small" color="success" variant="outlined" sx={{ height: 20 }} />
+                          </Tooltip>
+                        )}
+                        {(b as any).validation_status === "failed" && (
+                          <Tooltip title="SQL failed validation against the warehouse, even after one auto-retry. Edit and re-run manually.">
+                            <Chip label="Validation failed" size="small" color="error" variant="outlined" sx={{ height: 20 }} />
+                          </Tooltip>
+                        )}
+                        {(b as any).validation_status === "skipped" && (
+                          <Tooltip title="No SQL warehouse was selected at draft time, so the SQL wasn't auto-validated. Pick a warehouse and click Run to validate.">
+                            <Chip label="Not validated" size="small" variant="outlined" sx={{ height: 20 }} />
+                          </Tooltip>
+                        )}
                       </Stack>
                       <ExpandableTextField
                         value={b.expected_sql || ""}
@@ -782,31 +1108,8 @@ export default function Session4Form({
           )}
           {benchmarks.length === 0 && (
             <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-              No benchmarks yet. Click "Draft Benchmarks from Sessions 1-3" to seed a starting set.
+              No benchmarks yet. Click "Draft Benchmarks from Sessions 1-4" to seed a starting set.
             </Typography>
-          )}
-        </AccordionDetails>
-      </Accordion>
-
-      {/* Metric View YAML */}
-      <Accordion defaultExpanded={!!metricViewYaml}>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography variant="h6">Recommended Metric View</Typography>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Generated metric view YAML from Session 3 based on the SQL expressions defined.
-            The analyst should create this metric view in the workspace before requesting approval.
-          </Typography>
-          {metricViewYaml ? (
-            <Paper variant="outlined" sx={{ p: 2, bgcolor: "grey.900", color: "grey.100", fontFamily: "monospace", fontSize: 13, whiteSpace: "pre-wrap", overflowX: "auto" }}>
-              {metricViewYaml}
-            </Paper>
-          ) : (
-            <Alert severity="info">
-              No metric view YAML has been generated yet. Complete Session 3's SQL Expressions
-              section to generate a recommendation.
-            </Alert>
           )}
         </AccordionDetails>
       </Accordion>
@@ -849,6 +1152,41 @@ export default function Session4Form({
                 Review the analyst's work above. Approve to unlock Sessions 5 & 6,
                 or request changes with specific feedback.
               </Typography>
+
+              {/* Analyst gap responses summary -- read-only */}
+              {currentGaps.length > 0 && (
+                <Paper variant="outlined" sx={{ p: 2, mb: 2, bgcolor: "grey.50" }}>
+                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5 }}>
+                    <Typography variant="subtitle2">Analyst's Responses to Flagged Gaps</Typography>
+                    <Chip
+                      label={`${respondedCount} of ${currentGaps.length} addressed`}
+                      size="small"
+                      color={respondedCount === currentGaps.length ? "success" : "default"}
+                    />
+                  </Stack>
+                  <Stack spacing={1}>
+                    {currentGaps.map((g) => {
+                      const resp = ((commentary.gap_responses || {})[g.id] || "").trim();
+                      return (
+                        <Box key={g.id} sx={{ pl: 1, borderLeft: "3px solid", borderColor: severityColor(g.severity) === "default" ? "grey.400" : `${severityColor(g.severity)}.main` }}>
+                          <Stack direction="row" alignItems="center" spacing={1}>
+                            <Chip label={g.severity} size="small" color={severityColor(g.severity)} sx={{ height: 20 }} />
+                            <Typography variant="body2" sx={{ fontWeight: 600 }}>{g.title}</Typography>
+                          </Stack>
+                          <Typography
+                            variant="body2"
+                            color={resp ? "text.primary" : "text.secondary"}
+                            sx={{ mt: 0.5, fontStyle: resp ? "normal" : "italic", whiteSpace: "pre-wrap" }}
+                          >
+                            {resp || "No response from analyst yet"}
+                          </Typography>
+                        </Box>
+                      );
+                    })}
+                  </Stack>
+                </Paper>
+              )}
+
               <TextField
                 multiline
                 minRows={3}

@@ -1,5 +1,10 @@
-import { Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert } from "@mui/material";
+import {
+  Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert,
+  TextField, InputAdornment, Link, Tooltip,
+} from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import LinkIcon from "@mui/icons-material/Link";
+import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import EditableTable from "../components/EditableTable";
 import type { ColumnDef } from "../types";
 
@@ -30,17 +35,35 @@ const REPORT_COLS: ColumnDef[] = [
   { key: "known_issues", label: "Known Issues", type: "textarea" },
 ];
 
+const isValidHttpUrl = (s: string) => {
+  if (!s.trim()) return true;
+  try {
+    const u = new URL(s);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
 
 interface Props {
   data: Record<string, any>;
   onChange: (section: string, rows: any[]) => void;
   readOnly?: boolean;
+  serviceNowUrl?: string;
+  onServiceNowUrlChange?: (value: string) => void;
 }
 
-export default function Session1Form({ data, onChange, readOnly }: Props) {
+export default function Session1Form({
+  data, onChange, readOnly, serviceNowUrl, onServiceNowUrlChange,
+}: Props) {
   const context = data.business_context?.length
     ? data.business_context
     : CONTEXT_QUESTIONS.map((q) => ({ ...q, response: "" }));
+
+  const url = serviceNowUrl || "";
+  const urlValid = isValidHttpUrl(url);
+  const urlEditable = !readOnly && !!onServiceNowUrlChange;
 
   return (
     <Box>
@@ -48,6 +71,41 @@ export default function Session1Form({ data, onChange, readOnly }: Props) {
         <strong>Session Goal:</strong> Understand the team, their workflow, their pain points, and the vocabulary they use.
         You should leave this session knowing enough to scope the Genie Space and begin drafting the question bank.
       </Alert>
+
+      {urlEditable && (
+        <Box sx={{ mb: 2 }}>
+          <TextField
+            label="ServiceNow Ticket URL"
+            value={url}
+            onChange={(e) => onServiceNowUrlChange?.(e.target.value)}
+            placeholder="https://yourorg.service-now.com/..."
+            fullWidth
+            size="small"
+            error={!urlValid}
+            helperText={
+              !urlValid
+                ? "Enter a valid http(s) URL or leave blank"
+                : "Optional. Link to the originating ServiceNow ticket. Autosaves."
+            }
+            InputProps={{
+              startAdornment: (
+                <InputAdornment position="start">
+                  <LinkIcon fontSize="small" />
+                </InputAdornment>
+              ),
+              endAdornment: url && urlValid ? (
+                <InputAdornment position="end">
+                  <Tooltip title="Open ticket in new tab">
+                    <Link href={url} target="_blank" rel="noopener noreferrer">
+                      <OpenInNewIcon fontSize="small" />
+                    </Link>
+                  </Tooltip>
+                </InputAdornment>
+              ) : null,
+            }}
+          />
+        </Box>
+      )}
 
       <Accordion defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>

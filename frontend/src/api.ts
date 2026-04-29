@@ -45,6 +45,24 @@ export interface BenchmarkQuestion {
   sample_result?: BenchmarkSampleResult;
 }
 
+export interface BriefGap {
+  id: string;
+  title: string;
+  severity: "Low" | "Medium" | "High";
+  summary: string;
+  citations: string[];
+}
+
+export interface AnalystCommentary {
+  gap_responses?: Record<string, string>;
+  resolved_gaps?: Record<string, { title: string; severity: string; response: string }>;
+  /**
+   * Free-form text from a pre-structured-commentary engagement, preserved
+   * verbatim so it doesn't disappear at upgrade time. Read-only.
+   */
+  legacy_notes?: string;
+}
+
 async function json<T>(url: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${url}`, {
     headers: { "Content-Type": "application/json" },
@@ -57,8 +75,75 @@ async function json<T>(url: string, opts?: RequestInit): Promise<T> {
   return res.json();
 }
 
+// --- Async job runner client helper ---
+//
+// Backend runs long LLM tasks in background threads; we kick them off via
+// startJob() then poll until done. This avoids the ~60s gateway timeout that
+// long sync HTTP requests hit.
+
+export interface JobStatus<T> {
+  state: "pending" | "done" | "failed";
+  task_type: string;
+  result: T | null;
+  error: string | null;
+  age_seconds: number;
+}
+
+export async function pollJob<T>(
+  jobId: string,
+  opts?: {
+    intervalMs?: number;
+    timeoutMs?: number;
+    onProgress?: (ageSeconds: number) => void;
+    signal?: AbortSignal;
+  },
+): Promise<T> {
+  const interval = opts?.intervalMs ?? 2000;
+  const timeout = opts?.timeoutMs ?? 600000; // 10 min ceiling
+  const start = Date.now();
+
+  while (true) {
+    if (opts?.signal?.aborted) throw new Error("Cancelled");
+    if (Date.now() - start > timeout) throw new Error("Job timed out (client-side)");
+
+    const status = await json<JobStatus<T>>(`/jobs/${jobId}`);
+    opts?.onProgress?.(status.age_seconds);
+
+    if (status.state === "done") return status.result as T;
+    if (status.state === "failed") throw new Error(status.error || "Job failed");
+
+    await new Promise<void>((resolve) => setTimeout(resolve, interval));
+  }
+}
+
+/** One-shot helper: kick off a background task and resolve when it's done.
+ *  Use for any LLM call that might exceed the gateway's ~60s sync timeout.
+ */
+export async function runJob<T>(
+  task_type: string,
+  payload: Record<string, unknown>,
+  opts?: {
+    onProgress?: (ageSeconds: number) => void;
+    intervalMs?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  },
+): Promise<T> {
+  const { job_id } = await json<{ job_id: string }>("/jobs/start", {
+    method: "POST",
+    body: JSON.stringify({ task_type, payload }),
+  });
+  return pollJob<T>(job_id, opts);
+}
+
 export const api = {
   getUser: () => json<{ email: string }>("/user"),
+
+  startJob: (task_type: string, payload: Record<string, unknown>) =>
+    json<{ job_id: string }>("/jobs/start", {
+      method: "POST",
+      body: JSON.stringify({ task_type, payload }),
+    }),
 
   listWarehouses: () =>
     json<{ id: string; name: string; state: string; size: string; type: string }[]>("/warehouses"),
@@ -67,8 +152,11 @@ export const api = {
 
   listEngagements: () => json<Record<string, string>[]>("/engagements"),
 
-  checkNameAvailable: (name: string) =>
-    json<{ available: boolean }>(`/engagements/check-name?name=${encodeURIComponent(name)}`),
+  checkNameAvailable: (name: string, excludeEid?: string) => {
+    const params = new URLSearchParams({ name });
+    if (excludeEid) params.set("exclude_eid", excludeEid);
+    return json<{ available: boolean }>(`/engagements/check-name?${params.toString()}`);
+  },
 
   createEngagement: (data: Record<string, string>) =>
     json<{ engagement_id: string }>("/engagements", {
@@ -79,20 +167,38 @@ export const api = {
   getEngagement: (id: string) =>
     json<Record<string, unknown>>(`/engagements/${id}`),
 
-  updateEngagement: (id: string, data: Record<string, unknown>) =>
-    json<{ success: boolean }>(`/engagements/${id}`, {
-      method: "PUT",
-      body: JSON.stringify(data),
-    }),
+  updateEngagement: (
+    id: string,
+    data: Record<string, unknown>,
+    ifMatch?: string,
+  ) => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (ifMatch) headers["If-Match"] = ifMatch;
+    return json<{ success: boolean; updated_at?: string }>(
+      `/engagements/${id}`,
+      { method: "PUT", headers, body: JSON.stringify(data) },
+    );
+  },
 
   deleteEngagement: (id: string) =>
     json<{ success: boolean }>(`/engagements/${id}`, { method: "DELETE" }),
 
-  saveSession: (id: string, sessionNum: number, data: Record<string, unknown>) =>
-    json<{ success: boolean }>(`/engagements/${id}/sessions/${sessionNum}`, {
-      method: "PUT",
-      body: JSON.stringify(data),
-    }),
+  /** Save a session. If `ifMatch` is provided (the engagement's last-known
+   * updated_at), the server returns 409 if the row has been changed by
+   * another user since. Returns the new updated_at on success. */
+  saveSession: (
+    id: string,
+    sessionNum: number,
+    data: Record<string, unknown>,
+    ifMatch?: string,
+  ) => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (ifMatch) headers["If-Match"] = ifMatch;
+    return json<{ success: boolean; updated_at?: string }>(
+      `/engagements/${id}/sessions/${sessionNum}`,
+      { method: "PUT", headers, body: JSON.stringify(data) },
+    );
+  },
 
   coeApprove: (id: string, data: { status: string; notes: string }) =>
     json<{ success: boolean }>(`/engagements/${id}/coe-approve`, {
@@ -100,17 +206,43 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  draftBenchmarks: (id: string, count?: number) =>
-    json<{ benchmarks: BenchmarkQuestion[] }>(`/engagements/${id}/draft-benchmarks`, {
-      method: "POST",
-      body: JSON.stringify({ count: count ?? 12 }),
-    }),
+  draftBenchmarks: (
+    id: string,
+    count?: number,
+    onProgress?: (s: number) => void,
+  ) =>
+    runJob<{ benchmarks: BenchmarkQuestion[] }>(
+      "draft_benchmarks",
+      { engagement_id: id, count: count ?? 12 },
+      { onProgress },
+    ),
 
-  draftBenchmarkSql: (id: string, question: string, warehouse_id?: string) =>
-    json<{ sql: string; explanation?: string }>(`/engagements/${id}/draft-benchmark-sql`, {
-      method: "POST",
-      body: JSON.stringify({ question, warehouse_id: warehouse_id || "" }),
-    }),
+  draftBenchmarkSql: (
+    id: string,
+    question: string,
+    warehouse_id?: string,
+    validate?: boolean,
+    onProgress?: (s: number) => void,
+  ) =>
+    runJob<{
+      sql: string;
+      explanation?: string;
+      validation?: {
+        ran: boolean;
+        error: string | null;
+        retried: boolean;
+        sample_result: BenchmarkSampleResult | null;
+      } | null;
+    }>(
+      "draft_benchmark_sql",
+      {
+        engagement_id: id,
+        question,
+        warehouse_id: warehouse_id || "",
+        validate: !!validate,
+      },
+      { onProgress },
+    ),
 
   draftBenchmarkSummary: (id: string, question: string, sql: string) =>
     json<{ explanation: string }>(`/engagements/${id}/draft-benchmark-summary`, {
@@ -132,10 +264,17 @@ export const api = {
     }),
 
   getAutoSummary: (id: string) =>
-    json<{ summary: string }>(`/engagements/${id}/auto-summary`),
-
-  generatePlan: (id: string, warehouse_id?: string) =>
     json<{
+      summary: string;
+      unacknowledged_gaps?: BriefGap[];
+    }>(`/engagements/${id}/auto-summary`),
+
+  generatePlan: (
+    id: string,
+    warehouse_id?: string,
+    onProgress?: (s: number) => void,
+  ) =>
+    runJob<{
       general_instructions: string;
       sample_questions: string[];
       sql_filters: SqlSnippet[];
@@ -145,15 +284,21 @@ export const api = {
       joins: UcJoin[];
       narrative: string;
       warnings?: string[];
-    }>(`/engagements/${id}/generate-plan`, {
-      method: "POST",
-      body: JSON.stringify({ warehouse_id: warehouse_id || "" }),
-    }),
+    }>(
+      "generate_plan",
+      { engagement_id: id, warehouse_id: warehouse_id || "" },
+      { onProgress },
+    ),
 
-  draftMetricViewYaml: (id: string, warehouse_id?: string) =>
-    json<{ yaml: string; source_table: string; suggested_name: string; warnings?: string[] }>(
-      `/engagements/${id}/draft-metric-view-yaml`,
-      { method: "POST", body: JSON.stringify({ warehouse_id: warehouse_id || "" }) },
+  draftMetricViewYaml: (
+    id: string,
+    warehouse_id?: string,
+    onProgress?: (s: number) => void,
+  ) =>
+    runJob<{ yaml: string; source_table: string; suggested_name: string; warnings?: string[] }>(
+      "draft_mv_yaml",
+      { engagement_id: id, warehouse_id: warehouse_id || "" },
+      { onProgress },
     ),
 
   getMvPromptPreview: (id: string) =>
@@ -218,6 +363,7 @@ export const api = {
       created?: boolean;
       updated?: boolean;
       warnings?: string[];
+      updated_at?: string;
     }>(`/engagements/${id}/push-to-genie`, {
       method: "POST",
       body: JSON.stringify(body),
