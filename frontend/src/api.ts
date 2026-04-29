@@ -127,8 +127,11 @@ export const api = {
 
   listEngagements: () => json<Record<string, string>[]>("/engagements"),
 
-  checkNameAvailable: (name: string) =>
-    json<{ available: boolean }>(`/engagements/check-name?name=${encodeURIComponent(name)}`),
+  checkNameAvailable: (name: string, excludeEid?: string) => {
+    const params = new URLSearchParams({ name });
+    if (excludeEid) params.set("exclude_eid", excludeEid);
+    return json<{ available: boolean }>(`/engagements/check-name?${params.toString()}`);
+  },
 
   createEngagement: (data: Record<string, string>) =>
     json<{ engagement_id: string }>("/engagements", {

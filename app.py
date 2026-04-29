@@ -312,6 +312,7 @@ def ensure_table():
         f"engagement_id STRING, genie_space_name STRING, "
         f"business_owner_name STRING, business_owner_email STRING, "
         f"analyst_name STRING, analyst_email STRING, "
+        f"servicenow_ticket_url STRING, "
         f"current_session INT, status STRING, "
         f"created_at STRING, updated_at STRING, "
         f"{section_ddl}"
@@ -319,6 +320,10 @@ def ensure_table():
     )
     rows = sql_exec(f"DESCRIBE TABLE {TABLE}")
     existing = {r.get("col_name", "") for r in rows}
+    # Top-level metadata columns added since v1
+    for top_col in ("servicenow_ticket_url",):
+        if top_col not in existing:
+            sql_run(f"ALTER TABLE {TABLE} ADD COLUMN {top_col} STRING")
     for col in ALL_SECTION_COLS:
         if col not in existing:
             sql_run(f"ALTER TABLE {TABLE} ADD COLUMN {col} STRING")
@@ -522,14 +527,26 @@ def list_engagements():
 
 @app.route("/api/engagements/check-name")
 def check_engagement_name():
-    """Check if an engagement name is already taken."""
+    """Check if an engagement name is already taken.
+
+    Optional `exclude_eid` query param: when renaming an existing engagement,
+    its own current name should not count as a conflict.
+    """
     name = request.args.get("name", "").strip()
+    exclude_eid = request.args.get("exclude_eid", "").strip()
     if not name:
         return jsonify({"available": False})
-    rows = sql_exec(
-        f"SELECT COUNT(*) AS cnt FROM {TABLE} WHERE genie_space_name = :name",
-        {"name": name},
-    )
+    if exclude_eid and _UUID_RE.match(exclude_eid):
+        rows = sql_exec(
+            f"SELECT COUNT(*) AS cnt FROM {TABLE} "
+            f"WHERE genie_space_name = :name AND engagement_id != :eid",
+            {"name": name, "eid": exclude_eid},
+        )
+    else:
+        rows = sql_exec(
+            f"SELECT COUNT(*) AS cnt FROM {TABLE} WHERE genie_space_name = :name",
+            {"name": name},
+        )
     count = int(rows[0]["cnt"]) if rows else 0
     return jsonify({"available": count == 0})
 
@@ -567,9 +584,10 @@ def create_engagement():
     sql_run(
         f"INSERT INTO {TABLE} "
         f"(engagement_id, genie_space_name, business_owner_name, business_owner_email, "
-        f"analyst_name, analyst_email, current_session, status, created_at, updated_at, "
+        f"analyst_name, analyst_email, servicenow_ticket_url, "
+        f"current_session, status, created_at, updated_at, "
         f"{section_cols_sql}) "
-        f"VALUES (:eid, :space_name, :bo_name, :bo_email, :a_name, :a_email, "
+        f"VALUES (:eid, :space_name, :bo_name, :bo_email, :a_name, :a_email, :sn_url, "
         f"1, 'draft', :ts, :ts, {', '.join(section_defaults)})",
         {
             "eid": eid,
@@ -578,6 +596,7 @@ def create_engagement():
             "bo_email": data.get("business_owner_email", "").strip(),
             "a_name": data.get("analyst_name", "").strip(),
             "a_email": data.get("analyst_email", "").strip(),
+            "sn_url": (data.get("servicenow_ticket_url") or "").strip(),
             "ts": ts,
             **section_params,
         },
@@ -595,22 +614,41 @@ def get_engagement(eid):
 
 @app.route("/api/engagements/<eid>", methods=["PUT"])
 def update_engagement(eid):
-    data = request.json
+    """Update engagement metadata. Validates genie_space_name uniqueness against
+    every OTHER engagement (the current row's own name does not count as a
+    conflict, so saving without renaming is always fine).
+    """
+    data = request.json or {}
+    name = (data.get("genie_space_name") or "").strip()
+    if not name:
+        return jsonify({"error": "genie_space_name is required"}), 400
+
+    # Uniqueness check, scoped to other engagements
+    dup = sql_exec(
+        f"SELECT COUNT(*) AS cnt FROM {TABLE} "
+        f"WHERE genie_space_name = :name AND engagement_id != :eid",
+        {"name": name, "eid": eid},
+    )
+    if dup and int(dup[0]["cnt"]) > 0:
+        return jsonify({"error": "An engagement with this name already exists"}), 409
+
     ts = now_ts()
     sql_run(
         f"UPDATE {TABLE} SET "
         f"genie_space_name = :space_name, business_owner_name = :bo_name, "
         f"business_owner_email = :bo_email, analyst_name = :a_name, "
-        f"analyst_email = :a_email, current_session = :session_num, "
+        f"analyst_email = :a_email, servicenow_ticket_url = :sn_url, "
+        f"current_session = :session_num, "
         f"status = :status, updated_at = :ts "
         f"WHERE engagement_id = :eid",
         {
             "eid": eid,
-            "space_name": data.get("genie_space_name", ""),
-            "bo_name": data.get("business_owner_name", ""),
-            "bo_email": data.get("business_owner_email", ""),
-            "a_name": data.get("analyst_name", ""),
-            "a_email": data.get("analyst_email", ""),
+            "space_name": name,
+            "bo_name": (data.get("business_owner_name") or "").strip(),
+            "bo_email": (data.get("business_owner_email") or "").strip(),
+            "a_name": (data.get("analyst_name") or "").strip(),
+            "a_email": (data.get("analyst_email") or "").strip(),
+            "sn_url": (data.get("servicenow_ticket_url") or "").strip(),
             "session_num": str(data.get("current_session", 1)),
             "status": data.get("status", "draft"),
             "ts": ts,

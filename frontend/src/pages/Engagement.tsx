@@ -34,6 +34,15 @@ interface Props {
   readOnly?: boolean;
 }
 
+interface EngagementMeta {
+  genie_space_name: string;
+  business_owner_name: string;
+  business_owner_email: string;
+  analyst_name: string;
+  analyst_email: string;
+  servicenow_ticket_url: string;
+}
+
 export default function Engagement({ readOnly = false }: Props) {
   const { id } = useParams<{ id: string }>();
   const nav = useNavigate();
@@ -42,10 +51,21 @@ export default function Engagement({ readOnly = false }: Props) {
   const [tab, setTab] = useState(0);
   const [toast, setToast] = useState("");
   const [sessionDrafts, setSessionDrafts] = useState<Record<number, any>>({});
+  const [meta, setMeta] = useState<EngagementMeta>({
+    genie_space_name: "",
+    business_owner_name: "",
+    business_owner_email: "",
+    analyst_name: "",
+    analyst_email: "",
+    servicenow_ticket_url: "",
+  });
+  const [metaError, setMetaError] = useState<string>("");
   const [isCoeMember, setIsCoeMember] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const metaSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const skipNextAutosave = useRef(true);
+  const skipNextMetaSave = useRef(true);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -59,6 +79,7 @@ export default function Engagement({ readOnly = false }: Props) {
       setIsCoeMember(coe.is_member);
       const s = eng.sessions || {};
       skipNextAutosave.current = true;
+      skipNextMetaSave.current = true;
       setSessionDrafts({
         1: s["1"] || {},
         2: s["2"] || {},
@@ -67,6 +88,15 @@ export default function Engagement({ readOnly = false }: Props) {
         5: s["5"] || {},
         6: s["6"] || {},
       });
+      setMeta({
+        genie_space_name: String(eng.genie_space_name || ""),
+        business_owner_name: String(eng.business_owner_name || ""),
+        business_owner_email: String(eng.business_owner_email || ""),
+        analyst_name: String(eng.analyst_name || ""),
+        analyst_email: String(eng.analyst_email || ""),
+        servicenow_ticket_url: String(eng.servicenow_ticket_url || ""),
+      });
+      setMetaError("");
       setSaveStatus("idle");
     } catch {
       setData(null);
@@ -116,6 +146,41 @@ export default function Engagement({ readOnly = false }: Props) {
       ...prev,
       [sessionNum]: { ...prev[sessionNum], [section]: value },
     }));
+  };
+
+  // --- Engagement metadata save flow ---
+  const persistMeta = useCallback(async () => {
+    if (!id) return;
+    setSaveStatus("saving");
+    setMetaError("");
+    try {
+      await api.updateEngagement(id, { ...meta, status: data?.status || "in_progress" });
+      // Mirror updated name into the page header
+      setData((prev: any) => (prev ? { ...prev, ...meta } : prev));
+      setSaveStatus("saved");
+    } catch (err: any) {
+      setSaveStatus("error");
+      setMetaError(err?.message || "Save failed");
+    }
+  }, [id, meta, data?.status]);
+
+  // Debounced metadata autosave
+  useEffect(() => {
+    if (readOnly || !id) return;
+    if (skipNextMetaSave.current) {
+      skipNextMetaSave.current = false;
+      return;
+    }
+    setSaveStatus("dirty");
+    if (metaSaveTimer.current) clearTimeout(metaSaveTimer.current);
+    metaSaveTimer.current = setTimeout(() => { persistMeta(); }, AUTOSAVE_DELAY_MS);
+    return () => {
+      if (metaSaveTimer.current) clearTimeout(metaSaveTimer.current);
+    };
+  }, [meta, readOnly, id, persistMeta]);
+
+  const updateMeta = (field: keyof EngagementMeta, value: string) => {
+    setMeta((prev) => ({ ...prev, [field]: value }));
   };
 
   if (loading) {
@@ -214,7 +279,15 @@ export default function Engagement({ readOnly = false }: Props) {
 
       {/* Session Content */}
       <Box sx={{ mb: 3 }}>
-        {tab === 0 && <Session1Form {...sessionProps(1)} />}
+        {tab === 0 && (
+          <Session1Form
+            {...sessionProps(1)}
+            engagementId={id}
+            meta={meta}
+            onMetaChange={updateMeta}
+            metaError={metaError}
+          />
+        )}
         {tab === 1 && <Session2Form {...sessionProps(2)} />}
         {tab === 2 && (
           <Session3Form
