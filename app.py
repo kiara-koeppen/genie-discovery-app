@@ -145,6 +145,20 @@ JOB_TTL_SECONDS = 3600  # 1 hour
 TASK_HANDLERS = {}
 
 
+def _user_error(label, exc):
+    """Log the full exception + traceback under `label`, return a clean
+    user-facing string. Strips the exception class name prefix so the UI
+    doesn't show 'ValueError: required field missing' to non-engineers --
+    just 'required field missing'. Falls back to a generic message for
+    blank exception strings."""
+    tb = traceback.format_exc()
+    print(f"[{label}] {type(exc).__name__}: {exc}\n{tb}", flush=True)
+    msg = str(exc).strip()
+    if not msg:
+        return f"Something went wrong. Check server logs for details (label: {label})."
+    return msg
+
+
 def register_task(name):
     """Decorator: register a function as the handler for a task_type."""
     def decorator(fn):
@@ -178,12 +192,10 @@ def _run_job(job_id, task_type, payload):
                 JOBS[job_id]["state"] = "done"
                 JOBS[job_id]["result"] = result
     except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[jobs] {task_type} {job_id} failed: {e}\n{tb}", flush=True)
         with JOBS_LOCK:
             if job_id in JOBS:
                 JOBS[job_id]["state"] = "failed"
-                JOBS[job_id]["error"] = f"{type(e).__name__}: {e}"
+                JOBS[job_id]["error"] = _user_error(f"jobs:{task_type}:{job_id}", e)
 
 
 @app.route("/api/jobs/start", methods=["POST"])
@@ -944,9 +956,7 @@ def auto_summary(eid):
     except ValueError as e:
         return jsonify({"summary": "", "error": str(e)}), 404
     except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[readiness-brief sync] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": _user_error("readiness-brief sync", e)}), 500
     return jsonify(result)
 
 
@@ -1656,9 +1666,7 @@ def generate_plan(eid):
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[generate-plan sync] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": _user_error("generate-plan sync", e)}), 500
 
 
 def _do_generate_plan_inner(eid, eng, user_w, warehouse_id):
@@ -2041,9 +2049,7 @@ def draft_benchmarks(eid):
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[draft-benchmarks sync] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": _user_error("draft-benchmarks sync", e)}), 500
 
 
 def _do_draft_benchmark_sql(eid, question, warehouse_id, validate, user_token):
@@ -2091,9 +2097,7 @@ def draft_benchmark_sql(eid):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[draft-benchmark-sql sync] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": _user_error("draft-benchmark-sql sync", e)}), 500
 
 
 def _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user_w):
@@ -2302,7 +2306,7 @@ def draft_benchmark_summary(eid):
     try:
         explanation = _summarize_benchmark_sql(question, sql_text)
     except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": _user_error("draft-benchmark-summary", e)}), 500
 
     return jsonify({"explanation": explanation})
 
@@ -2838,8 +2842,7 @@ def mv_prompt_preview(eid):
         prompt = _build_mv_yaml_prompt(eng)
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[mv-prompt-preview] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": _user_error("mv-prompt-preview", e)}), 500
     return jsonify({"prompt": prompt})
 
 
@@ -2857,9 +2860,7 @@ def draft_metric_view_yaml(eid):
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[draft-mv-yaml sync] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": _user_error("draft-mv-yaml sync", e)}), 500
 
 
 def _do_draft_mv_yaml(eid, user_token, warehouse_id):
