@@ -150,6 +150,37 @@ TASK_HANDLERS = {}
 # mid-poll surfaces a real result instead of "job not found".
 JOBS_TABLE = f"{CATALOG}.{SCHEMA}.discovery_jobs"
 
+# LLM cost / usage telemetry. Every _call_llm / _call_llm_raw call appends a
+# row here so the customer can see total token spend, per-feature breakdowns,
+# and historical latency without standing up a separate dashboard. Best-effort:
+# write failures don't break the LLM call.
+LLM_USAGE_TABLE = f"{CATALOG}.{SCHEMA}.discovery_llm_usage"
+
+
+def _log_llm_usage(
+    label, endpoint, prompt_chars, output_chars, latency_ms,
+    prompt_tokens=0, completion_tokens=0, success=True, error="",
+):
+    try:
+        sql_run(
+            f"INSERT INTO {LLM_USAGE_TABLE} VALUES "
+            f"(:ts, :label, :endpoint, :pc, :oc, :pt, :ct, :lm, :ok, :err)",
+            {
+                "ts": now_ts(),
+                "label": label or "",
+                "endpoint": endpoint or "",
+                "pc": str(int(prompt_chars or 0)),
+                "oc": str(int(output_chars or 0)),
+                "pt": str(int(prompt_tokens or 0)),
+                "ct": str(int(completion_tokens or 0)),
+                "lm": str(int(latency_ms or 0)),
+                "ok": "true" if success else "false",
+                "err": str(error or "")[:500],
+            },
+        )
+    except Exception as e:
+        print(f"[llm-usage] log failed: {e}", flush=True)
+
 
 def _persist_job_state(job_id, job):
     """Mirror the current in-memory job state into the Delta jobs table.
@@ -558,6 +589,15 @@ def ensure_table():
         f"job_id STRING, task_type STRING, creator_email STRING, "
         f"state STRING, started_at DOUBLE, finished_at DOUBLE, "
         f"result STRING, error STRING"
+        f") USING DELTA"
+    )
+    # LLM cost / usage telemetry table.
+    sql_run(
+        f"CREATE TABLE IF NOT EXISTS {LLM_USAGE_TABLE} ("
+        f"ts STRING, label STRING, endpoint STRING, "
+        f"prompt_chars BIGINT, output_chars BIGINT, "
+        f"prompt_tokens BIGINT, completion_tokens BIGINT, "
+        f"latency_ms BIGINT, success BOOLEAN, error STRING"
         f") USING DELTA"
     )
 
@@ -1834,7 +1874,27 @@ def _call_llm_raw(prompt, max_tokens=16000, model=None, label=None):
     except Exception as e:
         elapsed = time.time() - started
         print(f"[{tag}] FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
+        _log_llm_usage(
+            tag, endpoint, prompt_chars, 0, int(elapsed * 1000),
+            success=False, error=f"{type(e).__name__}: {e}",
+        )
         raise
+
+    # Best-effort: pull token counts off the response if the endpoint exposes
+    # a `usage` object. Handles both raw-dict and SDK-object response shapes.
+    prompt_tokens = 0
+    completion_tokens = 0
+    try:
+        if isinstance(resp, dict) and resp.get("usage"):
+            u = resp["usage"]
+            prompt_tokens = int(u.get("prompt_tokens") or 0)
+            completion_tokens = int(u.get("completion_tokens") or 0)
+        elif hasattr(resp, "usage") and resp.usage is not None:
+            prompt_tokens = int(getattr(resp.usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(resp.usage, "completion_tokens", 0) or 0)
+    except Exception:
+        pass
+
     if isinstance(resp, dict):
         d = resp
     elif hasattr(resp, "as_dict"):
@@ -1843,7 +1903,12 @@ def _call_llm_raw(prompt, max_tokens=16000, model=None, label=None):
         d = {"choices": [{"message": {"content": resp.choices[0].message.content}}]}
     content = d["choices"][0]["message"]["content"]
     elapsed = time.time() - started
-    print(f"[{tag}] done in {elapsed:.1f}s output_chars={len(content)}", flush=True)
+    print(f"[{tag}] done in {elapsed:.1f}s output_chars={len(content)} pt={prompt_tokens} ct={completion_tokens}", flush=True)
+    _log_llm_usage(
+        tag, endpoint, prompt_chars, len(content), int(elapsed * 1000),
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+        success=True,
+    )
     return content
 
 
