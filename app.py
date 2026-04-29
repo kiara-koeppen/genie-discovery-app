@@ -1,6 +1,8 @@
 import json
 import os
 import secrets
+import threading
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -63,6 +65,121 @@ SCALAR_COLS = {
 
 # All section columns
 ALL_SECTION_COLS = sorted(set(col for cols in SESSION_COLS.values() for col in cols))
+
+
+# ---------------------------------------------------------------------------
+# Async job runner
+#
+# Long-running LLM calls (Readiness Brief, plan generation, etc.) routinely
+# exceed the Databricks Apps frontend gateway's ~60s HTTP request timeout.
+# This module lets us run those tasks in a background thread and have the
+# frontend poll for completion via short, fast HTTP requests.
+#
+# Architecture:
+#   - JOBS: in-memory dict keyed by uuid; values track state + result.
+#   - TASK_HANDLERS: registry mapping task_type strings to callables.
+#     Decorate a function with @register_task("name") to make it dispatchable.
+#   - POST /api/jobs/start launches a daemon thread, returns job_id immediately.
+#   - GET /api/jobs/<id> returns current state, result (when done), or error.
+#   - Old jobs (>1h) are evicted opportunistically on each /start call.
+#
+# Tradeoffs:
+#   - In-memory state dies on app restart. For this single-instance app that's
+#     acceptable: the worst case is the user clicks Regenerate and we run again.
+#   - No cancel signal -- a cancelled job's LLM call still completes server-side,
+#     we just stop returning the result to the client.
+# ---------------------------------------------------------------------------
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 3600  # 1 hour
+TASK_HANDLERS = {}
+
+
+def register_task(name):
+    """Decorator: register a function as the handler for a task_type."""
+    def decorator(fn):
+        TASK_HANDLERS[name] = fn
+        return fn
+    return decorator
+
+
+def _cleanup_old_jobs():
+    """Evict jobs older than TTL. Called on each /start request -- amortized."""
+    now = time.time()
+    with JOBS_LOCK:
+        stale = [jid for jid, j in JOBS.items() if now - j["started_at"] > JOB_TTL_SECONDS]
+        for jid in stale:
+            del JOBS[jid]
+
+
+def _run_job(job_id, task_type, payload):
+    """Background-thread worker. Updates JOBS with result or error."""
+    handler = TASK_HANDLERS.get(task_type)
+    if not handler:
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id]["state"] = "failed"
+                JOBS[job_id]["error"] = f"Unknown task_type: {task_type}"
+        return
+    try:
+        result = handler(payload)
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id]["state"] = "done"
+                JOBS[job_id]["result"] = result
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[jobs] {task_type} {job_id} failed: {e}\n{tb}", flush=True)
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id]["state"] = "failed"
+                JOBS[job_id]["error"] = f"{type(e).__name__}: {e}"
+
+
+@app.route("/api/jobs/start", methods=["POST"])
+def jobs_start():
+    """Kick off a background task. Returns a job_id for polling."""
+    body = request.json or {}
+    task_type = (body.get("task_type") or "").strip()
+    payload = body.get("payload") or {}
+    if not task_type:
+        return jsonify({"error": "task_type is required"}), 400
+    if task_type not in TASK_HANDLERS:
+        return jsonify({"error": f"unknown task_type: {task_type}"}), 400
+
+    _cleanup_old_jobs()
+
+    job_id = uuid.uuid4().hex
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "state": "pending",
+            "task_type": task_type,
+            "started_at": time.time(),
+            "result": None,
+            "error": None,
+        }
+
+    t = threading.Thread(target=_run_job, args=(job_id, task_type, payload), daemon=True)
+    t.start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/jobs/<job_id>", methods=["GET"])
+def jobs_status(job_id):
+    """Return current state of a job. Frontend polls this endpoint."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "job not found"}), 404
+        snapshot = {
+            "state": job["state"],
+            "task_type": job["task_type"],
+            "result": job["result"],
+            "error": job["error"],
+            "age_seconds": int(time.time() - job["started_at"]),
+        }
+    return jsonify(snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -581,26 +698,18 @@ def coe_approve(eid):
 # API: Auto-summary (structured, no LLM)
 # ---------------------------------------------------------------------------
 
-@app.route("/api/engagements/<eid>/auto-summary")
-def auto_summary(eid):
-    """Generate an LLM-driven Readiness Brief synthesizing Sessions 1-4 for COE review.
-
-    Replaces the older deterministic dump. The brief includes citation-backed
-    narrative, a coverage analysis tying S2 questions to S3 metrics, and a gap
-    section that distinguishes acknowledged vs unacknowledged gaps.
+def _generate_readiness_brief(eid):
+    """Core Readiness Brief logic. Used by both the legacy sync endpoint and
+    the async job task. Returns dict {summary, unacknowledged_gaps}.
+    Raises on engagement-not-found or LLM/parse failure.
     """
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
-        return jsonify({"summary": ""}), 404
+        raise ValueError("Engagement not found")
     eng = parse_row(rows[0])
 
-    try:
-        prompt = _build_readiness_brief_prompt(eng)
-        raw = _call_llm_raw(prompt)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[readiness-brief] ERROR: {e}\n{tb}", flush=True)
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    prompt = _build_readiness_brief_prompt(eng)
+    raw = _call_llm_raw(prompt)
 
     # Output format:
     # <markdown brief>
@@ -613,7 +722,6 @@ def auto_summary(eid):
         parts = raw.split(SENTINEL, 1)
         brief = parts[0].strip()
         gaps_text = parts[1].strip()
-        # Strip any leading/trailing code fences around the JSON section
         if gaps_text.startswith("```"):
             gaps_text = gaps_text.split("\n", 1)[1] if "\n" in gaps_text else gaps_text
             if gaps_text.endswith("```"):
@@ -624,14 +732,12 @@ def auto_summary(eid):
         try:
             gaps_raw = json.loads(gaps_text)
         except Exception as e:
-            print(f"[readiness-brief] gap JSON parse failed: {e}; tail of raw output: {raw[-500:]}", flush=True)
+            print(f"[readiness-brief] gap JSON parse failed: {e}; tail: {raw[-500:]}", flush=True)
             gaps_raw = []
     else:
-        # Sentinel missing -- treat the entire response as the brief, no gaps surfaced
         brief = raw.strip()
         print("[readiness-brief] sentinel missing; full output treated as brief", flush=True)
 
-    # Strip wrapping code fences from the markdown if any (defensive)
     if brief.startswith("```"):
         brief = brief.split("\n", 1)[1] if "\n" in brief else brief
         if brief.endswith("```"):
@@ -641,9 +747,8 @@ def auto_summary(eid):
             brief = brief[8:].lstrip()
 
     if not brief:
-        return jsonify({"error": "LLM returned empty brief"}), 500
+        raise RuntimeError("LLM returned empty brief")
 
-    # Normalize structured unacknowledged gaps. Each drives a response card.
     gaps = []
     if isinstance(gaps_raw, list):
         for g in gaps_raw:
@@ -669,7 +774,33 @@ def auto_summary(eid):
                 "citations": cits,
             })
 
-    return jsonify({"summary": brief, "unacknowledged_gaps": gaps})
+    return {"summary": brief, "unacknowledged_gaps": gaps}
+
+
+@register_task("readiness_brief")
+def _task_readiness_brief(payload):
+    """Async task wrapper for the Readiness Brief generator."""
+    eid = (payload.get("engagement_id") or "").strip()
+    if not eid:
+        raise ValueError("engagement_id is required")
+    return _generate_readiness_brief(eid)
+
+
+@app.route("/api/engagements/<eid>/auto-summary")
+def auto_summary(eid):
+    """Legacy synchronous endpoint. Kept for backward compat; will 504 on long
+    briefs. New callers should use POST /api/jobs/start with task_type=
+    "readiness_brief" instead.
+    """
+    try:
+        result = _generate_readiness_brief(eid)
+    except ValueError as e:
+        return jsonify({"summary": "", "error": str(e)}), 404
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[readiness-brief sync] ERROR: {e}\n{tb}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify(result)
 
 
 def _slug(text):

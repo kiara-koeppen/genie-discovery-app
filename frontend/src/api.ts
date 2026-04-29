@@ -70,8 +70,55 @@ async function json<T>(url: string, opts?: RequestInit): Promise<T> {
   return res.json();
 }
 
+// --- Async job runner client helper ---
+//
+// Backend runs long LLM tasks in background threads; we kick them off via
+// startJob() then poll until done. This avoids the ~60s gateway timeout that
+// long sync HTTP requests hit.
+
+export interface JobStatus<T> {
+  state: "pending" | "done" | "failed";
+  task_type: string;
+  result: T | null;
+  error: string | null;
+  age_seconds: number;
+}
+
+export async function pollJob<T>(
+  jobId: string,
+  opts?: {
+    intervalMs?: number;
+    timeoutMs?: number;
+    onProgress?: (ageSeconds: number) => void;
+    signal?: AbortSignal;
+  },
+): Promise<T> {
+  const interval = opts?.intervalMs ?? 2000;
+  const timeout = opts?.timeoutMs ?? 600000; // 10 min ceiling
+  const start = Date.now();
+
+  while (true) {
+    if (opts?.signal?.aborted) throw new Error("Cancelled");
+    if (Date.now() - start > timeout) throw new Error("Job timed out (client-side)");
+
+    const status = await json<JobStatus<T>>(`/jobs/${jobId}`);
+    opts?.onProgress?.(status.age_seconds);
+
+    if (status.state === "done") return status.result as T;
+    if (status.state === "failed") throw new Error(status.error || "Job failed");
+
+    await new Promise<void>((resolve) => setTimeout(resolve, interval));
+  }
+}
+
 export const api = {
   getUser: () => json<{ email: string }>("/user"),
+
+  startJob: (task_type: string, payload: Record<string, unknown>) =>
+    json<{ job_id: string }>("/jobs/start", {
+      method: "POST",
+      body: JSON.stringify({ task_type, payload }),
+    }),
 
   listWarehouses: () =>
     json<{ id: string; name: string; state: string; size: string; type: string }[]>("/warehouses"),

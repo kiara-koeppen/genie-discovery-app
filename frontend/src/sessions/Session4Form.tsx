@@ -17,7 +17,7 @@ import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import ReactMarkdown from "react-markdown";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
-import { api, BenchmarkQuestion, BriefGap, AnalystCommentary } from "../api";
+import { api, pollJob, BenchmarkQuestion, BriefGap, AnalystCommentary } from "../api";
 import type { ColumnDef } from "../types";
 
 // --- Gap-matching helpers (for preserving analyst responses across regenerations) ---
@@ -88,6 +88,7 @@ export default function Session4Form({
   const [summary, setSummary] = useState("");
   const [loadingSummary, setLoadingSummary] = useState(false);
   const [briefError, setBriefError] = useState("");
+  const [briefElapsed, setBriefElapsed] = useState(0);
   const [currentGaps, setCurrentGaps] = useState<BriefGap[]>([]);
   const [approvalNotes, setApprovalNotes] = useState("");
   const [draftingBenchmarks, setDraftingBenchmarks] = useState(false);
@@ -203,13 +204,26 @@ export default function Session4Form({
     });
   };
 
-  // Fetch auto-summary (Readiness Brief + structured unacknowledged gaps)
+  // Fetch auto-summary via async job runner (avoids the gateway 60s timeout).
+  // The brief LLM call frequently exceeds 60s wall-clock, which would 504 if
+  // we held a single HTTP request open. Instead: kick off a background job,
+  // then poll a fast status endpoint until the brief is ready.
   const fetchSummary = async () => {
     if (!engagementId) return;
     setLoadingSummary(true);
     setBriefError("");
+    setBriefElapsed(0);
     try {
-      const res = await api.getAutoSummary(engagementId);
+      const { job_id } = await api.startJob("readiness_brief", {
+        engagement_id: engagementId,
+      });
+      const res = await pollJob<{
+        summary: string;
+        unacknowledged_gaps?: BriefGap[];
+      }>(job_id, {
+        intervalMs: 2000,
+        onProgress: (s) => setBriefElapsed(s),
+      });
       setSummary(res.summary);
       onChange("auto_summary", res.summary);
       const gaps = res.unacknowledged_gaps || [];
@@ -222,6 +236,14 @@ export default function Session4Form({
       console.error("[readiness-brief] generate failed:", err);
     }
     setLoadingSummary(false);
+    setBriefElapsed(0);
+  };
+
+  // Format elapsed seconds as "0:42" / "1:15" for the button label.
+  const formatElapsed = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${s.toString().padStart(2, "0")}`;
   };
 
   useEffect(() => {
@@ -587,7 +609,9 @@ export default function Session4Form({
               disabled={loadingSummary}
               sx={{ mb: 2 }}
             >
-              {loadingSummary ? "Generating..." : (summary ? "Regenerate Brief" : "Generate Brief")}
+              {loadingSummary
+                ? `Generating... ${formatElapsed(briefElapsed)}`
+                : (summary ? "Regenerate Brief" : "Generate Brief")}
             </Button>
           )}
           {briefError && (
