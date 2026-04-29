@@ -2363,6 +2363,59 @@ def draft_benchmark_summary(eid):
     return jsonify({"explanation": explanation})
 
 
+_SELECT_OR_WITH_RE = _re.compile(r"^\s*(?:WITH\b|SELECT\b)", _re.IGNORECASE | _re.DOTALL)
+_DESTRUCTIVE_KEYWORDS = (
+    "DELETE", "UPDATE", "INSERT", "MERGE", "DROP", "TRUNCATE", "ALTER",
+    "CREATE", "REPLACE", "GRANT", "REVOKE", "OPTIMIZE", "VACUUM", "ANALYZE",
+    "REFRESH", "RESTORE", "USE", "SET", "RESET", "COMMENT", "RENAME",
+)
+_DESTRUCTIVE_RE = _re.compile(
+    r"(?:^|[\s;])(" + "|".join(_DESTRUCTIVE_KEYWORDS) + r")\b",
+    _re.IGNORECASE,
+)
+
+
+def _is_safe_select(sql_text):
+    """Return (True, None) if the SQL is unambiguously a SELECT (or WITH...SELECT);
+    (False, reason) otherwise.
+
+    Defense-in-depth against an LLM hallucinating a destructive statement
+    that the user happens to have grants for. The outer SELECT * FROM (...)
+    wrapper would syntax-error on most DML/DDL anyway, but this is a
+    deliberate guard rather than relying on that accident.
+
+    Strips a leading SQL comment block and a single trailing semicolon
+    before matching; rejects multi-statement bodies.
+    """
+    s = (sql_text or "").strip()
+    if not s:
+        return False, "empty SQL"
+    # Strip leading line comments (--) and block comments (/* */)
+    while True:
+        if s.startswith("--"):
+            nl = s.find("\n")
+            s = (s[nl + 1:] if nl >= 0 else "").lstrip()
+            continue
+        if s.startswith("/*"):
+            end = s.find("*/")
+            if end < 0:
+                return False, "unterminated SQL comment"
+            s = s[end + 2:].lstrip()
+            continue
+        break
+    # Reject multi-statement bodies (one trailing semicolon is fine)
+    if ";" in s.rstrip().rstrip(";"):
+        return False, "multiple SQL statements are not allowed"
+    if not _SELECT_OR_WITH_RE.match(s):
+        return False, "only SELECT (or WITH ... SELECT) statements are allowed"
+    # Belt: scan for destructive keywords appearing as standalone words.
+    # False positives possible (e.g., a string literal containing 'DELETE')
+    # but for a defense-in-depth guard the trade-off is acceptable.
+    if _DESTRUCTIVE_RE.search(s):
+        return False, "SQL contains a disallowed keyword (DELETE/UPDATE/DROP/etc.)"
+    return True, None
+
+
 def _execute_benchmark_sql_obo(user_w, sql_text, warehouse_id, limit_cap=50):
     """Run benchmark SQL via OBO; return a dict with columns/rows/row_count or error.
 
@@ -2378,6 +2431,13 @@ def _execute_benchmark_sql_obo(user_w, sql_text, warehouse_id, limit_cap=50):
         return {"error": "warehouse_id is required"}
 
     stmt = sql_text.rstrip().rstrip(";").strip()
+
+    # Hard guard: only SELECT / WITH ... SELECT bodies allowed. Defends against
+    # an LLM (or a user-edited benchmark) emitting a destructive statement.
+    safe, reason = _is_safe_select(stmt)
+    if not safe:
+        return {"error": f"SQL rejected by safety guard: {reason}"}
+
     wrapped = f"SELECT * FROM (\n{stmt}\n) __bm LIMIT {limit_cap}"
 
     try:
