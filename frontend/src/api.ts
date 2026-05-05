@@ -150,6 +150,20 @@ export const api = {
 
   checkCoeMembership: () => json<{ is_member: boolean }>("/user/coe-member"),
 
+  getUserRole: () =>
+    json<{
+      is_coe: boolean;
+      is_bo: boolean;
+      coe_group_name: string;
+      bo_group_name: string;
+    }>("/user/role"),
+
+  setBenchmarkBoApproved: (id: string, idx: number, value: boolean) =>
+    json<{ success: boolean; idx: number; value: boolean }>(
+      `/engagements/${id}/benchmarks/bo-approved`,
+      { method: "PATCH", body: JSON.stringify({ idx, value }) },
+    ),
+
   listEngagements: () => json<Record<string, string>[]>("/engagements"),
 
   checkNameAvailable: (name: string, excludeEid?: string) => {
@@ -315,7 +329,7 @@ export const api = {
       overwrite?: boolean;
     },
   ): Promise<
-    | { success: true; fqn: string }
+    | { success: true; fqn: string; updated_at?: string }
     | { success: false; exists: true; fqn: string; owner: string | null }
   > => {
     const res = await fetch(`${BASE}/engagements/${id}/create-metric-view`, {
@@ -330,7 +344,7 @@ export const api = {
     if (!res.ok) {
       throw new Error(payload.error || `${res.status} ${res.statusText}`);
     }
-    return { success: true, fqn: payload.fqn };
+    return { success: true, fqn: payload.fqn, updated_at: payload.updated_at };
   },
 
   listCatalogs: () => json<string[]>("/uc/catalogs"),

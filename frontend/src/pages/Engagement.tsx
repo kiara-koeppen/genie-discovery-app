@@ -64,6 +64,11 @@ export default function Engagement({ readOnly = false }: Props) {
   });
   const [metaError, setMetaError] = useState<string>("");
   const [isCoeMember, setIsCoeMember] = useState(false);
+  const [isBoMember, setIsBoMember] = useState(false);
+  // BO-only users (BO group, NOT in COE) get the restricted view: hide
+  // S3/S5/S6 tabs, hide pencil edit, hide AI buttons in S4, etc. COE-and-BO
+  // gets full access (COE wins).
+  const isBoOnly = isBoMember && !isCoeMember;
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const skipNextAutosave = useRef(true);
@@ -80,12 +85,13 @@ export default function Engagement({ readOnly = false }: Props) {
     if (!id) return;
     setLoading(true);
     try {
-      const [eng, coe] = await Promise.all([
+      const [eng, role] = await Promise.all([
         api.getEngagement(id) as Promise<any>,
-        api.checkCoeMembership(),
+        api.getUserRole(),
       ]);
       setData(eng);
-      setIsCoeMember(coe.is_member);
+      setIsCoeMember(role.is_coe);
+      setIsBoMember(role.is_bo);
       updatedAtRef.current = String(eng.updated_at || "");
       const s = eng.sessions || {};
       skipNextAutosave.current = true;
@@ -123,24 +129,52 @@ export default function Engagement({ readOnly = false }: Props) {
   const persistSession = useCallback(async (sessionNum: number) => {
     if (!id) return;
     setSaveStatus("saving");
-    try {
-      const res = await api.saveSession(
-        id,
-        sessionNum,
-        sessionDrafts[sessionNum],
-        updatedAtRef.current,
-      );
-      if (res.updated_at) updatedAtRef.current = res.updated_at;
-      setSaveStatus("saved");
-    } catch (err: any) {
-      setSaveStatus("error");
-      const msg = err?.message || "Save failed";
-      // 409 stale: backend message is friendly. Reload to recover.
-      if (msg.toLowerCase().includes("updated by another user")) {
-        setToast("This engagement was updated elsewhere. Reloading...");
-        await load();
-      } else {
-        setToast(`Error saving: ${msg}`);
+
+    // Bounded retry on 409. Most stale-token failures come from sibling
+    // mutations that bumped engagement.updated_at without our local ref
+    // catching up — e.g., a BO clicking BO Approved on benchmarks, the COE
+    // approval flow, or a Create Metric View. Those mutations don't actually
+    // conflict with the user's in-progress edits, so we silently refresh the
+    // ref from the server and retry once. Only if the retry ALSO 409s do we
+    // assume a real concurrent edit and reload (which preserves the server's
+    // version, losing local in-progress edits — last resort).
+    const MAX_ATTEMPTS = 2;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const res = await api.saveSession(
+          id,
+          sessionNum,
+          sessionDrafts[sessionNum],
+          updatedAtRef.current,
+        );
+        if (res.updated_at) updatedAtRef.current = res.updated_at;
+        setSaveStatus("saved");
+        return;
+      } catch (err: any) {
+        const msg = err?.message || "Save failed";
+        const isStale = msg.toLowerCase().includes("updated by another user");
+
+        if (isStale && attempt < MAX_ATTEMPTS) {
+          // Refresh ref from server and retry. Don't touch sessionDrafts —
+          // the user's in-progress edits stay intact.
+          try {
+            const eng = await api.getEngagement(id) as any;
+            updatedAtRef.current = String(eng.updated_at || "");
+            continue;
+          } catch {
+            // Couldn't even fetch — fall through to error path below.
+          }
+        }
+
+        // Either non-stale error, or retry exhausted.
+        setSaveStatus("error");
+        if (isStale) {
+          setToast("This engagement was updated elsewhere. Reloading...");
+          await load();
+        } else {
+          setToast(`Error saving: ${msg}`);
+        }
+        return;
       }
     }
   }, [id, sessionDrafts, load]);
@@ -155,6 +189,10 @@ export default function Engagement({ readOnly = false }: Props) {
       skipNextAutosave.current = false;
       return;
     }
+    // BO-only users can only PUT S1 and S2. Skip autosave if the most recent
+    // edit was outside that scope (defense in depth — the section-level
+    // backend gate would 403 us anyway).
+    if (isBoOnly && lastEditedSessionRef.current >= 3) return;
     setSaveStatus("dirty");
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     autosaveTimer.current = setTimeout(() => {
@@ -163,7 +201,7 @@ export default function Engagement({ readOnly = false }: Props) {
     return () => {
       if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     };
-  }, [sessionDrafts, readOnly, id, persistSession]);
+  }, [sessionDrafts, readOnly, id, persistSession, isBoOnly]);
 
   const handleManualSave = async () => {
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
@@ -358,7 +396,7 @@ export default function Engagement({ readOnly = false }: Props) {
         <Typography variant="h5">
           {data.genie_space_name || "Untitled Space"}
         </Typography>
-        {!readOnly && (
+        {!readOnly && !isBoOnly && (
           <Tooltip title="Edit engagement info">
             <IconButton size="small" onClick={openEdit} sx={{ ml: 0.5 }}>
               <EditIcon fontSize="small" />
@@ -406,10 +444,15 @@ export default function Engagement({ readOnly = false }: Props) {
       <Paper sx={{ mb: 2 }}>
         <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="fullWidth">
           {SESSION_LABELS.map((label, i) => {
+            // BO users only see S1, S2, S4. S3, S5, S6 are hidden entirely
+            // (not just locked) so they don't see technical-design / configure-
+            // space / prototype-review surfaces.
+            if (isBoOnly && (i === 2 || i === 4 || i === 5)) return null;
             const locked = (i === 4 || i === 5) && !isApproved;
             return (
               <Tab
                 key={i}
+                value={i}
                 label={
                   locked ? (
                     <Tooltip title="Requires COE approval">
@@ -443,6 +486,7 @@ export default function Engagement({ readOnly = false }: Props) {
             session1Data={sessionDrafts[1]}
             session2Data={sessionDrafts[2]}
             engagementId={id}
+            onMetricViewCreated={(ts) => { updatedAtRef.current = ts; }}
           />
         )}
         {tab === 3 && (
@@ -453,6 +497,7 @@ export default function Engagement({ readOnly = false }: Props) {
             session3Data={sessionDrafts[3]}
             engagementId={id}
             isCoeMember={isCoeMember}
+            isBoOnly={isBoOnly}
           />
         )}
         {tab === 4 && (
@@ -467,8 +512,10 @@ export default function Engagement({ readOnly = false }: Props) {
         {tab === 5 && <Session6Form {...sessionProps(6)} />}
       </Box>
 
-      {/* Save Button */}
-      {!readOnly && (
+      {/* Save Button — BOs only see it on S1+S2 (the only sections they can write).
+          On S4, BO interactions go through the dedicated BO-Approved PATCH from
+          inside Session4Form, so no full-section save is needed. */}
+      {!readOnly && !(isBoOnly && tab === 3) && (
         <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 2, mb: 4 }}>
           <Button
             variant="contained"

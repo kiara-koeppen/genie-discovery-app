@@ -50,9 +50,14 @@ interface Props {
   session1Data?: Record<string, any>;
   session2Data?: Record<string, any>;
   engagementId?: string;
+  /** Called after Create Metric View persists, so the parent can refresh its
+   *  optimistic-lock token (updatedAtRef) and avoid a 409 on next autosave. */
+  onMetricViewCreated?: (updatedAt: string) => void;
 }
 
-export default function Session3Form({ data, onChange, readOnly, session1Data, session2Data, engagementId }: Props) {
+export default function Session3Form({
+  data, onChange, readOnly, session1Data, session2Data, engagementId, onMetricViewCreated,
+}: Props) {
   const [joins, setJoins] = useState<{ table: string; keys: string }[]>([]);
   const [metricViews, setMetricViews] = useState<string[]>([]);
 
@@ -250,6 +255,9 @@ export default function Session3Form({ data, onChange, readOnly, session1Data, s
         overwrite,
       });
       if (res.success) {
+        // Refresh parent's optimistic-lock token BEFORE the onChange cascade
+        // triggers an autosave — otherwise the next autosave 409s.
+        if (res.updated_at) onMetricViewCreated?.(res.updated_at);
         onChange("metric_view_fqn", res.fqn);
         setMvSuccess(`${overwrite ? "Overwrote" : "Created"} ${res.fqn}`);
         setMvConflict(null);

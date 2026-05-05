@@ -35,6 +35,15 @@ env:
   - name: COE_GROUP_NAME
     value: "genie-coe-reviewers"
 
+  # Optional. Databricks group whose members are restricted to a "Business
+  # Owner" view of the app: they can read all engagements, edit Sessions 1
+  # and 2, view Section 4, and click the "BO Approved" checkbox on benchmark
+  # rows — but cannot edit Sections 3/5/6 or trigger any AI actions. If this
+  # group is unset or empty, no users get the BO restriction (everyone
+  # except COE acts as a default-access "analyst").
+  - name: BO_GROUP_NAME
+    value: "genie-bo-reviewers"
+
   # Optional. Model Serving endpoint used by every AI button (generate-plan,
   # draft-benchmarks, draft-metric-view-yaml, etc). Default is the HIPAA-
   # eligible pay-per-token Claude endpoint. The app's service principal

@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import secrets
 import threading
 import time
@@ -10,7 +11,7 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask, request, jsonify, send_from_directory
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.sql import StatementParameterListItem
+from databricks.sdk.service.sql import StatementParameterListItem, StatementState
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
 app = Flask(__name__, static_folder="static", static_url_path="")
@@ -32,6 +33,9 @@ TABLE = f"{CATALOG}.{SCHEMA}.discovery"
 
 # Optional — sensible defaults are OK here.
 COE_GROUP = os.getenv("COE_GROUP_NAME") or "genie-coe-reviewers"
+# BO group: members can view all engagements but only edit S1/S2 + click BO
+# Approved on benchmark rows. If unset, no users get BO permissions.
+BO_GROUP = os.getenv("BO_GROUP_NAME") or "genie-bo-reviewers"
 LLM_ENDPOINT = os.getenv("LLM_ENDPOINT_NAME") or "databricks-claude-sonnet-4-6"
 
 w = WorkspaceClient()
@@ -432,7 +436,29 @@ def jobs_status(job_id):
 # SQL helpers
 # ---------------------------------------------------------------------------
 
+class SqlTransientError(RuntimeError):
+    """Raised when a SQL statement does not reach a successful terminal state
+    within the warehouse-warmup window — typically a cold warehouse, network
+    blip, or timeout. Distinct from a genuine empty result so callers can tell
+    'row doesn't exist' from 'we couldn't ask.'"""
+
+
 def sql_exec(query, params=None):
+    """Execute a read query and return a list of dict rows.
+
+    Returns:
+        list[dict]: rows on a SUCCEEDED query (empty list = genuinely no rows).
+
+    Raises:
+        SqlTransientError: warehouse cold-start / timeout / non-terminal state.
+        RuntimeError: query failed (syntax error, permission denied, etc).
+
+    The wait_timeout is set generously so a cold warehouse has time to spin
+    up before we treat the call as transient. Without this, every read
+    against a cold warehouse silently returned [] and callers interpreted
+    'no results' the same as 'real empty result' — for /api/jobs/start
+    that surfaced as a confusing 404 'Engagement not found.'
+    """
     sdk_params = None
     if params:
         sdk_params = [
@@ -445,11 +471,27 @@ def sql_exec(query, params=None):
         parameters=sdk_params,
         catalog=CATALOG,
         schema=SCHEMA,
+        wait_timeout="50s",  # generous: covers warehouse cold-start
     )
-    if resp.result and resp.result.data_array:
-        cols = [c.name for c in resp.manifest.schema.columns]
-        return [dict(zip(cols, row)) for row in resp.result.data_array]
-    return []
+
+    state = resp.status.state if resp.status else None
+    if state == StatementState.SUCCEEDED:
+        if resp.result and resp.result.data_array:
+            cols = [c.name for c in resp.manifest.schema.columns]
+            return [dict(zip(cols, row)) for row in resp.result.data_array]
+        return []  # genuine empty result
+    if state in (StatementState.FAILED, StatementState.CANCELED, StatementState.CLOSED):
+        err = (
+            resp.status.error.message
+            if resp.status and resp.status.error
+            else f"state={state}"
+        )
+        raise RuntimeError(f"SQL failed: {err}")
+    # PENDING / RUNNING / None — non-terminal after wait_timeout
+    raise SqlTransientError(
+        f"SQL did not complete within wait_timeout (state={state}). "
+        "The warehouse may be cold; retry in a few seconds."
+    )
 
 
 def sql_run(query, params=None, *, must_succeed=False):
@@ -683,25 +725,65 @@ def _user_is_coe_member(user_w):
     return False
 
 
-def _authorize_engagement(eid):
-    """Gate access to a single engagement row.
+def _user_is_bo_member(user_w):
+    """True if the OBO user is in BO_GROUP. False on any error."""
+    if not user_w:
+        return False
+    try:
+        me = user_w.current_user.me()
+        for g in (me.groups or []):
+            if g.display == BO_GROUP:
+                return True
+    except Exception:
+        pass
+    return False
 
-    Returns (engagement_dict, None) if the current user is the analyst, the BO,
-    or a COE-group member. Returns (None, flask_error_response) otherwise.
-    COE members get access so they can review engagements for Session 4 approval.
+
+def _user_role(user_w):
+    """Return ('coe' | 'bo' | 'analyst' | None) — the user's role for permission
+    decisions. COE wins over BO; default authenticated users are 'analyst'.
+    Returns None only if there's no OBO client (unauthenticated request).
     """
-    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    if not user_w:
+        return None
+    is_coe = _user_is_coe_member(user_w)
+    if is_coe:
+        return "coe"
+    if _user_is_bo_member(user_w):
+        return "bo"
+    return "analyst"
+
+
+def _authorize_engagement(eid):
+    """Verify engagement exists. Read access is open to any authenticated user
+    (CAN_USE on the app is the access boundary). Mutation gating happens at the
+    section level via _gate_engagement_routes — see permissions model below.
+
+    Permissions model:
+      - Default (any authenticated user): full read/write on all engagements,
+        EXCEPT clicking Approve in S4 (COE only) and clicking BO Approved on
+        benchmark rows (COE or BO group only).
+      - COE group: full access including Approve and BO Approved.
+      - BO group: read all; edit S1/S2 only; view S4 (read-only except for BO
+        Approved checkboxes); cannot touch S3/S5/S6 or any AI/push action.
+
+    Returns (eng, None) on success, or (None, error_response) if not found
+    (404) or the warehouse couldn't answer (503 — transient, retry).
+    """
+    try:
+        rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    except SqlTransientError:
+        # Cold warehouse / timeout — distinct from "row doesn't exist." Return
+        # 503 so the frontend can show "wait and retry" instead of confusing
+        # the user with "Not found."
+        return None, (jsonify({
+            "error": "Database temporarily unavailable. The SQL warehouse may "
+                     "be starting up; retry in a few seconds.",
+            "transient": True,
+        }), 503)
     if not rows:
-        return None, (jsonify({"error": "Not found"}), 404)
-    eng = parse_row(rows[0])
-    current = (get_current_user() or "").strip().lower()
-    analyst = (eng.get("analyst_email") or "").strip().lower()
-    bo = (eng.get("business_owner_email") or "").strip().lower()
-    if current and (current == analyst or current == bo):
-        return eng, None
-    if _user_is_coe_member(_user_workspace_client()):
-        return eng, None
-    return None, (jsonify({"error": "Forbidden"}), 403)
+        return None, (jsonify({"error": "Engagement not found"}), 404)
+    return parse_row(rows[0]), None
 
 
 import re as _re
@@ -709,14 +791,35 @@ import re as _re
 _UUID_RE = _re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
+def _bo_can_access(method, sub_path):
+    """Whitelist of operations a BO-only user (not COE) is allowed to perform.
+
+    Everything else returns 403 for BOs. The whitelist is intentionally tight
+    so adding new endpoints doesn't accidentally open BO access — if a future
+    endpoint should be BO-accessible, it must be added here explicitly.
+    """
+    if method == "GET":
+        return True
+    if method == "PUT" and sub_path in ("/sessions/1", "/sessions/2"):
+        return True
+    if method == "PATCH" and sub_path == "/benchmarks/bo-approved":
+        return True
+    return False
+
+
 @app.before_request
 def _gate_engagement_routes():
-    """Apply _authorize_engagement to every /api/engagements/<eid>[/...] route.
+    """Apply _authorize_engagement to every /api/engagements/<eid>[/...] route,
+    then layer BO restrictions on top.
 
-    Catches all the per-session saves, generate-plan, push-to-genie, etc. without
-    having to bolt an auth check onto each handler individually. Only triggers
-    when the path segment after /api/engagements/ looks like an engagement UUID
-    (so sibling routes like /api/engagements/check-name are not mistakenly gated).
+    Layer 1: existence/auth — engagement exists and caller is authenticated.
+    Layer 2: section-level role gate — BO-only users are limited to a tight
+             whitelist of operations (read everything, edit S1/S2, click the
+             BO-Approved checkbox via the dedicated PATCH endpoint).
+
+    Only triggers when the path segment after /api/engagements/ looks like an
+    engagement UUID (so sibling routes like /api/engagements/check-name are
+    not mistakenly gated).
     """
     path = request.path or ""
     prefix = "/api/engagements/"
@@ -729,7 +832,17 @@ def _gate_engagement_routes():
     if not _UUID_RE.match(eid):
         return None
     _, err = _authorize_engagement(eid)
-    return err
+    if err:
+        return err
+    # Layer 2: BO-only users get a tight whitelist of operations.
+    sub_path = remainder[len(eid):]  # "" or "/sessions/1" or "/coe-approve" etc.
+    user_w = _user_workspace_client()
+    role = _user_role(user_w)
+    if role == "bo" and not _bo_can_access(request.method, sub_path):
+        return jsonify({
+            "error": f"Members of the '{BO_GROUP}' group cannot perform this action."
+        }), 403
+    return None
 
 
 @app.route("/api/warehouses")
@@ -809,36 +922,49 @@ def api_user_coe_member():
         return jsonify(result)
 
 
+@app.route("/api/user/role")
+def api_user_role():
+    """Return the caller's role flags so the frontend can render the right UI.
+
+    Frontend uses this to decide what tabs/buttons/checkboxes to show. The
+    backend independently re-checks role on every mutation, so this is
+    advisory-only — a frontend that fakes a role still gets 403'd server-side.
+    """
+    user_w = _user_workspace_client()
+    return jsonify({
+        "is_coe": _user_is_coe_member(user_w),
+        "is_bo": _user_is_bo_member(user_w),
+        "coe_group_name": COE_GROUP,
+        "bo_group_name": BO_GROUP,
+    })
+
+
 # ---------------------------------------------------------------------------
 # API: Engagements CRUD
 # ---------------------------------------------------------------------------
 
 @app.route("/api/engagements", methods=["GET"])
 def list_engagements():
-    """Return only engagements where the caller is a stakeholder — or all
-    engagements if the caller is a COE-group reviewer.
+    """Return all non-deleted engagements. Read visibility is open to any
+    authenticated user; the per-section write rules are enforced elsewhere
+    (see permissions model in _authorize_engagement).
     """
-    current = (get_current_user() or "").strip().lower()
     # Soft-deleted rows (deleted_at IS NOT NULL/empty) are hidden from the list.
-    # The row stays in Delta so an admin can recover it via direct URL/SQL.
+    # The row stays in Delta so an admin can recover it via delete_at IS NULL/SQL.
     not_deleted = "(deleted_at IS NULL OR deleted_at = '')"
-    if _user_is_coe_member(_user_workspace_client()):
+    try:
         rows = sql_exec(
             f"SELECT engagement_id, genie_space_name, business_owner_name, "
-            f"analyst_name, current_session, status, created_at, updated_at "
+            f"business_owner_email, analyst_name, analyst_email, "
+            f"current_session, status, created_at, updated_at "
             f"FROM {TABLE} WHERE {not_deleted} ORDER BY updated_at DESC"
         )
-    else:
-        rows = sql_exec(
-            f"SELECT engagement_id, genie_space_name, business_owner_name, "
-            f"analyst_name, current_session, status, created_at, updated_at "
-            f"FROM {TABLE} "
-            f"WHERE {not_deleted} AND ("
-            f"LOWER(TRIM(analyst_email)) = :u "
-            f"OR LOWER(TRIM(business_owner_email)) = :u) "
-            f"ORDER BY updated_at DESC",
-            {"u": current},
-        )
+    except SqlTransientError:
+        return jsonify({
+            "error": "Database temporarily unavailable. The SQL warehouse may "
+                     "be starting up; retry in a few seconds.",
+            "transient": True,
+        }), 503
     return jsonify(rows)
 
 
@@ -875,6 +1001,13 @@ def check_engagement_name():
 
 @app.route("/api/engagements", methods=["POST"])
 def create_engagement():
+    # BO-only users cannot create engagements (analysts and COE only).
+    user_w = _user_workspace_client()
+    if _user_role(user_w) == "bo":
+        return jsonify({
+            "error": f"Members of the '{BO_GROUP}' group cannot create engagements.",
+        }), 403
+
     data = request.json
     # Validate required fields
     missing = []
@@ -1080,6 +1213,38 @@ def save_session(eid, session_num, data):
     the row's current updated_at."""
     _check_optimistic_lock(eid)
 
+    # Section 4 special case: preserve bo_approved on existing benchmark rows
+    # so an analyst's full-section save doesn't overwrite a BO's approval.
+    # Match by question text (the closest thing to a stable id we have); if
+    # the analyst regenerated benchmarks, the question text changes and the
+    # row legitimately resets to whatever value the payload supplies.
+    if session_num == 4 and isinstance(data, dict) and "benchmark_questions" in data:
+        try:
+            current_rows = sql_exec(
+                f"SELECT benchmark_questions FROM {TABLE} WHERE engagement_id = :eid",
+                {"eid": eid},
+            )
+            if current_rows:
+                raw = current_rows[0].get("benchmark_questions") or "[]"
+                existing = json.loads(raw) if isinstance(raw, str) else (raw or [])
+                approved_by_q = {
+                    (r.get("question") or "").strip(): bool(r.get("bo_approved"))
+                    for r in (existing or [])
+                    if isinstance(r, dict)
+                }
+                new_list = data.get("benchmark_questions") or []
+                for row in new_list:
+                    if isinstance(row, dict):
+                        q = (row.get("question") or "").strip()
+                        if q in approved_by_q:
+                            row["bo_approved"] = approved_by_q[q]
+                data["benchmark_questions"] = new_list
+        except Exception:
+            # If anything goes wrong reading the current state, fall back to the
+            # payload as-is. This is best-effort; the dedicated PATCH endpoint
+            # is the authoritative path for BO approvals.
+            pass
+
     cols = SESSION_COLS[session_num]
     set_parts = []
     ts = now_ts()
@@ -1189,24 +1354,76 @@ def coe_approve(eid):
         f"WHERE engagement_id = :eid",
         {"eid": eid, "status": status, "notes": notes, "reviewer": reviewer, "ts": ts},
     )
-    return jsonify({"success": True})
+    return jsonify({"success": True, "updated_at": ts})
+
+
+@app.route("/api/engagements/<eid>/benchmarks/bo-approved", methods=["PATCH"])
+def patch_benchmark_bo_approved(eid):
+    """Toggle the bo_approved flag on a single benchmark row.
+
+    Allowed for COE and BO group members (other users get 403). Intentionally
+    DOES NOT bump engagement.updated_at — this is a lightweight checkbox action
+    that lives outside the optimistic lock so a BO clicking the checkbox does
+    not 409 the analyst's autosave on the same engagement. The analyst's
+    save_session(4, ...) preserves bo_approved values from the DB (see merge in
+    save_session), so the BO's approval is never overwritten by an analyst.
+    """
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "reauth_required"}), 401
+    role = _user_role(user_w)
+    if role not in ("coe", "bo"):
+        return jsonify({
+            "error": (
+                f"Only members of the '{COE_GROUP}' or '{BO_GROUP}' group can "
+                f"change BO Approved."
+            ),
+        }), 403
+
+    body = request.json or {}
+    idx = body.get("idx")
+    value = bool(body.get("value", False))
+    if not isinstance(idx, int) or idx < 0:
+        return jsonify({"error": "idx must be a non-negative integer"}), 400
+
+    rows = sql_exec(
+        f"SELECT benchmark_questions FROM {TABLE} WHERE engagement_id = :eid",
+        {"eid": eid},
+    )
+    if not rows:
+        return jsonify({"error": "Engagement not found"}), 404
+
+    raw = rows[0].get("benchmark_questions") or "[]"
+    try:
+        bench = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except Exception:
+        bench = []
+
+    if not isinstance(bench, list) or idx >= len(bench):
+        return jsonify({"error": "Invalid benchmark index"}), 400
+    if not isinstance(bench[idx], dict):
+        return jsonify({"error": "Benchmark row is malformed"}), 400
+
+    bench[idx]["bo_approved"] = value
+    sql_run(
+        f"UPDATE {TABLE} SET benchmark_questions = :b WHERE engagement_id = :eid",
+        {"eid": eid, "b": json.dumps(bench)},
+    )
+    return jsonify({"success": True, "idx": idx, "value": value})
 
 
 # ---------------------------------------------------------------------------
 # API: Auto-summary (structured, no LLM)
 # ---------------------------------------------------------------------------
 
-BRIEF_MODEL = os.getenv("BRIEF_LLM_ENDPOINT_NAME") or "databricks-claude-haiku-4-5"
-
-
 def _generate_readiness_brief(eid):
     """Core Readiness Brief logic. Used by both the legacy sync endpoint and
     the async job task. Returns dict {summary, unacknowledged_gaps}.
     Raises on engagement-not-found or LLM/parse failure.
 
-    Uses BRIEF_MODEL (default Haiku 4.5) instead of the default Sonnet, since
-    this task is structured extraction with citations -- a small fast model
-    handles it well, and Sonnet was hitting 5+ minute generation times.
+    Uses the brief task's model (default Haiku 4.5 — see _model_for) instead
+    of the default Sonnet, since this task is structured extraction with
+    citations and a small fast model handles it well.
     """
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
@@ -1214,7 +1431,7 @@ def _generate_readiness_brief(eid):
     eng = parse_row(rows[0])
 
     prompt = _build_readiness_brief_prompt(eng)
-    raw = _call_llm_raw(prompt, model=BRIEF_MODEL, label="brief")
+    raw = _call_llm_raw(prompt, label="brief")
 
     # Output format:
     # <markdown brief>
@@ -1799,7 +2016,8 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
     if mv_defs_for_prompt:
         parts = []
         for fqn, (src, body) in mv_defs_for_prompt.items():
-            parts.append(f"### Metric View: `{fqn}` — source: {src}\n```\n{body}\n```")
+            # Cap each MV body so a sprawling YAML doesn't blow the prompt.
+            parts.append(f"### Metric View: `{fqn}` — source: {src}\n```\n{_trunc(body, 4000)}\n```")
         joined_mvs = "\n\n".join(parts)
         mv_block = f"""
 <metric_view_definitions>
@@ -1920,38 +2138,154 @@ Return ONLY the JSON object. No markdown fences, no preamble, no trailing commen
     return prompt
 
 
-def _call_llm_raw(prompt, max_tokens=16000, model=None, label=None):
+# --- LLM tunables ---
+#
+# Hard cap on prompt size. Catches runaway engagements before paying for a
+# slow LLM call that might time out or return garbage. ~80K chars is roughly
+# 20K input tokens — generous, but bounded.
+MAX_PROMPT_CHARS = int(os.getenv("LLM_MAX_PROMPT_CHARS") or "80000")
+
+# Per-cell character cap when stringifying a single field into a prompt.
+# Prevents one runaway value (long description, multi-paragraph note,
+# ten-page MV YAML) from dominating the input. Truncates with an ellipsis.
+MAX_CELL_CHARS = int(os.getenv("LLM_MAX_CELL_CHARS") or "1500")
+
+
+def _trunc(s, max_chars=MAX_CELL_CHARS):
+    """Truncate a string for inclusion in an LLM prompt. Returns the original
+    if short, else a head slice + ellipsis marker that signals truncation
+    to the LLM.
+    """
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"\n…[truncated, {len(s) - max_chars} chars dropped]"
+
+# Realistic max output tokens per task. Sonnet emits ~50 tok/sec, so 16K
+# tokens = 5+ min worst case (the timeout cliff). Right-sizing per task is
+# the single biggest speedup lever.
+TASK_MAX_TOKENS = {
+    "brief":              16000,  # citation-heavy markdown + structured gaps trailer
+    "plan":               10000,  # large structured JSON (filters/dimensions/measures/example_queries/narrative)
+    "mv-yaml":             6000,  # YAML output, typically 2-3K tokens
+    "mv-yaml-fix":         6000,  # retry with corrected columns
+    "benchmark-draft":     3000,  # 12 questions, ~1-2K tokens
+    "benchmark-sql":       1500,  # one SQL query
+    "benchmark-sql-fix":   1500,  # retry with error context
+    "benchmark-summary":    600,  # one-paragraph plain English
+}
+DEFAULT_MAX_TOKENS = 8000
+
+# Per-task model overrides. Each defaults to the global LLM_ENDPOINT, but
+# specific tasks can be downgraded to a faster model (Haiku 4.5) without
+# affecting the precision-sensitive ones (plan, mv-yaml, benchmark-sql).
+TASK_MODEL_ENV = {
+    "brief":              "BRIEF_LLM_ENDPOINT_NAME",
+    "benchmark-draft":    "BENCHMARK_DRAFT_LLM_ENDPOINT_NAME",
+    "benchmark-summary":  "BENCHMARK_SUMMARY_LLM_ENDPOINT_NAME",
+}
+TASK_MODEL_DEFAULT = {
+    "brief":              "databricks-claude-haiku-4-5",
+    "benchmark-draft":    "databricks-claude-haiku-4-5",
+    "benchmark-summary":  "databricks-claude-haiku-4-5",
+}
+
+
+def _model_for(label):
+    """Pick the LLM endpoint for a task: env var override, then per-task default,
+    then global LLM_ENDPOINT."""
+    env_name = TASK_MODEL_ENV.get(label)
+    if env_name:
+        configured = os.getenv(env_name)
+        if configured:
+            return configured
+        if label in TASK_MODEL_DEFAULT:
+            return TASK_MODEL_DEFAULT[label]
+    return LLM_ENDPOINT
+
+
+def _max_tokens_for(label, override=None):
+    """Pick max_tokens for a task. Caller can override; otherwise use the
+    per-task default; falls back to DEFAULT_MAX_TOKENS for unknown tags."""
+    if override is not None:
+        return override
+    return TASK_MAX_TOKENS.get(label, DEFAULT_MAX_TOKENS)
+
+
+def _call_llm_raw(prompt, max_tokens=None, model=None, label=None, retries=2):
     """Call the Databricks serving endpoint and return the raw text content (no JSON parse).
 
     Use this when the prompt asks for non-JSON output (e.g. markdown with a
     structured trailer) — JSON-wrapping markdown content breaks on every
     backtick or newline the LLM emits.
 
-    `model` overrides the default LLM_ENDPOINT for this single call. Useful
-    when a specific task (e.g. the Readiness Brief) wants a faster model
-    while other tasks keep using a stronger one.
-    `label` is a short tag for timing logs.
+    `max_tokens` defaults to the per-task value from TASK_MAX_TOKENS based on
+    `label`; explicit override wins. Right-sizing this is the biggest speedup
+    lever — Sonnet's output rate is ~50 tok/sec.
+
+    `model` overrides the default model selection. Without an override, the
+    model is resolved via `_model_for(label)`: per-task env var → per-task
+    default → global LLM_ENDPOINT.
+
+    `label` is a short tag for timing logs and per-task tuning lookup.
+
+    `retries` is the number of additional attempts on transient failures
+    (5xx, rate limit, network) with exponential backoff. Set to 0 to disable.
     """
-    endpoint = model or LLM_ENDPOINT
     tag = label or "llm"
+    endpoint = model or _model_for(tag)
+    resolved_max = _max_tokens_for(tag, max_tokens)
     prompt_chars = len(prompt)
+
+    if prompt_chars > MAX_PROMPT_CHARS:
+        raise ValueError(
+            f"Prompt for '{tag}' is {prompt_chars} chars (cap: {MAX_PROMPT_CHARS}). "
+            "Prompt builder needs truncation, or LLM_MAX_PROMPT_CHARS env var "
+            "needs to be raised. Aborting before paying for a slow LLM call."
+        )
+
     started = time.time()
-    print(f"[{tag}] start endpoint={endpoint} prompt_chars={prompt_chars} max_tokens={max_tokens}", flush=True)
-    try:
-        resp = w.serving_endpoints.query(
-            name=endpoint,
-            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-            max_tokens=max_tokens,
-            temperature=0.2,
-        )
-    except Exception as e:
-        elapsed = time.time() - started
-        print(f"[{tag}] FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
-        _log_llm_usage(
-            tag, endpoint, prompt_chars, 0, int(elapsed * 1000),
-            success=False, error=f"{type(e).__name__}: {e}",
-        )
-        raise
+    print(f"[{tag}] start endpoint={endpoint} prompt_chars={prompt_chars} max_tokens={resolved_max}", flush=True)
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = w.serving_endpoints.query(
+                name=endpoint,
+                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+                max_tokens=resolved_max,
+                temperature=0.2,
+            )
+            break
+        except Exception as e:
+            last_exc = e
+            err_str = str(e).lower()
+            transient = (
+                "rate limit" in err_str
+                or "429" in err_str
+                or "503" in err_str
+                or "504" in err_str
+                or "timeout" in err_str
+                or "connection" in err_str
+            )
+            if attempt < retries and transient:
+                # Exponential backoff with jitter: 1.5s, 3s, 6s...
+                delay = 1.5 * (2 ** attempt) * (0.75 + random.random() * 0.5)
+                print(f"[{tag}] transient error, retry {attempt+1}/{retries} in {delay:.1f}s: {type(e).__name__}", flush=True)
+                time.sleep(delay)
+                continue
+            elapsed = time.time() - started
+            print(f"[{tag}] FAILED after {elapsed:.1f}s ({attempt+1} attempt(s)): {type(e).__name__}: {e}", flush=True)
+            _log_llm_usage(
+                tag, endpoint, prompt_chars, 0, int(elapsed * 1000),
+                success=False, error=f"{type(e).__name__}: {e}",
+            )
+            raise
+    else:
+        # Exhausted retries
+        if last_exc:
+            raise last_exc
 
     # Best-effort: pull token counts off the response if the endpoint exposes
     # a `usage` object. Handles both raw-dict and SDK-object response shapes.
@@ -1985,9 +2319,9 @@ def _call_llm_raw(prompt, max_tokens=16000, model=None, label=None):
     return content
 
 
-def _call_llm(prompt, model=None, label=None):
+def _call_llm(prompt, model=None, label=None, max_tokens=None):
     """Call the LLM and return parsed JSON. Tolerates ```json fences."""
-    content = _call_llm_raw(prompt, model=model, label=label)
+    content = _call_llm_raw(prompt, model=model, label=label, max_tokens=max_tokens)
     text = content.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text
@@ -2591,7 +2925,7 @@ Common causes:
 
 Return JSON: {{"sql": "the corrected SQL"}}. No markdown fences, no commentary."""
             try:
-                retry_result = _call_llm(retry_prompt)
+                retry_result = _call_llm(retry_prompt, label="benchmark-sql-fix")
                 if isinstance(retry_result, dict):
                     retry_sql = str(retry_result.get("sql", "")).strip()
                 else:
@@ -2659,7 +2993,7 @@ def _summarize_benchmark_sql(question, sql_text):
 Write 2-3 sentences answering "how are we measuring this?" — no column names in backticks, no SQL jargon. Example voice: "Counts every claim received in the current calendar year, excluding voided records, and averages the number of days between receipt and final decision." Your summary must describe the SQL exactly as written, including any filters or groupings it applies. Do not describe anything the SQL doesn't actually do.
 
 Return JSON with exactly: {{"explanation": "..."}}. No markdown fences."""
-    result = _call_llm(prompt)
+    result = _call_llm(prompt, label="benchmark-summary")
     if isinstance(result, dict):
         return str(result.get("explanation", "")).strip()
     return ""
@@ -3350,7 +3684,7 @@ Rewrite the YAML so every bare column reference in any `expr`, `filter`, or join
 
 Return JSON with exactly: {{"yaml": "...", "source_table": "...", "suggested_name": "..."}}. No markdown fences."""
         try:
-            result2 = _call_llm(fix_prompt)
+            result2 = _call_llm(fix_prompt, label="mv-yaml-fix")
             yaml_text2 = _strip_yaml_fences(str(result2.get("yaml", "")))
             missing2 = _validate_yaml_columns(yaml_text2, schemas)
             if yaml_text2 and len(missing2) < len(missing):
@@ -3507,6 +3841,7 @@ def create_metric_view(eid):
         return jsonify({"error": f"Failed to create metric view: {msg}"}), status
 
     # Persist to Session 3 (last-created MV) and auto-add to Session 4 data plan
+    new_updated_at = None
     if rows:
         eng = parse_row(rows[0])
         s4 = eng["sessions"]["4"]
@@ -3519,14 +3854,19 @@ def create_metric_view(eid):
                 "include_in_space": "Yes",
                 "notes": "Auto-added from Session 3 metric view creation.",
             })
-        ts = now_ts()
+        new_updated_at = now_ts()
         sql_run(
             f"UPDATE {TABLE} SET data_plan = :dp, metric_view_fqn = :fqn, updated_at = :ts "
             f"WHERE engagement_id = :eid",
-            {"eid": eid, "dp": json.dumps(data_plan), "fqn": created_fqn, "ts": ts},
+            {"eid": eid, "dp": json.dumps(data_plan), "fqn": created_fqn, "ts": new_updated_at},
         )
 
-    return jsonify({"success": True, "fqn": created_fqn})
+    # Return updated_at so the frontend can refresh its optimistic-lock token.
+    # Without this the next autosave 409s, same pattern as push-to-Genie.
+    resp = {"success": True, "fqn": created_fqn}
+    if new_updated_at is not None:
+        resp["updated_at"] = new_updated_at
+    return jsonify(resp)
 
 
 # ---------------------------------------------------------------------------
