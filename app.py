@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask, request, jsonify, send_from_directory
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.sql import StatementParameterListItem
+from databricks.sdk.service.sql import StatementParameterListItem, StatementState
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
 app = Flask(__name__, static_folder="static", static_url_path="")
@@ -436,7 +436,29 @@ def jobs_status(job_id):
 # SQL helpers
 # ---------------------------------------------------------------------------
 
+class SqlTransientError(RuntimeError):
+    """Raised when a SQL statement does not reach a successful terminal state
+    within the warehouse-warmup window — typically a cold warehouse, network
+    blip, or timeout. Distinct from a genuine empty result so callers can tell
+    'row doesn't exist' from 'we couldn't ask.'"""
+
+
 def sql_exec(query, params=None):
+    """Execute a read query and return a list of dict rows.
+
+    Returns:
+        list[dict]: rows on a SUCCEEDED query (empty list = genuinely no rows).
+
+    Raises:
+        SqlTransientError: warehouse cold-start / timeout / non-terminal state.
+        RuntimeError: query failed (syntax error, permission denied, etc).
+
+    The wait_timeout is set generously so a cold warehouse has time to spin
+    up before we treat the call as transient. Without this, every read
+    against a cold warehouse silently returned [] and callers interpreted
+    'no results' the same as 'real empty result' — for /api/jobs/start
+    that surfaced as a confusing 404 'Engagement not found.'
+    """
     sdk_params = None
     if params:
         sdk_params = [
@@ -449,11 +471,27 @@ def sql_exec(query, params=None):
         parameters=sdk_params,
         catalog=CATALOG,
         schema=SCHEMA,
+        wait_timeout="50s",  # generous: covers warehouse cold-start
     )
-    if resp.result and resp.result.data_array:
-        cols = [c.name for c in resp.manifest.schema.columns]
-        return [dict(zip(cols, row)) for row in resp.result.data_array]
-    return []
+
+    state = resp.status.state if resp.status else None
+    if state == StatementState.SUCCEEDED:
+        if resp.result and resp.result.data_array:
+            cols = [c.name for c in resp.manifest.schema.columns]
+            return [dict(zip(cols, row)) for row in resp.result.data_array]
+        return []  # genuine empty result
+    if state in (StatementState.FAILED, StatementState.CANCELED, StatementState.CLOSED):
+        err = (
+            resp.status.error.message
+            if resp.status and resp.status.error
+            else f"state={state}"
+        )
+        raise RuntimeError(f"SQL failed: {err}")
+    # PENDING / RUNNING / None — non-terminal after wait_timeout
+    raise SqlTransientError(
+        f"SQL did not complete within wait_timeout (state={state}). "
+        "The warehouse may be cold; retry in a few seconds."
+    )
 
 
 def sql_run(query, params=None, *, must_succeed=False):
@@ -728,10 +766,23 @@ def _authorize_engagement(eid):
       - COE group: full access including Approve and BO Approved.
       - BO group: read all; edit S1/S2 only; view S4 (read-only except for BO
         Approved checkboxes); cannot touch S3/S5/S6 or any AI/push action.
+
+    Returns (eng, None) on success, or (None, error_response) if not found
+    (404) or the warehouse couldn't answer (503 — transient, retry).
     """
-    rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    try:
+        rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
+    except SqlTransientError:
+        # Cold warehouse / timeout — distinct from "row doesn't exist." Return
+        # 503 so the frontend can show "wait and retry" instead of confusing
+        # the user with "Not found."
+        return None, (jsonify({
+            "error": "Database temporarily unavailable. The SQL warehouse may "
+                     "be starting up; retry in a few seconds.",
+            "transient": True,
+        }), 503)
     if not rows:
-        return None, (jsonify({"error": "Not found"}), 404)
+        return None, (jsonify({"error": "Engagement not found"}), 404)
     return parse_row(rows[0]), None
 
 
@@ -899,14 +950,21 @@ def list_engagements():
     (see permissions model in _authorize_engagement).
     """
     # Soft-deleted rows (deleted_at IS NOT NULL/empty) are hidden from the list.
-    # The row stays in Delta so an admin can recover it via direct URL/SQL.
+    # The row stays in Delta so an admin can recover it via delete_at IS NULL/SQL.
     not_deleted = "(deleted_at IS NULL OR deleted_at = '')"
-    rows = sql_exec(
-        f"SELECT engagement_id, genie_space_name, business_owner_name, "
-        f"business_owner_email, analyst_name, analyst_email, "
-        f"current_session, status, created_at, updated_at "
-        f"FROM {TABLE} WHERE {not_deleted} ORDER BY updated_at DESC"
-    )
+    try:
+        rows = sql_exec(
+            f"SELECT engagement_id, genie_space_name, business_owner_name, "
+            f"business_owner_email, analyst_name, analyst_email, "
+            f"current_session, status, created_at, updated_at "
+            f"FROM {TABLE} WHERE {not_deleted} ORDER BY updated_at DESC"
+        )
+    except SqlTransientError:
+        return jsonify({
+            "error": "Database temporarily unavailable. The SQL warehouse may "
+                     "be starting up; retry in a few seconds.",
+            "transient": True,
+        }), 503
     return jsonify(rows)
 
 
