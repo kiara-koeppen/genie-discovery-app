@@ -150,6 +150,20 @@ export const api = {
 
   checkCoeMembership: () => json<{ is_member: boolean }>("/user/coe-member"),
 
+  getUserRole: () =>
+    json<{
+      is_coe: boolean;
+      is_bo: boolean;
+      coe_group_name: string;
+      bo_group_name: string;
+    }>("/user/role"),
+
+  setBenchmarkBoApproved: (id: string, idx: number, value: boolean) =>
+    json<{ success: boolean; idx: number; value: boolean }>(
+      `/engagements/${id}/benchmarks/bo-approved`,
+      { method: "PATCH", body: JSON.stringify({ idx, value }) },
+    ),
+
   listEngagements: () => json<Record<string, string>[]>("/engagements"),
 
   checkNameAvailable: (name: string, excludeEid?: string) => {

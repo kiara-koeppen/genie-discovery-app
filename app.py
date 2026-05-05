@@ -32,6 +32,9 @@ TABLE = f"{CATALOG}.{SCHEMA}.discovery"
 
 # Optional — sensible defaults are OK here.
 COE_GROUP = os.getenv("COE_GROUP_NAME") or "genie-coe-reviewers"
+# BO group: members can view all engagements but only edit S1/S2 + click BO
+# Approved on benchmark rows. If unset, no users get BO permissions.
+BO_GROUP = os.getenv("BO_GROUP_NAME") or "genie-bo-reviewers"
 LLM_ENDPOINT = os.getenv("LLM_ENDPOINT_NAME") or "databricks-claude-sonnet-4-6"
 
 w = WorkspaceClient()
@@ -683,25 +686,52 @@ def _user_is_coe_member(user_w):
     return False
 
 
-def _authorize_engagement(eid):
-    """Gate access to a single engagement row.
+def _user_is_bo_member(user_w):
+    """True if the OBO user is in BO_GROUP. False on any error."""
+    if not user_w:
+        return False
+    try:
+        me = user_w.current_user.me()
+        for g in (me.groups or []):
+            if g.display == BO_GROUP:
+                return True
+    except Exception:
+        pass
+    return False
 
-    Returns (engagement_dict, None) if the current user is the analyst, the BO,
-    or a COE-group member. Returns (None, flask_error_response) otherwise.
-    COE members get access so they can review engagements for Session 4 approval.
+
+def _user_role(user_w):
+    """Return ('coe' | 'bo' | 'analyst' | None) — the user's role for permission
+    decisions. COE wins over BO; default authenticated users are 'analyst'.
+    Returns None only if there's no OBO client (unauthenticated request).
+    """
+    if not user_w:
+        return None
+    is_coe = _user_is_coe_member(user_w)
+    if is_coe:
+        return "coe"
+    if _user_is_bo_member(user_w):
+        return "bo"
+    return "analyst"
+
+
+def _authorize_engagement(eid):
+    """Verify engagement exists. Read access is open to any authenticated user
+    (CAN_USE on the app is the access boundary). Mutation gating happens at the
+    section level via _gate_engagement_routes — see permissions model below.
+
+    Permissions model:
+      - Default (any authenticated user): full read/write on all engagements,
+        EXCEPT clicking Approve in S4 (COE only) and clicking BO Approved on
+        benchmark rows (COE or BO group only).
+      - COE group: full access including Approve and BO Approved.
+      - BO group: read all; edit S1/S2 only; view S4 (read-only except for BO
+        Approved checkboxes); cannot touch S3/S5/S6 or any AI/push action.
     """
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
         return None, (jsonify({"error": "Not found"}), 404)
-    eng = parse_row(rows[0])
-    current = (get_current_user() or "").strip().lower()
-    analyst = (eng.get("analyst_email") or "").strip().lower()
-    bo = (eng.get("business_owner_email") or "").strip().lower()
-    if current and (current == analyst or current == bo):
-        return eng, None
-    if _user_is_coe_member(_user_workspace_client()):
-        return eng, None
-    return None, (jsonify({"error": "Forbidden"}), 403)
+    return parse_row(rows[0]), None
 
 
 import re as _re
@@ -709,14 +739,35 @@ import re as _re
 _UUID_RE = _re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
+def _bo_can_access(method, sub_path):
+    """Whitelist of operations a BO-only user (not COE) is allowed to perform.
+
+    Everything else returns 403 for BOs. The whitelist is intentionally tight
+    so adding new endpoints doesn't accidentally open BO access — if a future
+    endpoint should be BO-accessible, it must be added here explicitly.
+    """
+    if method == "GET":
+        return True
+    if method == "PUT" and sub_path in ("/sessions/1", "/sessions/2"):
+        return True
+    if method == "PATCH" and sub_path == "/benchmarks/bo-approved":
+        return True
+    return False
+
+
 @app.before_request
 def _gate_engagement_routes():
-    """Apply _authorize_engagement to every /api/engagements/<eid>[/...] route.
+    """Apply _authorize_engagement to every /api/engagements/<eid>[/...] route,
+    then layer BO restrictions on top.
 
-    Catches all the per-session saves, generate-plan, push-to-genie, etc. without
-    having to bolt an auth check onto each handler individually. Only triggers
-    when the path segment after /api/engagements/ looks like an engagement UUID
-    (so sibling routes like /api/engagements/check-name are not mistakenly gated).
+    Layer 1: existence/auth — engagement exists and caller is authenticated.
+    Layer 2: section-level role gate — BO-only users are limited to a tight
+             whitelist of operations (read everything, edit S1/S2, click the
+             BO-Approved checkbox via the dedicated PATCH endpoint).
+
+    Only triggers when the path segment after /api/engagements/ looks like an
+    engagement UUID (so sibling routes like /api/engagements/check-name are
+    not mistakenly gated).
     """
     path = request.path or ""
     prefix = "/api/engagements/"
@@ -729,7 +780,17 @@ def _gate_engagement_routes():
     if not _UUID_RE.match(eid):
         return None
     _, err = _authorize_engagement(eid)
-    return err
+    if err:
+        return err
+    # Layer 2: BO-only users get a tight whitelist of operations.
+    sub_path = remainder[len(eid):]  # "" or "/sessions/1" or "/coe-approve" etc.
+    user_w = _user_workspace_client()
+    role = _user_role(user_w)
+    if role == "bo" and not _bo_can_access(request.method, sub_path):
+        return jsonify({
+            "error": f"Members of the '{BO_GROUP}' group cannot perform this action."
+        }), 403
+    return None
 
 
 @app.route("/api/warehouses")
@@ -809,36 +870,42 @@ def api_user_coe_member():
         return jsonify(result)
 
 
+@app.route("/api/user/role")
+def api_user_role():
+    """Return the caller's role flags so the frontend can render the right UI.
+
+    Frontend uses this to decide what tabs/buttons/checkboxes to show. The
+    backend independently re-checks role on every mutation, so this is
+    advisory-only — a frontend that fakes a role still gets 403'd server-side.
+    """
+    user_w = _user_workspace_client()
+    return jsonify({
+        "is_coe": _user_is_coe_member(user_w),
+        "is_bo": _user_is_bo_member(user_w),
+        "coe_group_name": COE_GROUP,
+        "bo_group_name": BO_GROUP,
+    })
+
+
 # ---------------------------------------------------------------------------
 # API: Engagements CRUD
 # ---------------------------------------------------------------------------
 
 @app.route("/api/engagements", methods=["GET"])
 def list_engagements():
-    """Return only engagements where the caller is a stakeholder — or all
-    engagements if the caller is a COE-group reviewer.
+    """Return all non-deleted engagements. Read visibility is open to any
+    authenticated user; the per-section write rules are enforced elsewhere
+    (see permissions model in _authorize_engagement).
     """
-    current = (get_current_user() or "").strip().lower()
     # Soft-deleted rows (deleted_at IS NOT NULL/empty) are hidden from the list.
     # The row stays in Delta so an admin can recover it via direct URL/SQL.
     not_deleted = "(deleted_at IS NULL OR deleted_at = '')"
-    if _user_is_coe_member(_user_workspace_client()):
-        rows = sql_exec(
-            f"SELECT engagement_id, genie_space_name, business_owner_name, "
-            f"analyst_name, current_session, status, created_at, updated_at "
-            f"FROM {TABLE} WHERE {not_deleted} ORDER BY updated_at DESC"
-        )
-    else:
-        rows = sql_exec(
-            f"SELECT engagement_id, genie_space_name, business_owner_name, "
-            f"analyst_name, current_session, status, created_at, updated_at "
-            f"FROM {TABLE} "
-            f"WHERE {not_deleted} AND ("
-            f"LOWER(TRIM(analyst_email)) = :u "
-            f"OR LOWER(TRIM(business_owner_email)) = :u) "
-            f"ORDER BY updated_at DESC",
-            {"u": current},
-        )
+    rows = sql_exec(
+        f"SELECT engagement_id, genie_space_name, business_owner_name, "
+        f"business_owner_email, analyst_name, analyst_email, "
+        f"current_session, status, created_at, updated_at "
+        f"FROM {TABLE} WHERE {not_deleted} ORDER BY updated_at DESC"
+    )
     return jsonify(rows)
 
 
@@ -875,6 +942,13 @@ def check_engagement_name():
 
 @app.route("/api/engagements", methods=["POST"])
 def create_engagement():
+    # BO-only users cannot create engagements (analysts and COE only).
+    user_w = _user_workspace_client()
+    if _user_role(user_w) == "bo":
+        return jsonify({
+            "error": f"Members of the '{BO_GROUP}' group cannot create engagements.",
+        }), 403
+
     data = request.json
     # Validate required fields
     missing = []
@@ -1080,6 +1154,38 @@ def save_session(eid, session_num, data):
     the row's current updated_at."""
     _check_optimistic_lock(eid)
 
+    # Section 4 special case: preserve bo_approved on existing benchmark rows
+    # so an analyst's full-section save doesn't overwrite a BO's approval.
+    # Match by question text (the closest thing to a stable id we have); if
+    # the analyst regenerated benchmarks, the question text changes and the
+    # row legitimately resets to whatever value the payload supplies.
+    if session_num == 4 and isinstance(data, dict) and "benchmark_questions" in data:
+        try:
+            current_rows = sql_exec(
+                f"SELECT benchmark_questions FROM {TABLE} WHERE engagement_id = :eid",
+                {"eid": eid},
+            )
+            if current_rows:
+                raw = current_rows[0].get("benchmark_questions") or "[]"
+                existing = json.loads(raw) if isinstance(raw, str) else (raw or [])
+                approved_by_q = {
+                    (r.get("question") or "").strip(): bool(r.get("bo_approved"))
+                    for r in (existing or [])
+                    if isinstance(r, dict)
+                }
+                new_list = data.get("benchmark_questions") or []
+                for row in new_list:
+                    if isinstance(row, dict):
+                        q = (row.get("question") or "").strip()
+                        if q in approved_by_q:
+                            row["bo_approved"] = approved_by_q[q]
+                data["benchmark_questions"] = new_list
+        except Exception:
+            # If anything goes wrong reading the current state, fall back to the
+            # payload as-is. This is best-effort; the dedicated PATCH endpoint
+            # is the authoritative path for BO approvals.
+            pass
+
     cols = SESSION_COLS[session_num]
     set_parts = []
     ts = now_ts()
@@ -1189,7 +1295,62 @@ def coe_approve(eid):
         f"WHERE engagement_id = :eid",
         {"eid": eid, "status": status, "notes": notes, "reviewer": reviewer, "ts": ts},
     )
-    return jsonify({"success": True})
+    return jsonify({"success": True, "updated_at": ts})
+
+
+@app.route("/api/engagements/<eid>/benchmarks/bo-approved", methods=["PATCH"])
+def patch_benchmark_bo_approved(eid):
+    """Toggle the bo_approved flag on a single benchmark row.
+
+    Allowed for COE and BO group members (other users get 403). Intentionally
+    DOES NOT bump engagement.updated_at — this is a lightweight checkbox action
+    that lives outside the optimistic lock so a BO clicking the checkbox does
+    not 409 the analyst's autosave on the same engagement. The analyst's
+    save_session(4, ...) preserves bo_approved values from the DB (see merge in
+    save_session), so the BO's approval is never overwritten by an analyst.
+    """
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "reauth_required"}), 401
+    role = _user_role(user_w)
+    if role not in ("coe", "bo"):
+        return jsonify({
+            "error": (
+                f"Only members of the '{COE_GROUP}' or '{BO_GROUP}' group can "
+                f"change BO Approved."
+            ),
+        }), 403
+
+    body = request.json or {}
+    idx = body.get("idx")
+    value = bool(body.get("value", False))
+    if not isinstance(idx, int) or idx < 0:
+        return jsonify({"error": "idx must be a non-negative integer"}), 400
+
+    rows = sql_exec(
+        f"SELECT benchmark_questions FROM {TABLE} WHERE engagement_id = :eid",
+        {"eid": eid},
+    )
+    if not rows:
+        return jsonify({"error": "Engagement not found"}), 404
+
+    raw = rows[0].get("benchmark_questions") or "[]"
+    try:
+        bench = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except Exception:
+        bench = []
+
+    if not isinstance(bench, list) or idx >= len(bench):
+        return jsonify({"error": "Invalid benchmark index"}), 400
+    if not isinstance(bench[idx], dict):
+        return jsonify({"error": "Benchmark row is malformed"}), 400
+
+    bench[idx]["bo_approved"] = value
+    sql_run(
+        f"UPDATE {TABLE} SET benchmark_questions = :b WHERE engagement_id = :eid",
+        {"eid": eid, "b": json.dumps(bench)},
+    )
+    return jsonify({"success": True, "idx": idx, "value": value})
 
 
 # ---------------------------------------------------------------------------
