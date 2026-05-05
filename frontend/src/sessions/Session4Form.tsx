@@ -89,7 +89,7 @@ interface Props {
 }
 
 export default function Session4Form({
-  data, onChange, readOnly, session3Data, engagementId, isCoeMember, isBoOnly,
+  data, onChange, readOnly, session1Data, session2Data, session3Data, engagementId, isCoeMember, isBoOnly,
 }: Props) {
   // BO users render this whole section read-only EXCEPT the BO-Approved
   // benchmark checkboxes (which are wired to a dedicated PATCH endpoint
@@ -263,10 +263,18 @@ export default function Session4Form({
     return `${m}:${s.toString().padStart(2, "0")}`;
   };
 
+  // Require some S1-S3 content before auto-firing brief generation. An empty
+  // engagement gives the LLM nothing to summarize and tends to 502 the model
+  // serving endpoint. User can still trigger manually via Generate Brief.
+  const hasMinimalContent = (
+    (session1Data?.business_context || []).some((q: any) => (q?.response || "").trim()) ||
+    (session2Data?.question_bank || []).some((q: any) => (q?.question_text || "").trim()) ||
+    (session3Data?.sql_expressions || []).length > 0
+  );
   useEffect(() => {
     if (data.auto_summary) setSummary(data.auto_summary);
     if (data.brief_unacknowledged_gaps) setCurrentGaps(data.brief_unacknowledged_gaps);
-    if (!data.auto_summary && engagementId) fetchSummary();
+    if (!data.auto_summary && engagementId && hasMinimalContent) fetchSummary();
   }, [engagementId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateGapResponse = (gapId: string, text: string) => {
