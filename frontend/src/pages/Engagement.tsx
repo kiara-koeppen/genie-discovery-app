@@ -64,6 +64,11 @@ export default function Engagement({ readOnly = false }: Props) {
   });
   const [metaError, setMetaError] = useState<string>("");
   const [isCoeMember, setIsCoeMember] = useState(false);
+  const [isBoMember, setIsBoMember] = useState(false);
+  // BO-only users (BO group, NOT in COE) get the restricted view: hide
+  // S3/S5/S6 tabs, hide pencil edit, hide AI buttons in S4, etc. COE-and-BO
+  // gets full access (COE wins).
+  const isBoOnly = isBoMember && !isCoeMember;
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const skipNextAutosave = useRef(true);
@@ -80,12 +85,13 @@ export default function Engagement({ readOnly = false }: Props) {
     if (!id) return;
     setLoading(true);
     try {
-      const [eng, coe] = await Promise.all([
+      const [eng, role] = await Promise.all([
         api.getEngagement(id) as Promise<any>,
-        api.checkCoeMembership(),
+        api.getUserRole(),
       ]);
       setData(eng);
-      setIsCoeMember(coe.is_member);
+      setIsCoeMember(role.is_coe);
+      setIsBoMember(role.is_bo);
       updatedAtRef.current = String(eng.updated_at || "");
       const s = eng.sessions || {};
       skipNextAutosave.current = true;
@@ -155,6 +161,10 @@ export default function Engagement({ readOnly = false }: Props) {
       skipNextAutosave.current = false;
       return;
     }
+    // BO-only users can only PUT S1 and S2. Skip autosave if the most recent
+    // edit was outside that scope (defense in depth — the section-level
+    // backend gate would 403 us anyway).
+    if (isBoOnly && lastEditedSessionRef.current >= 3) return;
     setSaveStatus("dirty");
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     autosaveTimer.current = setTimeout(() => {
@@ -163,7 +173,7 @@ export default function Engagement({ readOnly = false }: Props) {
     return () => {
       if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     };
-  }, [sessionDrafts, readOnly, id, persistSession]);
+  }, [sessionDrafts, readOnly, id, persistSession, isBoOnly]);
 
   const handleManualSave = async () => {
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
@@ -358,7 +368,7 @@ export default function Engagement({ readOnly = false }: Props) {
         <Typography variant="h5">
           {data.genie_space_name || "Untitled Space"}
         </Typography>
-        {!readOnly && (
+        {!readOnly && !isBoOnly && (
           <Tooltip title="Edit engagement info">
             <IconButton size="small" onClick={openEdit} sx={{ ml: 0.5 }}>
               <EditIcon fontSize="small" />
@@ -406,10 +416,15 @@ export default function Engagement({ readOnly = false }: Props) {
       <Paper sx={{ mb: 2 }}>
         <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="fullWidth">
           {SESSION_LABELS.map((label, i) => {
+            // BO users only see S1, S2, S4. S3, S5, S6 are hidden entirely
+            // (not just locked) so they don't see technical-design / configure-
+            // space / prototype-review surfaces.
+            if (isBoOnly && (i === 2 || i === 4 || i === 5)) return null;
             const locked = (i === 4 || i === 5) && !isApproved;
             return (
               <Tab
                 key={i}
+                value={i}
                 label={
                   locked ? (
                     <Tooltip title="Requires COE approval">
@@ -453,6 +468,7 @@ export default function Engagement({ readOnly = false }: Props) {
             session3Data={sessionDrafts[3]}
             engagementId={id}
             isCoeMember={isCoeMember}
+            isBoOnly={isBoOnly}
           />
         )}
         {tab === 4 && (
@@ -467,8 +483,10 @@ export default function Engagement({ readOnly = false }: Props) {
         {tab === 5 && <Session6Form {...sessionProps(6)} />}
       </Box>
 
-      {/* Save Button */}
-      {!readOnly && (
+      {/* Save Button — BOs only see it on S1+S2 (the only sections they can write).
+          On S4, BO interactions go through the dedicated BO-Approved PATCH from
+          inside Session4Form, so no full-section save is needed. */}
+      {!readOnly && !(isBoOnly && tab === 3) && (
         <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 2, mb: 4 }}>
           <Button
             variant="contained"

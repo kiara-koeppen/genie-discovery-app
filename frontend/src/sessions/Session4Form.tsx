@@ -82,11 +82,26 @@ interface Props {
   session3Data?: Record<string, any>;
   engagementId?: string;
   isCoeMember?: boolean;
+  /** True when the caller is in the BO group AND not in COE. BO-only users see
+   *  most of S4 read-only; only the BO Approved benchmark checkboxes are
+   *  interactive (and they call the dedicated PATCH endpoint). */
+  isBoOnly?: boolean;
 }
 
 export default function Session4Form({
-  data, onChange, readOnly, session3Data, engagementId, isCoeMember,
+  data, onChange, readOnly, session3Data, engagementId, isCoeMember, isBoOnly,
 }: Props) {
+  // BO users render this whole section read-only EXCEPT the BO-Approved
+  // benchmark checkboxes (which are wired to a dedicated PATCH endpoint
+  // below). Combining with the existing `readOnly` prop catches both
+  // gating paths.
+  const sectionReadOnly = readOnly || !!isBoOnly;
+  // Only COE and BO group members can flip the BO Approved checkbox. Default
+  // analysts (not in either group) cannot. The checkbox calls a dedicated
+  // PATCH endpoint (api.setBenchmarkBoApproved) rather than going through
+  // the normal section save path so it doesn't conflict with optimistic
+  // locking on the rest of S4.
+  const canToggleBoApproved = !!isCoeMember || !!isBoOnly;
   const [summary, setSummary] = useState("");
   const [loadingSummary, setLoadingSummary] = useState(false);
   const [briefError, setBriefError] = useState("");
@@ -582,7 +597,7 @@ export default function Session4Form({
             columns={DATA_PLAN_COLS}
             rows={data.data_plan || []}
             onChange={(rows) => onChange("data_plan", rows)}
-            readOnly={readOnly}
+            readOnly={sectionReadOnly}
           />
         </AccordionDetails>
       </Accordion>
@@ -602,7 +617,7 @@ export default function Session4Form({
             that distinguishes analyst-acknowledged gaps from unacknowledged coverage failures.
             Regenerate after any change to Sessions 1-3 or the Data Plan.
           </Typography>
-          {!readOnly && (
+          {!sectionReadOnly && (
             <Button
               size="small"
               variant="outlined"
@@ -720,7 +735,7 @@ export default function Session4Form({
                         placeholder="How will this gap be addressed? Why is it acceptable to ship as-is? What's the analyst's take?"
                         value={resp}
                         onChange={(v) => updateGapResponse(g.id, v)}
-                        disabled={readOnly}
+                        disabled={sectionReadOnly}
                         dialogTitle={`Response: ${g.title}`}
                       />
                     </Paper>
@@ -786,7 +801,7 @@ export default function Session4Form({
             the other configured context. Minimum 5 BO-approved to unlock COE approval.
           </Alert>
 
-          {!readOnly && (
+          {!sectionReadOnly && (
             <Stack direction="row" spacing={1} sx={{ mb: 2, flexWrap: "wrap", alignItems: "center" }}>
               <TextField
                 size="small"
@@ -862,7 +877,7 @@ export default function Session4Form({
               />
             </Stack>
           )}
-          {readOnly && (
+          {sectionReadOnly && (
             <Box sx={{ mb: 2, display: "flex", justifyContent: "flex-end" }}>
               <FormControlLabel
                 control={
@@ -877,7 +892,7 @@ export default function Session4Form({
               />
             </Box>
           )}
-          {!readOnly && (
+          {!sectionReadOnly && (
             <Alert severity="warning" sx={{ mb: 2 }} variant="outlined">
               LLM-drafted SQL is a starting point only. <strong>Verify every query</strong> runs
               against your data and returns what the question asks before marking it BO-approved.
@@ -894,7 +909,7 @@ export default function Session4Form({
                       size="small"
                       value={b.category || "Core"}
                       onChange={(e) => updateBenchmark(i, "category", e.target.value)}
-                      disabled={readOnly}
+                      disabled={sectionReadOnly}
                       sx={{ minWidth: 120 }}
                     >
                       <MenuItem value="Core">Core</MenuItem>
@@ -904,7 +919,7 @@ export default function Session4Form({
                       size="small"
                       value={b.difficulty || "Medium"}
                       onChange={(e) => updateBenchmark(i, "difficulty", e.target.value)}
-                      disabled={readOnly}
+                      disabled={sectionReadOnly}
                       sx={{ minWidth: 110 }}
                     >
                       <MenuItem value="Easy">Easy</MenuItem>
@@ -914,7 +929,9 @@ export default function Session4Form({
                     <Box sx={{ flex: 1 }} />
                     <Tooltip
                       title={
-                        !b.question?.trim() || !b.expected_sql?.trim()
+                        !canToggleBoApproved
+                          ? "Only COE or BO group members can change BO Approved"
+                          : !b.question?.trim() || !b.expected_sql?.trim()
                           ? "Question and SQL required before BO approval"
                           : "BO approved"
                       }
@@ -924,14 +941,33 @@ export default function Session4Form({
                           <Checkbox
                             size="small"
                             checked={!!b.bo_approved}
-                            onChange={(e) => updateBenchmark(i, "bo_approved", e.target.checked)}
-                            disabled={readOnly || !b.question?.trim() || !b.expected_sql?.trim()}
+                            onChange={async (e) => {
+                              if (!engagementId || !canToggleBoApproved) return;
+                              const newVal = e.target.checked;
+                              try {
+                                await api.setBenchmarkBoApproved(engagementId, i, newVal);
+                                // Update local state to reflect server change.
+                                // The PATCH endpoint intentionally does not bump
+                                // updated_at (lives outside the optimistic lock),
+                                // and save_session preserves bo_approved server-
+                                // side, so a follow-up analyst autosave won't
+                                // overwrite this.
+                                updateBenchmark(i, "bo_approved", newVal);
+                              } catch (err) {
+                                console.error("BO Approved update failed:", err);
+                              }
+                            }}
+                            disabled={
+                              !canToggleBoApproved ||
+                              !b.question?.trim() ||
+                              !b.expected_sql?.trim()
+                            }
                           />
                           <Typography variant="caption">BO approved</Typography>
                         </Stack>
                       </span>
                     </Tooltip>
-                    {!readOnly && (
+                    {!sectionReadOnly && (
                       <IconButton size="small" onClick={() => removeBenchmark(i)}>
                         <DeleteIcon fontSize="small" />
                       </IconButton>
@@ -943,7 +979,7 @@ export default function Session4Form({
                     label="Question"
                     value={b.question || ""}
                     onChange={(e) => updateBenchmark(i, "question", e.target.value)}
-                    disabled={readOnly}
+                    disabled={sectionReadOnly}
                     sx={{ mb: 1.5 }}
                   />
 
@@ -953,7 +989,7 @@ export default function Session4Form({
                         <Typography variant="caption" color="text.secondary">
                           Expected SQL
                         </Typography>
-                        {!readOnly && (
+                        {!sectionReadOnly && (
                           <Tooltip title="Draft SQL + plain-English summary for this row with AI">
                             <span>
                               <IconButton
@@ -978,7 +1014,7 @@ export default function Session4Form({
                               size="small"
                               color="primary"
                               onClick={() => runBenchmarkSql(i)}
-                              disabled={readOnly || runningSqlIdx === i || !b.expected_sql?.trim() || !benchmarkWarehouseId}
+                              disabled={sectionReadOnly || runningSqlIdx === i || !b.expected_sql?.trim() || !benchmarkWarehouseId}
                             >
                               {runningSqlIdx === i ? <CircularProgress size={14} /> : <PlayArrowIcon fontSize="small" />}
                             </IconButton>
@@ -1012,7 +1048,7 @@ export default function Session4Form({
                         value={b.expected_sql || ""}
                         onChange={(v) => updateBenchmark(i, "expected_sql", v)}
                         placeholder="SELECT ..."
-                        disabled={readOnly}
+                        disabled={sectionReadOnly}
                         minRows={2}
                         monospace
                         dialogTitle={`Expected SQL — Benchmark #${i + 1}`}
@@ -1079,7 +1115,7 @@ export default function Session4Form({
                       <Typography variant="caption" color="text.secondary">
                         Measurement Summary (plain English)
                       </Typography>
-                      {!readOnly && (
+                      {!sectionReadOnly && (
                         <Tooltip title="Regenerate summary from the current SQL (overwrites existing summary)">
                           <span>
                             <IconButton
@@ -1097,7 +1133,7 @@ export default function Session4Form({
                       value={b.notes || ""}
                       onChange={(v) => updateBenchmark(i, "notes", v)}
                       placeholder="How we're measuring this, in plain English. Auto-filled when SQL is drafted."
-                      disabled={readOnly}
+                      disabled={sectionReadOnly}
                       minRows={2}
                       dialogTitle={`Measurement Summary — Benchmark #${i + 1}`}
                     />

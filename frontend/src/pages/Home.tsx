@@ -1,14 +1,15 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Box, Typography, Button, Card, CardContent, CardActions, Grid2 as Grid,
   Dialog, DialogTitle, DialogContent, DialogActions, TextField,
-  Chip, IconButton, CircularProgress, Alert,
+  Chip, IconButton, CircularProgress, Alert, InputAdornment,
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import EditIcon from "@mui/icons-material/Edit";
+import SearchIcon from "@mui/icons-material/Search";
 import { api } from "../api";
 
 const SESSION_LABELS = [
@@ -27,6 +28,9 @@ export default function Home() {
   const [engagements, setEngagements] = useState<Record<string, string>[]>([]);
   const [loading, setLoading] = useState(true);
   const [userEmail, setUserEmail] = useState("");
+  // BO-only users (BO group, not COE) cannot create or delete engagements.
+  const [isBoOnly, setIsBoOnly] = useState(false);
+  const [search, setSearch] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
@@ -44,15 +48,36 @@ export default function Home() {
   const load = async () => {
     setLoading(true);
     try {
-      const [engs, user] = await Promise.all([api.listEngagements(), api.getUser()]);
+      const [engs, user, role] = await Promise.all([
+        api.listEngagements(),
+        api.getUser(),
+        api.getUserRole(),
+      ]);
       setEngagements(engs);
       setUserEmail(user.email);
+      setIsBoOnly(role.is_bo && !role.is_coe);
       setForm((f) => ({ ...f, analyst_email: user.email }));
     } catch {
       /* ignore */
     }
     setLoading(false);
   };
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return engagements;
+    return engagements.filter((e) => {
+      const fields = [
+        e.genie_space_name,
+        e.business_owner_name,
+        e.business_owner_email,
+        e.analyst_name,
+        e.analyst_email,
+        e.status,
+      ];
+      return fields.some((f) => (f || "").toLowerCase().includes(q));
+    });
+  }, [engagements, search]);
 
   useEffect(() => { load(); }, []);
 
@@ -111,24 +136,49 @@ export default function Home() {
             Manage discovery engagements for new Genie Spaces
           </Typography>
         </Box>
-        <Button variant="contained" startIcon={<AddIcon />} onClick={() => {
-          setDialogOpen(true);
-          setCreateError("");
-          setNameAvailable(null);
-        }}>
-          New Engagement
-        </Button>
+        {!isBoOnly && (
+          <Button variant="contained" startIcon={<AddIcon />} onClick={() => {
+            setDialogOpen(true);
+            setCreateError("");
+            setNameAvailable(null);
+          }}>
+            New Engagement
+          </Button>
+        )}
+      </Box>
+
+      <Box sx={{ mb: 3 }}>
+        <TextField
+          fullWidth
+          size="small"
+          placeholder="Search by name, owner, analyst, status…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          InputProps={{
+            startAdornment: (
+              <InputAdornment position="start">
+                <SearchIcon fontSize="small" />
+              </InputAdornment>
+            ),
+          }}
+        />
       </Box>
 
       {loading ? (
         <Box sx={{ textAlign: "center", py: 8 }}><CircularProgress /></Box>
       ) : engagements.length === 0 ? (
         <Alert severity="info">
-          No engagements yet. Click "New Engagement" to start your first discovery.
+          {isBoOnly
+            ? "No engagements yet. An analyst will create one for you to review."
+            : "No engagements yet. Click \"New Engagement\" to start your first discovery."}
+        </Alert>
+      ) : filtered.length === 0 ? (
+        <Alert severity="info">
+          No engagements match your search.
         </Alert>
       ) : (
         <Grid container spacing={2}>
-          {engagements.map((e) => (
+          {filtered.map((e) => (
             <Grid size={{ xs: 12, sm: 6, md: 4 }} key={e.engagement_id}>
               <Card sx={{ height: "100%", display: "flex", flexDirection: "column" }}>
                 <CardContent sx={{ flexGrow: 1 }}>
@@ -162,9 +212,11 @@ export default function Home() {
                     <VisibilityIcon fontSize="small" />
                   </IconButton>
                   <Box sx={{ flexGrow: 1 }} />
-                  <IconButton size="small" onClick={() => handleDelete(e.engagement_id)} color="error" title="Delete">
-                    <DeleteIcon fontSize="small" />
-                  </IconButton>
+                  {!isBoOnly && (
+                    <IconButton size="small" onClick={() => handleDelete(e.engagement_id)} color="error" title="Delete">
+                      <DeleteIcon fontSize="small" />
+                    </IconButton>
+                  )}
                 </CardActions>
               </Card>
             </Grid>
