@@ -11,7 +11,6 @@ import type { ColumnDef } from "../types";
 const CONTEXT_QUESTIONS = [
   { question: "What does your team do day-to-day?", why_it_matters: "Scopes the question universe" },
   { question: "What decisions do you make with data?", why_it_matters: "Identifies the high-value questions" },
-  { question: "What reports do you use today?", why_it_matters: "Reveals existing metric definitions" },
   { question: "Who else on your team would use this?", why_it_matters: "Sizes the audience and skill range" },
   { question: "How do you get ad hoc answers today?", why_it_matters: "Reveals the bottleneck Genie solves" },
 ];
