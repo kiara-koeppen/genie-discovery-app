@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import secrets
 import threading
 import time
@@ -1357,17 +1358,14 @@ def patch_benchmark_bo_approved(eid):
 # API: Auto-summary (structured, no LLM)
 # ---------------------------------------------------------------------------
 
-BRIEF_MODEL = os.getenv("BRIEF_LLM_ENDPOINT_NAME") or "databricks-claude-haiku-4-5"
-
-
 def _generate_readiness_brief(eid):
     """Core Readiness Brief logic. Used by both the legacy sync endpoint and
     the async job task. Returns dict {summary, unacknowledged_gaps}.
     Raises on engagement-not-found or LLM/parse failure.
 
-    Uses BRIEF_MODEL (default Haiku 4.5) instead of the default Sonnet, since
-    this task is structured extraction with citations -- a small fast model
-    handles it well, and Sonnet was hitting 5+ minute generation times.
+    Uses the brief task's model (default Haiku 4.5 — see _model_for) instead
+    of the default Sonnet, since this task is structured extraction with
+    citations and a small fast model handles it well.
     """
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
@@ -1375,7 +1373,7 @@ def _generate_readiness_brief(eid):
     eng = parse_row(rows[0])
 
     prompt = _build_readiness_brief_prompt(eng)
-    raw = _call_llm_raw(prompt, model=BRIEF_MODEL, label="brief")
+    raw = _call_llm_raw(prompt, label="brief")
 
     # Output format:
     # <markdown brief>
@@ -1960,7 +1958,8 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
     if mv_defs_for_prompt:
         parts = []
         for fqn, (src, body) in mv_defs_for_prompt.items():
-            parts.append(f"### Metric View: `{fqn}` — source: {src}\n```\n{body}\n```")
+            # Cap each MV body so a sprawling YAML doesn't blow the prompt.
+            parts.append(f"### Metric View: `{fqn}` — source: {src}\n```\n{_trunc(body, 4000)}\n```")
         joined_mvs = "\n\n".join(parts)
         mv_block = f"""
 <metric_view_definitions>
@@ -2081,38 +2080,154 @@ Return ONLY the JSON object. No markdown fences, no preamble, no trailing commen
     return prompt
 
 
-def _call_llm_raw(prompt, max_tokens=16000, model=None, label=None):
+# --- LLM tunables ---
+#
+# Hard cap on prompt size. Catches runaway engagements before paying for a
+# slow LLM call that might time out or return garbage. ~80K chars is roughly
+# 20K input tokens — generous, but bounded.
+MAX_PROMPT_CHARS = int(os.getenv("LLM_MAX_PROMPT_CHARS") or "80000")
+
+# Per-cell character cap when stringifying a single field into a prompt.
+# Prevents one runaway value (long description, multi-paragraph note,
+# ten-page MV YAML) from dominating the input. Truncates with an ellipsis.
+MAX_CELL_CHARS = int(os.getenv("LLM_MAX_CELL_CHARS") or "1500")
+
+
+def _trunc(s, max_chars=MAX_CELL_CHARS):
+    """Truncate a string for inclusion in an LLM prompt. Returns the original
+    if short, else a head slice + ellipsis marker that signals truncation
+    to the LLM.
+    """
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"\n…[truncated, {len(s) - max_chars} chars dropped]"
+
+# Realistic max output tokens per task. Sonnet emits ~50 tok/sec, so 16K
+# tokens = 5+ min worst case (the timeout cliff). Right-sizing per task is
+# the single biggest speedup lever.
+TASK_MAX_TOKENS = {
+    "brief":              16000,  # citation-heavy markdown + structured gaps trailer
+    "plan":               10000,  # large structured JSON (filters/dimensions/measures/example_queries/narrative)
+    "mv-yaml":             6000,  # YAML output, typically 2-3K tokens
+    "mv-yaml-fix":         6000,  # retry with corrected columns
+    "benchmark-draft":     3000,  # 12 questions, ~1-2K tokens
+    "benchmark-sql":       1500,  # one SQL query
+    "benchmark-sql-fix":   1500,  # retry with error context
+    "benchmark-summary":    600,  # one-paragraph plain English
+}
+DEFAULT_MAX_TOKENS = 8000
+
+# Per-task model overrides. Each defaults to the global LLM_ENDPOINT, but
+# specific tasks can be downgraded to a faster model (Haiku 4.5) without
+# affecting the precision-sensitive ones (plan, mv-yaml, benchmark-sql).
+TASK_MODEL_ENV = {
+    "brief":              "BRIEF_LLM_ENDPOINT_NAME",
+    "benchmark-draft":    "BENCHMARK_DRAFT_LLM_ENDPOINT_NAME",
+    "benchmark-summary":  "BENCHMARK_SUMMARY_LLM_ENDPOINT_NAME",
+}
+TASK_MODEL_DEFAULT = {
+    "brief":              "databricks-claude-haiku-4-5",
+    "benchmark-draft":    "databricks-claude-haiku-4-5",
+    "benchmark-summary":  "databricks-claude-haiku-4-5",
+}
+
+
+def _model_for(label):
+    """Pick the LLM endpoint for a task: env var override, then per-task default,
+    then global LLM_ENDPOINT."""
+    env_name = TASK_MODEL_ENV.get(label)
+    if env_name:
+        configured = os.getenv(env_name)
+        if configured:
+            return configured
+        if label in TASK_MODEL_DEFAULT:
+            return TASK_MODEL_DEFAULT[label]
+    return LLM_ENDPOINT
+
+
+def _max_tokens_for(label, override=None):
+    """Pick max_tokens for a task. Caller can override; otherwise use the
+    per-task default; falls back to DEFAULT_MAX_TOKENS for unknown tags."""
+    if override is not None:
+        return override
+    return TASK_MAX_TOKENS.get(label, DEFAULT_MAX_TOKENS)
+
+
+def _call_llm_raw(prompt, max_tokens=None, model=None, label=None, retries=2):
     """Call the Databricks serving endpoint and return the raw text content (no JSON parse).
 
     Use this when the prompt asks for non-JSON output (e.g. markdown with a
     structured trailer) — JSON-wrapping markdown content breaks on every
     backtick or newline the LLM emits.
 
-    `model` overrides the default LLM_ENDPOINT for this single call. Useful
-    when a specific task (e.g. the Readiness Brief) wants a faster model
-    while other tasks keep using a stronger one.
-    `label` is a short tag for timing logs.
+    `max_tokens` defaults to the per-task value from TASK_MAX_TOKENS based on
+    `label`; explicit override wins. Right-sizing this is the biggest speedup
+    lever — Sonnet's output rate is ~50 tok/sec.
+
+    `model` overrides the default model selection. Without an override, the
+    model is resolved via `_model_for(label)`: per-task env var → per-task
+    default → global LLM_ENDPOINT.
+
+    `label` is a short tag for timing logs and per-task tuning lookup.
+
+    `retries` is the number of additional attempts on transient failures
+    (5xx, rate limit, network) with exponential backoff. Set to 0 to disable.
     """
-    endpoint = model or LLM_ENDPOINT
     tag = label or "llm"
+    endpoint = model or _model_for(tag)
+    resolved_max = _max_tokens_for(tag, max_tokens)
     prompt_chars = len(prompt)
+
+    if prompt_chars > MAX_PROMPT_CHARS:
+        raise ValueError(
+            f"Prompt for '{tag}' is {prompt_chars} chars (cap: {MAX_PROMPT_CHARS}). "
+            "Prompt builder needs truncation, or LLM_MAX_PROMPT_CHARS env var "
+            "needs to be raised. Aborting before paying for a slow LLM call."
+        )
+
     started = time.time()
-    print(f"[{tag}] start endpoint={endpoint} prompt_chars={prompt_chars} max_tokens={max_tokens}", flush=True)
-    try:
-        resp = w.serving_endpoints.query(
-            name=endpoint,
-            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-            max_tokens=max_tokens,
-            temperature=0.2,
-        )
-    except Exception as e:
-        elapsed = time.time() - started
-        print(f"[{tag}] FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
-        _log_llm_usage(
-            tag, endpoint, prompt_chars, 0, int(elapsed * 1000),
-            success=False, error=f"{type(e).__name__}: {e}",
-        )
-        raise
+    print(f"[{tag}] start endpoint={endpoint} prompt_chars={prompt_chars} max_tokens={resolved_max}", flush=True)
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = w.serving_endpoints.query(
+                name=endpoint,
+                messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
+                max_tokens=resolved_max,
+                temperature=0.2,
+            )
+            break
+        except Exception as e:
+            last_exc = e
+            err_str = str(e).lower()
+            transient = (
+                "rate limit" in err_str
+                or "429" in err_str
+                or "503" in err_str
+                or "504" in err_str
+                or "timeout" in err_str
+                or "connection" in err_str
+            )
+            if attempt < retries and transient:
+                # Exponential backoff with jitter: 1.5s, 3s, 6s...
+                delay = 1.5 * (2 ** attempt) * (0.75 + random.random() * 0.5)
+                print(f"[{tag}] transient error, retry {attempt+1}/{retries} in {delay:.1f}s: {type(e).__name__}", flush=True)
+                time.sleep(delay)
+                continue
+            elapsed = time.time() - started
+            print(f"[{tag}] FAILED after {elapsed:.1f}s ({attempt+1} attempt(s)): {type(e).__name__}: {e}", flush=True)
+            _log_llm_usage(
+                tag, endpoint, prompt_chars, 0, int(elapsed * 1000),
+                success=False, error=f"{type(e).__name__}: {e}",
+            )
+            raise
+    else:
+        # Exhausted retries
+        if last_exc:
+            raise last_exc
 
     # Best-effort: pull token counts off the response if the endpoint exposes
     # a `usage` object. Handles both raw-dict and SDK-object response shapes.
@@ -2146,9 +2261,9 @@ def _call_llm_raw(prompt, max_tokens=16000, model=None, label=None):
     return content
 
 
-def _call_llm(prompt, model=None, label=None):
+def _call_llm(prompt, model=None, label=None, max_tokens=None):
     """Call the LLM and return parsed JSON. Tolerates ```json fences."""
-    content = _call_llm_raw(prompt, model=model, label=label)
+    content = _call_llm_raw(prompt, model=model, label=label, max_tokens=max_tokens)
     text = content.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text
@@ -2752,7 +2867,7 @@ Common causes:
 
 Return JSON: {{"sql": "the corrected SQL"}}. No markdown fences, no commentary."""
             try:
-                retry_result = _call_llm(retry_prompt)
+                retry_result = _call_llm(retry_prompt, label="benchmark-sql-fix")
                 if isinstance(retry_result, dict):
                     retry_sql = str(retry_result.get("sql", "")).strip()
                 else:
@@ -2820,7 +2935,7 @@ def _summarize_benchmark_sql(question, sql_text):
 Write 2-3 sentences answering "how are we measuring this?" — no column names in backticks, no SQL jargon. Example voice: "Counts every claim received in the current calendar year, excluding voided records, and averages the number of days between receipt and final decision." Your summary must describe the SQL exactly as written, including any filters or groupings it applies. Do not describe anything the SQL doesn't actually do.
 
 Return JSON with exactly: {{"explanation": "..."}}. No markdown fences."""
-    result = _call_llm(prompt)
+    result = _call_llm(prompt, label="benchmark-summary")
     if isinstance(result, dict):
         return str(result.get("explanation", "")).strip()
     return ""
@@ -3511,7 +3626,7 @@ Rewrite the YAML so every bare column reference in any `expr`, `filter`, or join
 
 Return JSON with exactly: {{"yaml": "...", "source_table": "...", "suggested_name": "..."}}. No markdown fences."""
         try:
-            result2 = _call_llm(fix_prompt)
+            result2 = _call_llm(fix_prompt, label="mv-yaml-fix")
             yaml_text2 = _strip_yaml_fences(str(result2.get("yaml", "")))
             missing2 = _validate_yaml_columns(yaml_text2, schemas)
             if yaml_text2 and len(missing2) < len(missing):

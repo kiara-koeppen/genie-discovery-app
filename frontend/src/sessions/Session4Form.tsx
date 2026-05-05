@@ -498,16 +498,33 @@ export default function Session4Form({
     if (!engagementId) return;
     setDraftingAllSql(true);
     const next = [...benchmarks];
+
+    // Build the list of rows that actually need work, skipping already-filled
+    // ones up front so the concurrency window isn't wasted on no-ops.
+    const todo: number[] = [];
     for (let i = 0; i < next.length; i++) {
       const b = next[i];
       const q = b.question?.trim();
       if (!q) continue;
       const hasSql = !!b.expected_sql?.trim();
       const hasNotes = !!b.notes?.trim();
-      if (hasSql && hasNotes) continue; // fully filled, skip
+      if (hasSql && hasNotes) continue;
+      todo.push(i);
+    }
+
+    // Process rows in concurrent batches. Each LLM call hits the gateway
+    // independently, so 12 rows × ~30-60s sequential = 6-12 minutes (well past
+    // any reasonable client timeout). With CONCURRENCY=4 the wall-clock time
+    // is ~3x faster. The cap is intentionally conservative — pushing too many
+    // simultaneous calls can trip endpoint concurrency limits.
+    const CONCURRENCY = 4;
+    const processOne = async (i: number) => {
+      const b = next[i];
+      const q = b.question!.trim();
+      const hasSql = !!b.expected_sql?.trim();
+      const hasNotes = !!b.notes?.trim();
       try {
         if (!hasSql) {
-          // Draft SQL (+ summary + auto-validate if warehouse selected) in one call
           const validate = !!benchmarkWarehouseId;
           const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId, validate);
           const patch: Record<string, any> = { expected_sql: res.sql };
@@ -515,15 +532,21 @@ export default function Session4Form({
           if (validate) applyValidationToPatch(patch, res.validation);
           next[i] = { ...next[i], ...patch };
         } else {
-          // SQL exists but no summary — backfill from existing SQL
           const res = await api.draftBenchmarkSummary(engagementId, q, b.expected_sql);
           if (res.explanation) next[i] = { ...next[i], notes: res.explanation };
         }
+        // Surface partial progress as each batch member completes.
         onChange("benchmark_questions", [...next]);
       } catch (err) {
         console.error(err);
       }
+    };
+
+    for (let start = 0; start < todo.length; start += CONCURRENCY) {
+      const batch = todo.slice(start, start + CONCURRENCY);
+      await Promise.all(batch.map(processOne));
     }
+
     setDraftingAllSql(false);
   };
 
