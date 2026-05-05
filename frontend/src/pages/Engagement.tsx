@@ -129,24 +129,52 @@ export default function Engagement({ readOnly = false }: Props) {
   const persistSession = useCallback(async (sessionNum: number) => {
     if (!id) return;
     setSaveStatus("saving");
-    try {
-      const res = await api.saveSession(
-        id,
-        sessionNum,
-        sessionDrafts[sessionNum],
-        updatedAtRef.current,
-      );
-      if (res.updated_at) updatedAtRef.current = res.updated_at;
-      setSaveStatus("saved");
-    } catch (err: any) {
-      setSaveStatus("error");
-      const msg = err?.message || "Save failed";
-      // 409 stale: backend message is friendly. Reload to recover.
-      if (msg.toLowerCase().includes("updated by another user")) {
-        setToast("This engagement was updated elsewhere. Reloading...");
-        await load();
-      } else {
-        setToast(`Error saving: ${msg}`);
+
+    // Bounded retry on 409. Most stale-token failures come from sibling
+    // mutations that bumped engagement.updated_at without our local ref
+    // catching up — e.g., a BO clicking BO Approved on benchmarks, the COE
+    // approval flow, or a Create Metric View. Those mutations don't actually
+    // conflict with the user's in-progress edits, so we silently refresh the
+    // ref from the server and retry once. Only if the retry ALSO 409s do we
+    // assume a real concurrent edit and reload (which preserves the server's
+    // version, losing local in-progress edits — last resort).
+    const MAX_ATTEMPTS = 2;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const res = await api.saveSession(
+          id,
+          sessionNum,
+          sessionDrafts[sessionNum],
+          updatedAtRef.current,
+        );
+        if (res.updated_at) updatedAtRef.current = res.updated_at;
+        setSaveStatus("saved");
+        return;
+      } catch (err: any) {
+        const msg = err?.message || "Save failed";
+        const isStale = msg.toLowerCase().includes("updated by another user");
+
+        if (isStale && attempt < MAX_ATTEMPTS) {
+          // Refresh ref from server and retry. Don't touch sessionDrafts —
+          // the user's in-progress edits stay intact.
+          try {
+            const eng = await api.getEngagement(id) as any;
+            updatedAtRef.current = String(eng.updated_at || "");
+            continue;
+          } catch {
+            // Couldn't even fetch — fall through to error path below.
+          }
+        }
+
+        // Either non-stale error, or retry exhausted.
+        setSaveStatus("error");
+        if (isStale) {
+          setToast("This engagement was updated elsewhere. Reloading...");
+          await load();
+        } else {
+          setToast(`Error saving: ${msg}`);
+        }
+        return;
       }
     }
   }, [id, sessionDrafts, load]);
@@ -458,6 +486,7 @@ export default function Engagement({ readOnly = false }: Props) {
             session1Data={sessionDrafts[1]}
             session2Data={sessionDrafts[2]}
             engagementId={id}
+            onMetricViewCreated={(ts) => { updatedAtRef.current = ts; }}
           />
         )}
         {tab === 3 && (

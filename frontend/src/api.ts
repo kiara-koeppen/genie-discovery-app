@@ -329,7 +329,7 @@ export const api = {
       overwrite?: boolean;
     },
   ): Promise<
-    | { success: true; fqn: string }
+    | { success: true; fqn: string; updated_at?: string }
     | { success: false; exists: true; fqn: string; owner: string | null }
   > => {
     const res = await fetch(`${BASE}/engagements/${id}/create-metric-view`, {
@@ -344,7 +344,7 @@ export const api = {
     if (!res.ok) {
       throw new Error(payload.error || `${res.status} ${res.statusText}`);
     }
-    return { success: true, fqn: payload.fqn };
+    return { success: true, fqn: payload.fqn, updated_at: payload.updated_at };
   },
 
   listCatalogs: () => json<string[]>("/uc/catalogs"),

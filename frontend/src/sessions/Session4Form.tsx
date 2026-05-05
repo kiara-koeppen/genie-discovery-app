@@ -964,21 +964,21 @@ export default function Session4Form({
                           <Checkbox
                             size="small"
                             checked={!!b.bo_approved}
-                            onChange={async (e) => {
+                            onChange={(e) => {
                               if (!engagementId || !canToggleBoApproved) return;
                               const newVal = e.target.checked;
-                              try {
-                                await api.setBenchmarkBoApproved(engagementId, i, newVal);
-                                // Update local state to reflect server change.
-                                // The PATCH endpoint intentionally does not bump
-                                // updated_at (lives outside the optimistic lock),
-                                // and save_session preserves bo_approved server-
-                                // side, so a follow-up analyst autosave won't
-                                // overwrite this.
-                                updateBenchmark(i, "bo_approved", newVal);
-                              } catch (err) {
-                                console.error("BO Approved update failed:", err);
-                              }
+                              // Optimistic update: flip the UI immediately so
+                              // the click feels instant. The PATCH below
+                              // persists; on failure we revert. Lives outside
+                              // the engagement optimistic lock — save_session
+                              // preserves bo_approved server-side, so a
+                              // follow-up analyst autosave won't overwrite.
+                              updateBenchmark(i, "bo_approved", newVal);
+                              api.setBenchmarkBoApproved(engagementId, i, newVal)
+                                .catch((err) => {
+                                  console.error("BO Approved update failed:", err);
+                                  updateBenchmark(i, "bo_approved", !newVal);
+                                });
                             }}
                             disabled={
                               !canToggleBoApproved ||

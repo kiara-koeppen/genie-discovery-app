@@ -3841,6 +3841,7 @@ def create_metric_view(eid):
         return jsonify({"error": f"Failed to create metric view: {msg}"}), status
 
     # Persist to Session 3 (last-created MV) and auto-add to Session 4 data plan
+    new_updated_at = None
     if rows:
         eng = parse_row(rows[0])
         s4 = eng["sessions"]["4"]
@@ -3853,14 +3854,19 @@ def create_metric_view(eid):
                 "include_in_space": "Yes",
                 "notes": "Auto-added from Session 3 metric view creation.",
             })
-        ts = now_ts()
+        new_updated_at = now_ts()
         sql_run(
             f"UPDATE {TABLE} SET data_plan = :dp, metric_view_fqn = :fqn, updated_at = :ts "
             f"WHERE engagement_id = :eid",
-            {"eid": eid, "dp": json.dumps(data_plan), "fqn": created_fqn, "ts": ts},
+            {"eid": eid, "dp": json.dumps(data_plan), "fqn": created_fqn, "ts": new_updated_at},
         )
 
-    return jsonify({"success": True, "fqn": created_fqn})
+    # Return updated_at so the frontend can refresh its optimistic-lock token.
+    # Without this the next autosave 409s, same pattern as push-to-Genie.
+    resp = {"success": True, "fqn": created_fqn}
+    if new_updated_at is not None:
+        resp["updated_at"] = new_updated_at
+    return jsonify(resp)
 
 
 # ---------------------------------------------------------------------------
