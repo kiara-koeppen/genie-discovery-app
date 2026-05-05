@@ -34,7 +34,8 @@ The app is a 6-session workbook. Each session is a form backed by a Delta table 
   - "Create Metric View" deploys it to UC under your OBO token (respects your grants, not the app SP's). If the FQN already exists the app returns ownership info rather than overwriting blindly.
 
 ### Session 4 — COE Review + Benchmarks (COE group)
-- **Analyst commentary + auto-summary** of Sessions 1–3.
+- **Readiness Brief** — async LLM call (via the background-job runner, see *Cross-cutting design choices*) that synthesizes Sessions 1–3 + Data Plan into a citation-backed brief with coverage analysis and a gaps section. Auto-fires on first visit if S1–S3 has any content; gated on having at least one S1 response, S2 question, or S3 SQL expression so a brand-new empty engagement doesn't trigger an LLM call.
+- **Analyst commentary** — per-gap responses preserved across regenerations via fuzzy-match.
 - **Data plan** — the single source of truth for which tables and metric views will be in scope for the Genie Space. A row per table/view with include=Yes/No and notes.
 - **Reactive sync**: when a metric view is created in Session 3, it auto-appears in Session 4's data plan (no manual copy step).
 - **Benchmark Questions** — the acceptance-test bank the space is measured against. Highlights:
@@ -44,7 +45,7 @@ The app is a 6-session workbook. Each session is a form backed by a Delta table 
   - **Two-step SQL → summary flow** — the Measurement Summary is generated *from* the SQL in a second call, so the explanation always matches what the SQL actually does. A refresh button re-derives the summary from the current SQL.
   - **Run SQL inline** — per-row ▶ button and a Run All button execute each benchmark's SQL under the user's OBO token on a warehouse they pick. The runner polls for cold-warehouse startup (50s wait + 1.5s polling, 2-min outer deadline with auto-cancel). Results render in a small table right under the row; the sample result persists even when "Show Expected SQL" is toggled off.
   - SQL is always wrapped in `SELECT * FROM (...) __bm LIMIT N` so an inner `LIMIT` or `ORDER BY` doesn't break the run.
-  - **BO approval checkbox** per benchmark — marks the row as validated and unlocks its use as a style exemplar in Session 5 (see below).
+  - **BO approval checkbox** per benchmark — marks the row as validated and unlocks its use as a style exemplar in Session 5 (see below). Toggling this is the only mutation a BO-group user can perform on Session 4; the click is optimistic (UI flips immediately) and persists via a dedicated PATCH endpoint that lives outside the engagement's optimistic-lock so a BO clicking the checkbox can't 409 the analyst's autosave.
 - **COE approval gating** — Sessions 5 & 6 are locked until a COE group member approves the engagement. Non-members can view but not approve; membership is checked under OBO so the app can't be tricked with a shared SP.
 
 ### Session 5 — Configure Genie Space (Analyst, gated)
@@ -72,6 +73,15 @@ This is where discovery becomes a real Genie Space configuration.
 
 ### Cross-cutting design choices
 
+- **Group-based access model.** Three roles, evaluated on every request under OBO:
+  - **Analyst (default).** Any authenticated app user can read all engagements and edit Sessions 1–6 except Session 4 COE approval. No email gating — discovery is a team activity.
+  - **COE group member** (`COE_GROUP_NAME`). Same as analyst, plus the right to approve/reject Session 4. Sessions 5 & 6 are locked behind COE approval.
+  - **BO group member** (`BO_GROUP_NAME`, optional). Tightly restricted: can read all engagements, edit Sessions 1 & 2, view Session 4, and toggle the BO Approved checkbox on benchmarks. Cannot edit S3/S5/S6 or trigger any AI button. The restriction is enforced in two layers: (1) the frontend hides tabs and AI controls; (2) a server-side `before_request` hook on `/api/engagements/<eid>/*` whitelists exactly those operations and 403s everything else, so a BO who bypasses the UI gets nothing.
+  - COE wins over BO if a user is in both groups.
+- **Async job runner for long LLM calls.** Databricks Apps' gateway has a ~60s timeout on synchronous HTTP, but the readiness brief, generate-plan, draft-MV-YAML, and draft-benchmark-SQL flows can each take 60–180s wall-clock. Every long LLM call is dispatched as a background job (`POST /api/jobs/start` with `task_type=...`); the frontend polls `/api/jobs/<job_id>` every 2s until the job reaches `done` or `failed`. State is persisted in a Delta table (`discovery_jobs`) with token-usage tracking in `discovery_llm_usage`.
+- **Per-task LLM tunables.** Each task type has its own `max_tokens` (matched to expected output size) and model selection — precision-critical tasks (plan generation, MV YAML) use the strongest model; quick refinements (summary regeneration) use a faster, cheaper model. Prompt-length capped per task to avoid overruns. Failed LLM calls retry once with exponential backoff before surfacing the error.
+- **Optimistic-lock with auto-retry on saves.** Every engagement mutation carries an `If-Match: <updated_at>` header. On 409 (stale token), the frontend silently fetches fresh `updated_at`, retries once. Only on a second 409 does it fall back to a "reloading…" toast. The dedicated BO-Approved PATCH endpoint intentionally lives **outside** this lock so BO clicks never conflict with analyst autosaves.
+- **`sql_exec` distinguishes cold-warehouse from genuine empty results.** A SQL statement that doesn't reach a successful terminal state within the wait window raises `SqlTransientError` → HTTP 503, so the frontend can prompt the user to retry instead of misinterpreting a cold start as a 404.
 - **OBO-first auth.** Anything that touches customer data — UC listings, warehouse picking, DESCRIBE, SHOW CREATE TABLE, SQL execution, Genie push — runs under the user's forwarded access token (`X-Forwarded-Access-Token`). The app's service principal only owns the engagement Delta table and LLM calls. This prevents the app from becoming a permissions-laundering vector.
 - **`/api/warehouses` is OBO-only.** Users only see warehouses they actually have access to. If their token is missing the `sql` scope (incremental-consent drift), the endpoint returns 403 with `reauth_required: true` instead of silently falling back to the SP.
 - **Schema-grounded prompting everywhere LLM writes SQL.** Benchmark SQL drafting, metric view YAML drafting, and plan generation all inject real UC column lists so the model cannot hallucinate.
@@ -92,7 +102,7 @@ The app runs as a service principal but deliberately routes most data-plane call
 | UC picker: list catalogs / schemas / tables / columns (Session 3) | **OBO** | Each `/api/uc/*` endpoint calls `user_w.catalogs.list()` / `.schemas.list()` / `.tables.list()` / `.tables.get()`. The SP is never a fallback — if the user can't see it, the picker is empty. |
 | `DESCRIBE TABLE` / `SHOW CREATE TABLE` (schema grounding, live MV fetch) | **OBO** | Runs via the user's chosen warehouse; inherits the user's UC SELECT/USE CATALOG grants. |
 | `tables.get()` for PK/FK constraints (Session 5 joins seeding) | **OBO** | UC metadata API. Needs the `catalog.tables:read` user scope (see Step 2b). |
-| List engagements / read / write / delete engagement (Sessions 1–6) | **App SP for DB, OBO for authz** | The SP writes to the `discovery` Delta table, but every `/api/engagements/<eid>` request is gated by a before-request hook that only lets through the recorded `analyst_email`, `business_owner_email`, or a COE-group member. Cross-user tampering is blocked at the API layer. |
+| List engagements / read / write / delete engagement (Sessions 1–6) | **App SP for DB, OBO for authz** | The SP writes to the `discovery` Delta table, but every `/api/engagements/<eid>` request is gated by a before-request hook that evaluates the caller's group membership (COE / BO / analyst) and applies the appropriate scope (full edit / S1–S2 + BO-Approved checkbox only / read-only on certain sections). Cross-user tampering is blocked at the API layer. |
 | COE approval (Session 4 "Approve/Request Changes") | **OBO** | `/api/engagements/<eid>/coe-approve` rejects with 403 unless the caller is a live COE group member (not just hidden in the UI). |
 | Execute benchmark SQL (Session 4 "Run" button) | **OBO** | User's query, user's warehouse, user's data grants. The app never runs arbitrary user-authored SQL under the SP. |
 | Create / update / patch Genie Spaces (Session 5 "Push") | **OBO** | Uses the Genie REST API on the user's behalf so their `CAN MANAGE` on the space governs whether the push succeeds. The SP does not manage Genie spaces. |
@@ -174,13 +184,14 @@ genie-discovery-app/
 
 ### Step 1 — Pick your workspace resources
 
-You need to decide five things before editing any config:
+You need to decide six things before editing any config:
 
 1. **SQL Warehouse ID** — In Databricks, go to SQL → SQL Warehouses → select your warehouse → Connection details. The ID is the trailing segment of the HTTP Path (e.g., `/sql/1.0/warehouses/<THIS_PART>`).
 2. **Catalog** — Where the app should store engagement data. The app's service principal must have `CREATE TABLE` on this catalog/schema.
-3. **Schema** — Under that catalog. The schema must already exist; the Delta table inside it is auto-created on first run.
+3. **Schema** — Under that catalog. The schema must already exist; the Delta tables inside it are auto-created on first run.
 4. **COE group name** — Create a Databricks group (Account Console → User management → Groups) whose members are allowed to approve engagements in Session 4. Add your COE reviewers to it.
-5. **Model Serving endpoint** — The name of a chat-completion-compatible served model used by "Generate Plan", "Draft YAML", "Draft Benchmarks", "Draft All SQL", and the summary refresh. Defaults to `databricks-claude-sonnet-4-6` (HIPAA-eligible, pay-per-token, on Azure). The app's service principal must have `CAN QUERY` on this endpoint.
+5. **BO group name (optional)** — Create a Databricks group whose members get the restricted business-owner view: read-only on most sections, edit Sessions 1 & 2, view Session 4, and toggle the BO Approved checkbox on benchmark rows. Leave blank to skip — without it, every authenticated user defaults to full analyst access (except COE approval).
+6. **Model Serving endpoint** — The name of a chat-completion-compatible served model used by "Generate Plan", "Draft YAML", "Draft Benchmarks", "Draft All SQL", "Generate Brief", and the summary refresh. Defaults to `databricks-claude-sonnet-4-6` (HIPAA-eligible, pay-per-token, on Azure). The app's service principal must have `CAN QUERY` on this endpoint.
 
 ### Step 2 — Update `app.yaml`
 
@@ -196,6 +207,8 @@ env:
     value: "<your-schema>"
   - name: COE_GROUP_NAME
     value: "<your-coe-group-name>"
+  - name: BO_GROUP_NAME
+    value: "<your-bo-group-name>"   # optional; leave empty to skip BO-restricted view
   - name: LLM_ENDPOINT_NAME
     value: "databricks-claude-sonnet-4-6"
 ```
@@ -204,11 +217,13 @@ Everything else (UC catalog/schema/table picking, metric view detection, PK/FK j
 
 **Permissions required on the app's service principal:**
 - `CREATE TABLE` on `<CATALOG>.<SCHEMA>` (for engagement storage)
+- `MODIFY` and `SELECT` on the auto-created `discovery_jobs` and `discovery_llm_usage` tables (the SP creates them; if you pre-create them yourself, grant these explicitly — without them, async-job state silently fails to persist)
 - `CAN USE` on the SQL warehouse
 - `CAN QUERY` on the Model Serving endpoint named in `LLM_ENDPOINT_NAME`
 
 **Permissions required on each end user (not the SP):**
 - Membership in the COE group (for Session 4 approval; non-members can view but not approve)
+- (Optional) Membership in the BO group for the restricted Business-Owner view
 - `CAN USE` on at least one SQL warehouse (required for benchmark runs and generate-plan schema grounding)
 - `SELECT` / `BROWSE` on the UC tables they intend to reference
 - `CAN MANAGE` on the target Genie Space (for Session 5 push)
@@ -321,6 +336,7 @@ All config lives in `app.yaml`:
 | `CATALOG` | UC catalog for the engagement Delta table |
 | `SCHEMA` | UC schema under `CATALOG` (must exist; table auto-created) |
 | `COE_GROUP_NAME` | Databricks group whose members gate Session 4 approval |
+| `BO_GROUP_NAME` | (Optional) Databricks group whose members get the restricted Business Owner view (S1/S2 edit, S4 view, BO Approved checkbox only). Leave blank to disable. |
 | `LLM_ENDPOINT_NAME` | Model Serving endpoint (chat-completion-compatible) used by every AI button |
 
 The app auto-creates the engagement table and adds any missing Delta columns on startup via `ensure_table()`, so schema migrations happen transparently when you pull updates.
@@ -329,14 +345,18 @@ The app auto-creates the engagement table and adds any missing Delta columns on 
 
 Functional today:
 
-- All 6 session forms with autosave + popup text editing
+- All 6 session forms with autosave + popup text editing + bounded auto-retry on stale-token 409
+- Group-based access: default analyst access, COE-restricted approval, optional BO-restricted view (S1/S2 + BO-Approved checkbox only)
 - UC pickers, PK/FK join detection (with verbose logging for debugging), metric view discovery
-- LLM-drafted metric view YAML (schema-grounded, Databricks-spec) + UC create flow
-- Benchmarks: N+10 draft-and-rank, schema-grounded SQL, dialect-aware prompt, inline SQL runner with cold-warehouse polling, two-step summary, Run All, BO approval
+- Async job runner for long LLM calls (avoids the gateway 60s sync timeout); per-task `max_tokens` and model selection; one-retry exponential backoff on transient model errors
+- Cold-warehouse aware `sql_exec` (returns 503 with retry hint instead of fake 404)
+- Readiness Brief (Session 4): citation-backed, gap analysis, gated on having S1–S3 content before auto-firing
+- LLM-drafted metric view YAML (schema-grounded, Databricks-spec) + UC create flow (returns updated_at so post-create autosave doesn't 409)
+- Benchmarks: N+10 draft-and-rank, schema-grounded SQL, dialect-aware prompt, inline SQL runner with cold-warehouse polling, two-step summary, Run All, BO approval (optimistic UI + dedicated PATCH endpoint outside the optimistic lock)
 - COE gating on Sessions 5 & 6 (OBO-verified group membership)
 - Generate Plan (Session 5): schema-grounded, MV-aware, benchmark-style-aware, strips benchmark overlaps, surfaces warnings
 - Joins: UC PK/FK auto-seeded + analyst-editable manual joins, regenerate preserves manual rows
-- Push to Genie Space: create-new and update-existing via REST API, OBO-authed, all four instruction surfaces serialized
+- Push to Genie Space: create-new and update-existing via REST API, OBO-authed, all four instruction surfaces serialized; benchmarks land in the Benchmarks tab
 
 Pending:
 
