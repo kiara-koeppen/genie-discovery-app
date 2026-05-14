@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask, request, jsonify, send_from_directory
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.core import Config
 from databricks.sdk.service.sql import StatementParameterListItem, StatementState
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
@@ -37,8 +38,15 @@ COE_GROUP = os.getenv("COE_GROUP_NAME") or "genie-coe-reviewers"
 # Approved on benchmark rows. If unset, no users get BO permissions.
 BO_GROUP = os.getenv("BO_GROUP_NAME") or "genie-bo-reviewers"
 LLM_ENDPOINT = os.getenv("LLM_ENDPOINT_NAME") or "databricks-claude-sonnet-4-6"
+# Model-serving first-token latency can exceed the SDK's default 60s HTTP read
+# timeout on large prompts (e.g. generate_plan with rich engagements), which the
+# SDK then retries for ~5 min before giving up. Use a dedicated client with a
+# longer read timeout for LLM calls only; leave non-LLM SDK calls at 60s so
+# they still fail fast.
+LLM_HTTP_TIMEOUT_SECONDS = int(os.getenv("LLM_HTTP_TIMEOUT_SECONDS") or "600")
 
 w = WorkspaceClient()
+llm_w = WorkspaceClient(config=Config(http_timeout_seconds=LLM_HTTP_TIMEOUT_SECONDS))
 
 # Section columns grouped by session
 SESSION_COLS = {
@@ -2251,7 +2259,7 @@ def _call_llm_raw(prompt, max_tokens=None, model=None, label=None, retries=2):
     last_exc = None
     for attempt in range(retries + 1):
         try:
-            resp = w.serving_endpoints.query(
+            resp = llm_w.serving_endpoints.query(
                 name=endpoint,
                 messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
                 max_tokens=resolved_max,
