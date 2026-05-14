@@ -277,12 +277,6 @@ export const api = {
       body: JSON.stringify({ sql, warehouse_id }),
     }),
 
-  getAutoSummary: (id: string) =>
-    json<{
-      summary: string;
-      unacknowledged_gaps?: BriefGap[];
-    }>(`/engagements/${id}/auto-summary`),
-
   generatePlan: (
     id: string,
     warehouse_id?: string,

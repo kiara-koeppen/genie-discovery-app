@@ -37,7 +37,7 @@ COE_GROUP = os.getenv("COE_GROUP_NAME") or "genie-coe-reviewers"
 # BO group: members can view all engagements but only edit S1/S2 + click BO
 # Approved on benchmark rows. If unset, no users get BO permissions.
 BO_GROUP = os.getenv("BO_GROUP_NAME") or "genie-bo-reviewers"
-LLM_ENDPOINT = os.getenv("LLM_ENDPOINT_NAME") or "databricks-claude-sonnet-4-6"
+LLM_ENDPOINT = os.getenv("LLM_ENDPOINT_NAME") or "databricks-claude-haiku-4-5"
 # Model-serving first-token latency can exceed the SDK's default 60s HTTP read
 # timeout on large prompts (e.g. generate_plan with rich engagements), which the
 # SDK then retries for ~5 min before giving up. Use a dedicated client with a
@@ -2186,9 +2186,11 @@ TASK_MAX_TOKENS = {
 }
 DEFAULT_MAX_TOKENS = 8000
 
-# Per-task model overrides. Each defaults to the global LLM_ENDPOINT, but
-# specific tasks can be downgraded to a faster model (Haiku 4.5) without
-# affecting the precision-sensitive ones (plan, mv-yaml, benchmark-sql).
+# Per-task model overrides. Each defaults to the global LLM_ENDPOINT (Haiku
+# 4.5) but can be pointed at a different endpoint via env var. Listed
+# explicitly so it's clear which tasks accept overrides. To revert any task
+# (or the whole app) to Sonnet 4.6, set the corresponding *_LLM_ENDPOINT_NAME
+# env var in app.yaml to "databricks-claude-sonnet-4-6".
 TASK_MODEL_ENV = {
     "brief":              "BRIEF_LLM_ENDPOINT_NAME",
     "benchmark-draft":    "BENCHMARK_DRAFT_LLM_ENDPOINT_NAME",

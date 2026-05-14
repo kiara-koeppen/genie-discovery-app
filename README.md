@@ -129,7 +129,7 @@ React SPA                  -->   REST API             -->    Unity Catalog (Delt
 
 - **Frontend**: React 18, TypeScript, Vite, Material UI 5
 - **Backend**: Flask, Databricks SDK (statement execution + workspace APIs)
-- **LLM**: Model Serving endpoint (default `databricks-claude-sonnet-4-6`, HIPAA-eligible on Azure)
+- **LLM**: Model Serving endpoint (default `databricks-claude-haiku-4-5`, HIPAA-eligible on Azure). Switch to Sonnet for higher-precision outputs by setting `LLM_ENDPOINT_NAME` (see below).
 - **Storage**: Single Delta table with JSON STRING columns per section
 - **Deployment**: Databricks App (`app.yaml`)
 
@@ -191,7 +191,7 @@ You need to decide six things before editing any config:
 3. **Schema** — Under that catalog. The schema must already exist; the Delta tables inside it are auto-created on first run.
 4. **COE group name** — Create a Databricks group (Account Console → User management → Groups) whose members are allowed to approve engagements in Session 4. Add your COE reviewers to it.
 5. **BO group name (optional)** — Create a Databricks group whose members get the restricted business-owner view: read-only on most sections, edit Sessions 1 & 2, view Session 4, and toggle the BO Approved checkbox on benchmark rows. Leave blank to skip — without it, every authenticated user defaults to full analyst access (except COE approval).
-6. **Model Serving endpoint** — The name of a chat-completion-compatible served model used by "Generate Plan", "Draft YAML", "Draft Benchmarks", "Draft All SQL", "Generate Brief", and the summary refresh. Defaults to `databricks-claude-sonnet-4-6` (HIPAA-eligible, pay-per-token, on Azure). The app's service principal must have `CAN QUERY` on this endpoint.
+6. **Model Serving endpoint** — The name of a chat-completion-compatible served model used by "Generate Plan", "Draft YAML", "Draft Benchmarks", "Draft All SQL", "Generate Brief", and the summary refresh. Defaults to `databricks-claude-haiku-4-5` (HIPAA-eligible, pay-per-token, on Azure). The app's service principal must have `CAN QUERY` on this endpoint. To switch to Sonnet 4.6 for higher-precision plan/SQL/YAML outputs, set `LLM_ENDPOINT_NAME` to `databricks-claude-sonnet-4-6` in `app.yaml`.
 
 ### Step 2 — Update `app.yaml`
 
@@ -210,7 +210,7 @@ env:
   - name: BO_GROUP_NAME
     value: "<your-bo-group-name>"   # optional; leave empty to skip BO-restricted view
   - name: LLM_ENDPOINT_NAME
-    value: "databricks-claude-sonnet-4-6"
+    value: "databricks-claude-haiku-4-5"   # default; use "databricks-claude-sonnet-4-6" for higher-precision plan/SQL/YAML
 ```
 
 Everything else (UC catalog/schema/table picking, metric view detection, PK/FK join detection) resolves dynamically against whatever the app's service principal and the end user can see in your workspace.
@@ -337,7 +337,8 @@ All config lives in `app.yaml`:
 | `SCHEMA` | UC schema under `CATALOG` (must exist; table auto-created) |
 | `COE_GROUP_NAME` | Databricks group whose members gate Session 4 approval |
 | `BO_GROUP_NAME` | (Optional) Databricks group whose members get the restricted Business Owner view (S1/S2 edit, S4 view, BO Approved checkbox only). Leave blank to disable. |
-| `LLM_ENDPOINT_NAME` | Model Serving endpoint (chat-completion-compatible) used by every AI button |
+| `LLM_ENDPOINT_NAME` | Model Serving endpoint (chat-completion-compatible) used by every AI button. Defaults to `databricks-claude-haiku-4-5`. Set to `databricks-claude-sonnet-4-6` if you want higher-precision plan/SQL/YAML output at the cost of slower responses. |
+| `LLM_HTTP_TIMEOUT_SECONDS` | (Optional) HTTP read timeout in seconds for LLM calls. Defaults to `600`. Raise if the model serving endpoint is slow to return first byte on large prompts. |
 
 The app auto-creates the engagement table and adds any missing Delta columns on startup via `ensure_table()`, so schema migrations happen transparently when you pull updates.
 

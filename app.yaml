@@ -45,10 +45,11 @@ env:
     value: "genie-bo-reviewers"
 
   # Optional. Model Serving endpoint used by every AI button (generate-plan,
-  # draft-benchmarks, draft-metric-view-yaml, etc). Default is the HIPAA-
-  # eligible pay-per-token Claude endpoint. The app's service principal
-  # needs CAN QUERY on this endpoint.
-  # Alternatives: databricks-claude-3-7-sonnet, databricks-gpt-oss-120b, or
-  # any chat-completion-compatible served model.
+  # draft-benchmarks, draft-metric-view-yaml, etc). Default is Haiku 4.5 for
+  # speed and lower cost. The app's service principal needs CAN QUERY on
+  # this endpoint.
+  # Alternatives: databricks-claude-sonnet-4-6 (higher precision, slower),
+  # databricks-claude-3-7-sonnet, databricks-gpt-oss-120b, or any
+  # chat-completion-compatible served model.
   - name: LLM_ENDPOINT_NAME
-    value: "databricks-claude-sonnet-4-6"
+    value: "databricks-claude-haiku-4-5"
