@@ -2645,22 +2645,21 @@ These are the ACTUAL columns that exist on each in-scope table (from UC DESCRIBE
         parts = []
         if column_syns:
             sub = ["### Column-level synonyms (alternate names for a SPECIFIC COLUMN)"]
-            sub.append("These belong on the column via Genie's column_configs surface — they are")
-            sub.append("NOT a text instruction. Do NOT emit them in general_instructions or as")
-            sub.append("sql_expressions synonyms. Instead, surface them in the `narrative` field")
-            sub.append("as an explicit TODO list so the analyst sets them on each column in the")
-            sub.append("Genie UI before relying on the space (e.g. \"Set column synonyms on")
-            sub.append("`<fqn>`: <synonyms>\").")
+            sub.append("These are AUTO-PUSHED to Genie's column_configs.synonyms at push time. Do NOT")
+            sub.append("emit them in general_instructions or sql_expressions synonyms. Surface them")
+            sub.append("in `narrative` as a manifest line under \"Pushed to column_configs:\" so the")
+            sub.append("analyst sees what got attached to which column.")
             for term, syns, fqn in column_syns:
                 joined_syns = ", ".join(f'"{s}"' for s in syns)
                 sub.append(f"- `{fqn}` — also called: {joined_syns} (canonical term: \"{term}\")")
             parts.append("\n".join(sub))
         if value_syns:
             sub = ["### Value-level synonyms (alternate names for a SPECIFIC VALUE in a column)"]
-            sub.append("These belong as Entity Matching on the column via Genie's column_configs.")
-            sub.append("Do NOT emit them in general_instructions or sql_expressions. Surface them")
-            sub.append("in `narrative` as a TODO: \"Set entity matching on `<fqn>` for value")
-            sub.append("'<column_value>' → <synonyms>\".")
+            sub.append("These are AUTO-PUSHED at push time as (1) a description line on the column")
+            sub.append("mapping value → aliases, and (2) enable_entity_matching=true on the column")
+            sub.append("(Genie's supported way to handle value-level matching). Do NOT emit them in")
+            sub.append("general_instructions or sql_expressions. Surface them in `narrative` under")
+            sub.append("\"Pushed to column_configs:\" as a record of what got attached.")
             for term, syns, fqn, val in value_syns:
                 joined_syns = ", ".join(f'"{s}"' for s in syns)
                 sub.append(
@@ -2681,8 +2680,10 @@ These are the ACTUAL columns that exist on each in-scope table (from UC DESCRIBE
         synonyms_block = f"""
 <classified_synonyms>
 The analyst classified each Synonym term in Session 3 with a routing target.
-Use this block as the AUTHORITATIVE source for where each synonym goes — do
-not re-derive routing from the raw vocabulary list above.
+Column- and value-level synonyms in this block are AUTO-PUSHED to Genie's
+column_configs at push time (no manual UI action needed). Use this block as
+the authoritative routing source — do NOT re-derive from the raw vocab list
+above.
 {joined}
 </classified_synonyms>
 """
@@ -2741,17 +2742,17 @@ IMPORTANT SQL qualification rule for snippets below: Genie infers the table from
 
    Trusted Assets tip: for the 1-3 highest-value recurring questions (the ones a BO will ask repeatedly with different parameters), write the SQL using `:param_name` placeholders (e.g. `WHERE orders.region = :region`) and note this in usage_guidance. When Genie matches the exact parameterized template, the response is labeled "Trusted" — a major reliability signal. Only do this for questions where you can confidently parameterize; don't force it.
 
-7. "narrative" (string): 3-5 sentences for the analyst review screen plus an optional Manual TODOs section. MUST include:
+7. "narrative" (string): 3-5 sentences for the analyst review screen plus an optional Pushed-to-column-configs manifest. MUST include:
    - What this space answers (one-line space purpose).
    - Target audience (which roles/teams will use it).
    - Out-of-scope topics (what it intentionally won't cover — pulled from Session 3 Scope Boundaries).
    - What was configured (high-level count summary: N measures, M filters, K example queries).
    - One sentence on KNOWN gaps the analyst should review before push (data gaps, low confidence example_queries, missing benchmarks).
 
-   If <classified_synonyms> contains column-level or value-level synonyms, end the narrative with a "Manual TODOs (set in Genie UI before relying on this space):" line followed by a markdown bulleted list — one bullet per synonym TODO. Format examples:
+   If <classified_synonyms> contains column-level or value-level synonyms, end the narrative with a "Pushed to column_configs at push time:" line followed by a markdown bulleted list — one bullet per pushed mapping. Format examples:
    - "Column synonyms on `catalog.schema.table.column_name`: \"alt_name_1\", \"alt_name_2\""
-   - "Entity matching on `catalog.schema.table.status` for value 'CANCELLED': \"voided\", \"killed\""
-   If <classified_synonyms> has no column/value entries, omit the TODOs line entirely.
+   - "Entity matching + value-description on `catalog.schema.table.status` for value 'CANCELLED': \"voided\", \"killed\""
+   These are AUTO-PUSHED — analyst doesn't need to set them in the Genie UI manually. The manifest is just a record so the analyst can verify the right metadata landed on the right columns. If <classified_synonyms> has no column/value entries, omit this section entirely.
 
 Return ONLY the JSON object. No markdown fences, no preamble, no trailing commentary. Begin with {{ and end with }}."""
 
@@ -4565,6 +4566,99 @@ def _build_serialized_space(eng, plan):
             tables.append(entry)
     tables.sort(key=lambda x: x["identifier"])
     metric_views.sort(key=lambda x: x["identifier"])
+
+    # ----- Phase 2: Column-level synonyms from Session 3 classifications -----
+    # Build column_configs entries for any term classified as Synonym with a
+    # column- or value-level target. Verified ColumnConfig schema fields
+    # (proto: databricks.datarooms.export.ColumnConfig):
+    #   column_name, description (string[]), display_name, synonyms (string[]),
+    #   enable_format_assistance (bool), enable_entity_matching (bool)
+    # Cross-cutting synonyms are NOT pushed here -- they flow to
+    # general_instructions via the S5 LLM plan.
+    #
+    # NOTE: this overwrites any column_configs the user has set in the Genie
+    # UI for the columns we touch (the push is destructive by design;
+    # serialized_space PATCHes replace-not-merge). Columns we don't touch are
+    # not affected because tables are rebuilt from the data plan each push.
+    s3 = eng["sessions"]["3"]
+    s2 = eng["sessions"]["2"]
+    s2_vocab_by_term = {
+        (v.get("business_term") or "").strip(): v
+        for v in (s2.get("vocabulary_metrics") or [])
+        if isinstance(v, dict) and (v.get("business_term") or "").strip()
+    }
+    # FQN of in-scope tables (the ones we just built) -- column_configs are only
+    # honored when the parent table is in data_sources.tables[]. If an analyst
+    # mapped a synonym to a column in a table that isn't in the data plan, we
+    # silently skip it (the S5 plan's narrative TODO will still surface it for
+    # manual review).
+    table_fqns_in_scope = {t["identifier"] for t in tables}
+
+    # column_configs accumulator: {table_fqn: {column_name: {field: value}}}
+    cc_by_table = {}
+    for c in (s3.get("term_classifications") or []):
+        if not isinstance(c, dict):
+            continue
+        term = (c.get("business_term") or "").strip()
+        types = c.get("types") or []
+        if not term or "Synonym" not in types:
+            continue
+        target = c.get("synonym_target") or {}
+        kind = (target.get("kind") or "cross_cutting").strip().lower()
+        if kind not in ("column", "value"):
+            continue  # cross_cutting handled via general_instructions
+        fqn = (target.get("column_fqn") or "").strip()
+        parts = fqn.split(".")
+        if len(parts) != 4:
+            continue  # malformed FQN (need catalog.schema.table.column)
+        table_fqn = ".".join(parts[:3])
+        column_name = parts[3]
+        if table_fqn not in table_fqns_in_scope:
+            continue  # column's table isn't in the data plan; skip
+
+        vocab = s2_vocab_by_term.get(term)
+        raw_syns = (vocab.get("synonyms") if vocab else "") or ""
+        syns_list = [s.strip() for s in raw_syns.split(",") if s.strip()]
+        if not syns_list:
+            continue
+
+        cc_by_table.setdefault(table_fqn, {})
+        cc = cc_by_table[table_fqn].setdefault(column_name, {"column_name": column_name})
+
+        if kind == "column":
+            # Merge into the column's synonym list (deduped, preserving order)
+            existing = cc.get("synonyms") or []
+            for s in syns_list + [term]:
+                if s and s != column_name and s not in existing:
+                    existing.append(s)
+            if existing:
+                cc["synonyms"] = existing
+        elif kind == "value":
+            # Value-level: append a description line mapping value -> aliases,
+            # and enable entity_matching so Genie can match user phrasings to
+            # values automatically. We don't push value synonyms structurally
+            # because Genie's column_configs schema has no value-aliases field
+            # -- entity_matching is the supported mechanism.
+            col_value = (target.get("column_value") or "").strip()
+            if not col_value:
+                continue
+            joined = ", ".join(f'"{s}"' for s in syns_list)
+            line = f"Value '{col_value}' is also referred to as: {joined}."
+            desc = cc.get("description") or []
+            if line not in desc:
+                desc.append(line)
+            cc["description"] = desc
+            cc["enable_entity_matching"] = True
+
+    # Attach the accumulated column_configs to the matching table entries
+    if cc_by_table:
+        for entry in tables:
+            cc_map = cc_by_table.get(entry["identifier"])
+            if not cc_map:
+                continue
+            entry["column_configs"] = sorted(
+                cc_map.values(), key=lambda c: c["column_name"]
+            )
 
     # Sample questions
     sq_entries = [{"id": _gen_hex_id(), "question": [q]} for q in sample_questions if q]

@@ -692,10 +692,11 @@ export default function Session5Form({
           </Link>
         </Stack>
         <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
-          Known caveat: the LLM sometimes places per-column synonyms in
-          general_instructions when they should be on the column itself. Skim
-          general_instructions before pushing and move any column-specific
-          synonyms into the column's UC metadata or the space's column_configs.
+          Column-level synonyms classified in Session 3 are auto-pushed to the
+          column's column_configs at push time (synonyms list for "column" kind,
+          description + entity_matching toggle for "value" kind). Look for the
+          "Pushed to column_configs" manifest at the bottom of the narrative
+          field above to verify what got attached to which column.
         </Typography>
       </Alert>
 
