@@ -3784,27 +3784,40 @@ def run_benchmark_sql(eid):
 # ---------------------------------------------------------------------------
 
 def _fetch_metric_view_definition(fqn, user_w=None, warehouse_id=None):
-    """Return the live UC definition of a Metric View as a string (DDL / YAML).
+    """Return the live UC YAML definition of a Metric View.
 
-    Uses SHOW CREATE TABLE under OBO so we inherit the user's UC grants. This
-    is the source of truth — the YAML stored in Session 3 could be stale or
-    absent if the analyst pointed at a pre-existing MV.
+    Uses the UC tables REST endpoint under OBO (so the user's UC grants
+    apply) and returns the `view_definition` field — the metric view's
+    YAML body.
+
+    Previously used SHOW CREATE TABLE, which silently fails on metric views
+    in current DBR with UNSUPPORTED_SHOW_CREATE_TABLE.ON_METRIC_VIEW. That
+    failure caused the S5 plan prompt's <metric_view_definitions> block to
+    be empty for any engagement that referenced an MV, so the LLM had no
+    way to see what the MV already covered and would re-author measures
+    that already existed.
+
+    `warehouse_id` is accepted for backwards compatibility with the call
+    site but is no longer used — the REST API doesn't need a warehouse.
     """
     parts = fqn.split(".")
-    if len(parts) != 3 or not (user_w and warehouse_id):
+    if len(parts) != 3 or not user_w:
         return ""
-    stmt = f"SHOW CREATE TABLE `{parts[0]}`.`{parts[1]}`.`{parts[2]}`"
+    url = f"{user_w.config.host.rstrip('/')}/api/2.1/unity-catalog/tables/{fqn}"
     try:
-        resp = user_w.statement_execution.execute_statement(
-            warehouse_id=warehouse_id, statement=stmt,
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {user_w.config.token}"},
+            timeout=30,
         )
-        state = str(resp.status.state) if resp.status else ""
-        if "SUCCEEDED" not in state or not resp.result or not resp.result.data_array:
-            print(f"[mv-fetch] {fqn}: state={state}", flush=True)
+        if not resp.ok:
+            print(f"[mv-fetch] {fqn}: {resp.status_code} {resp.text[:200]}", flush=True)
             return ""
-        # SHOW CREATE TABLE returns a single row with a single column (createtab_stmt).
-        row = resp.result.data_array[0]
-        return str(row[0]) if row else ""
+        body = resp.json()
+        # `view_definition` holds the YAML body for metric views. For a
+        # regular table or non-MV view, it'll be absent or empty -- that's
+        # fine, the caller treats "" as "no MV definition available."
+        return body.get("view_definition") or ""
     except Exception as e:
         print(f"[mv-fetch] {fqn} failed: {type(e).__name__}: {e}", flush=True)
         return ""
