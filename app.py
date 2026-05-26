@@ -4397,34 +4397,44 @@ def uc_metric_views_for_tables():
         return jsonify([])
 
     # Step 1: enumerate MV candidates in every (catalog, schema) that a
-    # picked table lives in. Uses the SDK's tables.list() under OBO so the
-    # user's UC grants apply. Errors are logged-and-skipped per scope so
-    # one inaccessible schema doesn't kill the whole discovery.
+    # picked table lives in. We use the UC tables REST list endpoint (NOT
+    # the SDK's tables.list) because databricks-sdk 0.44.0 (pinned in
+    # requirements.txt) returns METRIC_VIEW as `TableType.MANAGED` in the
+    # TableInfo struct -- the METRIC_VIEW enum value was added in a later
+    # SDK version. The REST response carries the correct `table_type`
+    # string, so this filter actually matches.
     schemas = {".".join(t.split(".")[:2]) for t in picked}
+    host = user_w.config.host.rstrip("/")
+    token = user_w.config.token
+    hdrs = {"Authorization": f"Bearer {token}"}
     candidates = []
     for cs in schemas:
         cat, sch = cs.split(".", 1)
         try:
-            tables = list(user_w.tables.list(catalog_name=cat, schema_name=sch))
+            r = requests.get(
+                f"{host}/api/2.1/unity-catalog/tables",
+                params={"catalog_name": cat, "schema_name": sch, "max_results": 200},
+                headers=hdrs, timeout=15,
+            )
+            if not r.ok:
+                print(f"[/api/uc/metric-views-for-tables] list({cs}): "
+                      f"{r.status_code} {r.text[:200]}", flush=True)
+                continue
+            for t in (r.json().get("tables") or []):
+                if t.get("table_type") == "METRIC_VIEW" and t.get("name"):
+                    candidates.append(f"{cat}.{sch}.{t['name']}")
         except Exception as e:
             print(f"[/api/uc/metric-views-for-tables] list({cs}): "
                   f"{type(e).__name__}: {e}", flush=True)
             continue
-        for t in tables:
-            tt = str(getattr(t, "table_type", "") or "").upper()
-            if "METRIC_VIEW" in tt and t.name:
-                candidates.append(f"{cat}.{sch}.{t.name}")
 
     if not candidates:
         return jsonify([])
 
-    # Step 2: REST-fetch each candidate to read view_dependencies. The SDK's
-    # TableInfo doesn't surface view_dependencies, so we hit /unity-catalog/
-    # tables/<fqn> directly. Skip candidates we can't read (private MVs the
-    # user lacks grants on -- logged-and-skipped, not fatal).
-    host = user_w.config.host.rstrip("/")
-    token = user_w.config.token
-    hdrs = {"Authorization": f"Bearer {token}"}
+    # Step 2: REST-fetch each candidate to read view_dependencies. The LIST
+    # response above returns `view_dependencies: null`, so a per-MV GET is
+    # required to read the dependency list. Skip candidates we can't read
+    # (private MVs the user lacks grants on -- logged-and-skipped, not fatal).
     results = []
     for fqn in candidates:
         try:
