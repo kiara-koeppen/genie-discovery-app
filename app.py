@@ -3,6 +3,7 @@ import os
 import random
 import secrets
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import traceback
 import uuid
@@ -2483,9 +2484,14 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
         lines.append(f"- {item}: {s.get('notes','')}")
     lines.append("")
 
-    lines.append("## Session 4: COE-Approved Data Plan")
+    # Data plan was originally authored in S4 ("COE-Approved Data Plan"); as
+    # of the S3 redesign it's authored in Session 3's Data Sources panel and
+    # COE just reviews it during S4. The underlying field still lives in S4's
+    # column set, but the heading below reflects the new flow so the LLM
+    # doesn't infer a different review stage.
+    lines.append("## Data Plan (authored in Session 3, reviewed in Session 4)")
     if s4.get("analyst_commentary"):
-        lines.append(f"### Analyst Commentary\n{s4.get('analyst_commentary','')}")
+        lines.append(f"### Session 4 Analyst Commentary\n{s4.get('analyst_commentary','')}")
     lines.append("### Tables & Views in scope")
     for d in s4.get("data_plan", []):
         if d.get("include_in_space") == "Yes":
@@ -5057,7 +5063,13 @@ def uc_joins():
 
 @app.route("/api/uc/metric-views")
 def uc_metric_views():
-    """Detect existing metric views in a catalog.schema via OBO tables.list()."""
+    """Detect existing metric views in a catalog.schema.
+
+    Uses the UC tables REST list endpoint (not the SDK's tables.list)
+    because databricks-sdk 0.44.0 returns METRIC_VIEW as TableType.MANAGED
+    in TableInfo -- the enum value was added in a later SDK version. REST
+    response carries table_type as a string, so the filter works.
+    """
     user_w, err = _require_obo()
     if err:
         return err
@@ -5066,17 +5078,365 @@ def uc_metric_views():
         return jsonify([])
     cat, sch = catalog_schema.split(".", 1)
     try:
-        tables = list(user_w.tables.list(catalog_name=cat, schema_name=sch))
+        r = requests.get(
+            f"{user_w.config.host.rstrip('/')}/api/2.1/unity-catalog/tables",
+            params={"catalog_name": cat, "schema_name": sch, "max_results": 200},
+            headers={"Authorization": f"Bearer {user_w.config.token}"},
+            timeout=15,
+        )
+        if not r.ok:
+            print(f"[/api/uc/metric-views] {r.status_code} {r.text[:200]}", flush=True)
+            return jsonify([])
     except Exception as e:
         print(f"[/api/uc/metric-views] {type(e).__name__}: {e}", flush=True)
         return jsonify([])
-    results = []
-    for t in tables:
-        tt = str(getattr(t, "table_type", "") or "").upper()
-        # True UC metric views show up as METRIC_VIEW; plain SQL views are VIEW.
-        if "METRIC_VIEW" in tt and t.name:
-            results.append(f"{cat}.{sch}.{t.name}")
+    results = [
+        f"{cat}.{sch}.{t['name']}"
+        for t in (r.json().get("tables") or [])
+        if t.get("table_type") == "METRIC_VIEW" and t.get("name")
+    ]
     return jsonify(results)
+
+
+@app.route("/api/uc/table-type")
+def uc_table_type():
+    """Return UC's authoritative table_type for a single FQN.
+
+    Used by S3's Data Sources panel: when the analyst picks a name via
+    UCTablePicker, we don't know if it's a managed table, a view, or a
+    metric view -- the picker dropdown lists all of them by name. This
+    lookup tells us how to categorize on Add.
+    """
+    user_w, err = _require_obo()
+    if err:
+        return err
+    fqn = request.args.get("fqn", "")
+    if not fqn or fqn.count(".") != 2:
+        return jsonify({"error": "fqn (3-part) is required"}), 400
+    try:
+        r = requests.get(
+            f"{user_w.config.host.rstrip('/')}/api/2.1/unity-catalog/tables/{fqn}",
+            headers={"Authorization": f"Bearer {user_w.config.token}"},
+            timeout=15,
+        )
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 502
+    if not r.ok:
+        return jsonify({"error": f"{r.status_code}: {r.text[:200]}"}), r.status_code
+    body = r.json()
+    return jsonify({
+        "fqn": fqn,
+        "table_type": body.get("table_type") or "MANAGED",
+        "comment": body.get("comment") or "",
+    })
+
+
+def _list_mvs_in_schema(host, hdrs, cat, sch):
+    """List MV candidate FQNs in a single (catalog, schema) via REST.
+
+    Returns (fqns, error_message) -- error is None on success. The caller
+    surfaces errors in the response so the UI can distinguish "0 MVs in
+    scope" from "couldn't read this schema."
+    """
+    try:
+        r = requests.get(
+            f"{host}/api/2.1/unity-catalog/tables",
+            params={"catalog_name": cat, "schema_name": sch, "max_results": 200},
+            headers=hdrs, timeout=15,
+        )
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    if not r.ok:
+        return [], f"HTTP {r.status_code}: {r.text[:200]}"
+    fqns = [
+        f"{cat}.{sch}.{t['name']}"
+        for t in (r.json().get("tables") or [])
+        if t.get("table_type") == "METRIC_VIEW" and t.get("name")
+    ]
+    return fqns, None
+
+
+def _fetch_mv_dependencies(host, hdrs, fqn):
+    """Return ({fqn metadata + dependencies set}, error_message). The
+    caller filters by the intersect with picked tables. Per-MV REST calls
+    are parallelized in the discovery endpoint via ThreadPoolExecutor."""
+    try:
+        r = requests.get(
+            f"{host}/api/2.1/unity-catalog/tables/{fqn}",
+            headers=hdrs, timeout=15,
+        )
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    if not r.ok:
+        return None, f"HTTP {r.status_code}"
+    body = r.json()
+    deps_raw = (body.get("view_dependencies") or {}).get("dependencies") or []
+    dep_fqns = set()
+    for d in deps_raw:
+        tbl = (d or {}).get("table") or {}
+        fn = tbl.get("table_full_name")
+        if fn:
+            dep_fqns.add(fn)
+    return {
+        "body": body,
+        "dep_fqns": dep_fqns,
+    }, None
+
+
+def _broad_mv_scan(user_w, warehouse_id):
+    """Use system.information_schema.tables to find every metric view
+    visible to the user, regardless of catalog/schema. Catches MVs in
+    personal catalogs that depend on shared source tables -- a common
+    DSA pattern that the per-schema scan misses.
+
+    Returns (fqns, error). On any failure (permission denied, warehouse
+    cold, system table not enabled) returns ([], err) and the caller falls
+    back to per-schema scan.
+    """
+    if not warehouse_id:
+        return [], "no warehouse_id provided"
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id,
+            statement="""
+                SELECT table_catalog || '.' || table_schema || '.' || table_name AS fqn
+                FROM system.information_schema.tables
+                WHERE table_type = 'METRIC_VIEW'
+            """,
+            wait_timeout="30s",
+        )
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    state = ""
+    if resp.status and resp.status.state:
+        state = str(resp.status.state.value if hasattr(resp.status.state, "value")
+                    else resp.status.state)
+    if state != "SUCCEEDED" or not resp.result:
+        msg = ""
+        if resp.status and resp.status.error:
+            msg = (resp.status.error.message or "")[:200]
+        return [], f"system.information_schema query failed ({state}): {msg}"
+    rows = resp.result.data_array or []
+    return [r[0] for r in rows if r and r[0]], None
+
+
+@app.route("/api/uc/metric-views-for-tables")
+def uc_metric_views_for_tables():
+    """Find Metric Views that depend on any of the given source tables.
+
+    Used by S3's data-sources-first flow: the analyst picks tables, the app
+    surfaces existing MVs that already use those tables so the analyst can
+    reuse them instead of re-authoring measures from scratch.
+
+    Query params:
+        fqns: comma-separated catalog.schema.table list (required)
+        warehouse_id: optional. If provided, the discovery also queries
+            system.information_schema.tables for a broader scan that catches
+            MVs in catalogs/schemas different from the picked tables (common
+            DSA pattern where MVs live in personal catalogs but reference
+            shared source tables). If absent or the broad scan fails, falls
+            back to per-(catalog,schema) scan only.
+
+    Response shape:
+        {
+            "metric_views": [{fqn, catalog, schema, name, comment, owner,
+                              updated_at, dependencies}],
+            "errors": ["<schema>: <message>", ...],  -- non-empty when one or
+                more candidate enumeration calls failed; lets the UI
+                distinguish "0 matches" from "couldn't search."
+            "warnings": ["..."]  -- non-fatal notes (e.g. broad scan unavailable,
+                falling back to schema-only).
+            "scope": {
+                "broad": bool  -- true iff system.information_schema was used
+            }
+        }
+    """
+    user_w, err = _require_obo()
+    if err:
+        return err
+    raw = request.args.get("fqns", "")
+    warehouse_id = (request.args.get("warehouse_id") or "").strip()
+    picked = {
+        t.strip() for t in raw.split(",")
+        if t.strip() and t.count(".") == 2
+    }
+    if not picked:
+        return jsonify({"metric_views": [], "errors": [], "warnings": [], "scope": {"broad": False}})
+
+    host = user_w.config.host.rstrip("/")
+    hdrs = {"Authorization": f"Bearer {user_w.config.token}"}
+    errors = []
+    warnings = []
+    candidates = set()
+    broad_used = False
+
+    # Step 1a: try the broad scan first if a warehouse is available. One SQL
+    # query finds every MV visible to the user. If it fails (system table
+    # disabled, no warehouse access, etc.) we silently fall back to the
+    # narrower per-schema scan -- but the UI gets a warning so the user
+    # knows discovery was scoped.
+    if warehouse_id:
+        broad_fqns, broad_err = _broad_mv_scan(user_w, warehouse_id)
+        if broad_err:
+            warnings.append(
+                f"Broad MV scan via system.information_schema failed: {broad_err}. "
+                "Falling back to schema-scoped scan (MVs in different catalogs/"
+                "schemas from your picked tables won't be found)."
+            )
+        else:
+            candidates.update(broad_fqns)
+            broad_used = True
+
+    # Step 1b: schema-scoped scan as fallback / supplement. Parallelize
+    # across the (catalog, schema) pairs of picked tables -- usually 1-3
+    # schemas, but parallelism shaves the round-trip cost regardless.
+    schemas = {".".join(t.split(".")[:2]) for t in picked}
+    if not broad_used:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {
+                pool.submit(_list_mvs_in_schema, host, hdrs, *cs.split(".", 1)): cs
+                for cs in schemas
+            }
+            for fut in futures:
+                cs = futures[fut]
+                fqns, scan_err = fut.result()
+                if scan_err:
+                    errors.append(f"{cs}: {scan_err}")
+                else:
+                    candidates.update(fqns)
+
+    if not candidates:
+        return jsonify({
+            "metric_views": [],
+            "errors": errors,
+            "warnings": warnings,
+            "scope": {"broad": broad_used},
+        })
+
+    # Step 2: REST-fetch view_dependencies for every candidate in parallel.
+    # The LIST response above returns view_dependencies: null, so we need
+    # per-MV GETs to read the dependency list. Parallelism here is the
+    # biggest win -- a schema with 30 MVs goes from sequential ~6s to a
+    # bounded ~1s. Failed fetches are logged-and-skipped (e.g. private MVs
+    # the user lacks grants on).
+    results = []
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {
+            pool.submit(_fetch_mv_dependencies, host, hdrs, fqn): fqn
+            for fqn in sorted(candidates)
+        }
+        for fut in futures:
+            fqn = futures[fut]
+            data, dep_err = fut.result()
+            if dep_err:
+                print(f"[/api/uc/metric-views-for-tables] {fqn}: {dep_err}", flush=True)
+                continue
+            if not (data["dep_fqns"] & picked):
+                continue
+            body = data["body"]
+            parts = fqn.split(".")
+            results.append({
+                "fqn": fqn,
+                "catalog": parts[0],
+                "schema": parts[1],
+                "name": parts[2],
+                "comment": body.get("comment", "") or "",
+                "owner": body.get("owner", "") or "",
+                "updated_at": body.get("updated_at"),
+                "dependencies": sorted(data["dep_fqns"]),
+            })
+
+    results.sort(key=lambda x: x["fqn"])
+    return jsonify({
+        "metric_views": results,
+        "errors": errors,
+        "warnings": warnings,
+        "scope": {"broad": broad_used},
+    })
+
+
+@app.route("/api/uc/metric-view-details")
+def uc_metric_view_details():
+    """Return structured dimensions + measures for a Metric View.
+
+    Used by S3's data-sources panel to render "what does this MV cover?" --
+    column names, display names, synonyms, comments, and measure markers --
+    without needing an LLM. The deterministic part of Phase 1.
+
+    Query params:
+        fqn:          catalog.schema.metric_view_name (required)
+        warehouse_id: SQL warehouse to run DESCRIBE on (required)
+
+    Returns:
+        { fqn, dimensions: [...], measures: [...] }
+      where each entry is:
+        { name, display_name, synonyms: [...], comment, data_type }
+
+    Measure detection: DESCRIBE EXTENDED on a metric view returns each
+    column's data_type with a trailing " measure" marker (e.g.
+    "bigint measure"). We split on that marker.
+    """
+    user_w, err = _require_obo()
+    if err:
+        return err
+    fqn = request.args.get("fqn", "")
+    warehouse_id = request.args.get("warehouse_id", "")
+    if not fqn or fqn.count(".") != 2:
+        return jsonify({"error": "fqn (3-part) is required"}), 400
+    if not warehouse_id:
+        return jsonify({"error": "warehouse_id is required"}), 400
+
+    parts = fqn.split(".")
+    stmt = f"DESCRIBE EXTENDED `{parts[0]}`.`{parts[1]}`.`{parts[2]}`"
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id, statement=stmt, wait_timeout="30s",
+        )
+    except Exception as e:
+        print(f"[/api/uc/metric-view-details] {type(e).__name__}: {e}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 502
+
+    state = ""
+    if resp.status and resp.status.state:
+        state = str(resp.status.state.value if hasattr(resp.status.state, "value")
+                    else resp.status.state)
+    if state != "SUCCEEDED" or not resp.result or not resp.result.data_array:
+        msg = ""
+        if resp.status and resp.status.error:
+            msg = (resp.status.error.message or "")[:300]
+        return jsonify({"error": f"DESCRIBE failed ({state}): {msg}"}), 502
+
+    dimensions, measures = [], []
+    for row in resp.result.data_array:
+        if not row:
+            continue
+        col_name = (row[0] or "").strip() if row[0] else ""
+        # The "# Detailed Table Information" section comes after the
+        # columns. Stop on the first blank or comment-banner row -- the
+        # column metadata we care about all lives above it.
+        if not col_name or col_name.startswith("#"):
+            break
+        data_type = (row[1] or "").strip() if len(row) > 1 and row[1] else ""
+        comment = (row[2] or "").strip() if len(row) > 2 and row[2] else ""
+        metadata_raw = (row[3] or "").strip() if len(row) > 3 and row[3] else ""
+        meta = {}
+        if metadata_raw:
+            try:
+                meta = json.loads(metadata_raw)
+            except Exception:
+                meta = {}
+        entry = {
+            "name": col_name,
+            "data_type": data_type,
+            "comment": comment,
+            "display_name": (meta.get("display_name") or "").strip(),
+            "synonyms": meta.get("synonyms") or [],
+        }
+        if "measure" in data_type.lower():
+            measures.append(entry)
+        else:
+            dimensions.append(entry)
+    return jsonify({"fqn": fqn, "dimensions": dimensions, "measures": measures})
 
 
 # ---------------------------------------------------------------------------

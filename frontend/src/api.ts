@@ -396,6 +396,51 @@ export const api = {
   listSchemas: (catalog: string) =>
     json<string[]>(`/uc/schemas?catalog=${encodeURIComponent(catalog)}`),
 
+  /** Return UC's authoritative table_type for a FQN. Used by the Data
+   *  Sources panel to categorize a picker selection as Table vs Metric View
+   *  on Add (the picker dropdown lists both kinds by name). */
+  getTableType: (fqn: string) =>
+    json<{ fqn: string; table_type: string; comment: string }>(
+      `/uc/table-type?fqn=${encodeURIComponent(fqn)}`,
+    ),
+
+  /** S3 data-sources-first flow: find existing Metric Views that depend on
+   *  any of the picked source tables. Used to surface reusable MVs to the
+   *  analyst so they don't have to re-author measures from scratch.
+   *
+   *  Passing `warehouseId` enables the broad scan via
+   *  system.information_schema (catches cross-catalog MVs). Without it,
+   *  discovery falls back to scanning only the (catalog, schema) of each
+   *  picked table -- correct but narrower. */
+  findMetricViewsForTables: (fqns: string[], warehouseId?: string) => {
+    const params = new URLSearchParams({ fqns: fqns.join(",") });
+    if (warehouseId) params.set("warehouse_id", warehouseId);
+    return json<{
+      metric_views: {
+        fqn: string;
+        catalog: string;
+        schema: string;
+        name: string;
+        comment: string;
+        owner: string;
+        updated_at?: string;
+        dependencies: string[];
+      }[];
+      errors: string[];
+      warnings: string[];
+      scope: { broad: boolean };
+    }>(`/uc/metric-views-for-tables?${params.toString()}`);
+  },
+
+  /** Deterministic "what this MV covers" view: dimensions + measures + each
+   *  column's display_name, synonyms, and comment. No LLM needed. */
+  fetchMetricViewDetails: (fqn: string, warehouseId: string) =>
+    json<{
+      fqn: string;
+      dimensions: { name: string; display_name: string; synonyms: string[]; comment: string; data_type: string }[];
+      measures:   { name: string; display_name: string; synonyms: string[]; comment: string; data_type: string }[];
+    }>(`/uc/metric-view-details?fqn=${encodeURIComponent(fqn)}&warehouse_id=${encodeURIComponent(warehouseId)}`),
+
   pushToGenie: (
     id: string,
     body: {

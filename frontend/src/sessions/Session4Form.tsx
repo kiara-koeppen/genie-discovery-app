@@ -14,6 +14,7 @@ import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
+import LockIcon from "@mui/icons-material/Lock";
 import ReactMarkdown from "react-markdown";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
@@ -605,7 +606,8 @@ export default function Session4Form({
         </Alert>
       )}
 
-      {/* Data Plan */}
+      {/* Data Plan -- read-only mirror of what was picked in S3's Data Sources panel.
+          Authoring lives in S3; S4 just reviews + uses as input for the Readiness Brief. */}
       <Accordion id="section-4-data-plan" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
@@ -615,20 +617,25 @@ export default function Session4Form({
               size="small"
               variant="outlined"
             />
+            <Chip
+              icon={<LockIcon sx={{ fontSize: 14 }} />}
+              label="Authored in Session 3"
+              size="small"
+              variant="outlined"
+            />
           </Box>
         </AccordionSummary>
         <AccordionDetails>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Tables and metric views that will be included in the Genie Space. Pre-populated
-            from Session 3. Add additional tables or metric views you have created. The Readiness
-            Brief below uses this data plan as one of its inputs -- regenerate the brief after
-            any changes here.
-          </Typography>
+          <Alert severity="info" sx={{ mb: 2 }}>
+            The data plan is now authored in Session 3's <strong>Data Sources</strong> panel.
+            This section shows what was picked, read-only. To add or remove tables / metric
+            views, switch back to Session 3.
+          </Alert>
           <EditableTable
             columns={DATA_PLAN_COLS}
             rows={data.data_plan || []}
             onChange={(rows) => onChange("data_plan", rows)}
-            readOnly={sectionReadOnly}
+            readOnly={true}
           />
         </AccordionDetails>
       </Accordion>

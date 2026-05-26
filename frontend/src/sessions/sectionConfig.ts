@@ -34,6 +34,7 @@ export const SESSION_SECTIONS: Record<number, SectionEntry[]> = {
     { id: "section-2-key-terms", label: "Key Terms & Metrics" },
   ],
   3: [
+    { id: "section-3-data-sources", label: "Data Sources" },
     { id: "section-3-reference", label: "Reference: Sessions 1 & 2" },
     { id: "section-3-classify-terms", label: "Classify Terms" },
     { id: "section-3-global-filter", label: "Global Filter" },

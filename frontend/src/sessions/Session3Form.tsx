@@ -14,6 +14,7 @@ import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
 import UCColumnPicker from "../components/UCColumnPicker";
+import DataSourcesPanel from "../components/DataSourcesPanel";
 import { api } from "../api";
 import type { ColumnDef, SynonymTarget } from "../types";
 
@@ -50,6 +51,23 @@ interface Props {
   readOnly?: boolean;
   session1Data?: Record<string, any>;
   session2Data?: Record<string, any>;
+  /** S4's draft -- needed so the new Data Sources panel can read+write the
+   *  data_plan field (which lives in S4's column set today). */
+  session4Data?: Record<string, any>;
+  /** Writer for S4 fields. The Data Sources panel uses this to update data_plan
+   *  from S3. The parent (Engagement.tsx) routes it through to the S4 save path. */
+  onChangeSession4?: (section: string, value: any) => void;
+  /** Writer for S5 fields. The Data Sources panel uses this for the inline
+   *  warehouse picker (which persists to plan_warehouse_id so the same
+   *  warehouse carries through to Generate Plan). */
+  onChangeSession5?: (section: string, value: any) => void;
+  /** SQL warehouse ID for DESCRIBE EXTENDED on metric views + the broad MV
+   *  discovery scan. Resolved by the parent from S5's plan_warehouse_id;
+   *  empty is OK -- the panel renders an inline picker to set it. */
+  warehouseId?: string;
+  /** True when the current user is a BO (not COE). Forces read-only on the
+   *  Data Sources panel since BOs can't write to S3/S4 fields. */
+  isBoOnly?: boolean;
   engagementId?: string;
   /** Called after Create Metric View persists, so the parent can refresh its
    *  optimistic-lock token (updatedAtRef) and avoid a 409 on next autosave. */
@@ -57,7 +75,9 @@ interface Props {
 }
 
 export default function Session3Form({
-  data, onChange, readOnly, session1Data, session2Data, engagementId, onMetricViewCreated,
+  data, onChange, readOnly, session1Data, session2Data, session4Data,
+  onChangeSession4, onChangeSession5, warehouseId, isBoOnly, engagementId,
+  onMetricViewCreated,
 }: Props) {
   const [joins, setJoins] = useState<{ table: string; keys: string }[]>([]);
   const [metricViews, setMetricViews] = useState<string[]>([]);
@@ -388,10 +408,37 @@ export default function Session3Form({
   return (
     <Box>
       <Alert severity="info" sx={{ mb: 2 }}>
-        <strong>Session Goal:</strong> This is your solo technical work. Classify each business term
-        from Session 2, then implement it: metrics get SQL expressions with a UC table,
-        and filters/date logic get text instructions.
+        <strong>Session Goal:</strong> This is your solo technical work. Pick the tables your
+        Genie space will use (top), reuse any existing Metric Views that already cover those
+        tables, then classify each business term from Session 2 and implement it.
       </Alert>
+
+      {/* ---- Data Sources (top -- the analyst starts here) ---- */}
+      <Accordion id="section-3-data-sources" defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="h6">Data Sources</Typography>
+            <Chip
+              label={`${(session4Data?.data_plan || []).filter((d: any) => d.include_in_space === "Yes").length} in scope`}
+              size="small"
+              variant="outlined"
+            />
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails>
+          <DataSourcesPanel
+            dataPlan={session4Data?.data_plan || []}
+            onChangeDataPlan={(next) => onChangeSession4?.("data_plan", next)}
+            warehouseId={warehouseId || ""}
+            onChangeWarehouseId={
+              onChangeSession5
+                ? (id) => onChangeSession5("plan_warehouse_id", id)
+                : undefined
+            }
+            readOnly={readOnly || isBoOnly || !onChangeSession4}
+          />
+        </AccordionDetails>
+      </Accordion>
 
       {/* ---- Reference Panel ---- */}
       {(questions.length > 0 || reports.length > 0) && (
