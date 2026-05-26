@@ -157,7 +157,10 @@ export default function Engagement({ readOnly = false }: Props) {
         return;
       } catch (err: any) {
         const msg = err?.message || "Save failed";
-        const isStale = msg.toLowerCase().includes("updated by another user");
+        // err.stale is set by the json() helper on any 409; fall back to a
+        // substring match for endpoints that don't go through json() (e.g.
+        // applyPrework throws its own custom error).
+        const isStale = err?.stale === true || msg.toLowerCase().includes("updated by another user");
 
         if (isStale && attempt < MAX_ATTEMPTS) {
           // Refresh ref from server and retry. Don't touch sessionDrafts —
@@ -584,6 +587,7 @@ export default function Engagement({ readOnly = false }: Props) {
             session4Data={sessionDrafts[4]}
             engagementId={id}
             onPushed={(ts) => { updatedAtRef.current = ts; }}
+            getUpdatedAt={() => updatedAtRef.current}
           />
         )}
         {tab === 5 && <Session6Form {...sessionProps(6)} />}

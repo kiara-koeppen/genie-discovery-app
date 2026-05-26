@@ -26,12 +26,16 @@ interface Props {
   /** Called after a successful push so the parent can refresh its
    *  optimistic-lock token (updatedAtRef) and avoid 409s on autosave. */
   onPushed?: (updatedAt: string) => void;
+  /** Returns the parent's current updated_at so the push can send If-Match
+   *  and refuse to race a concurrent edit. Implemented as a getter (not a
+   *  prop value) so the child reads the FRESH ref value at click time. */
+  getUpdatedAt?: () => string;
 }
 
 type SnippetKey = "plan_sql_filters" | "plan_sql_dimensions" | "plan_sql_measures";
 
 export default function Session5Form({
-  data, onChange, readOnly, session4Data, engagementId, onPushed,
+  data, onChange, readOnly, session4Data, engagementId, onPushed, getUpdatedAt,
 }: Props) {
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string>("");
@@ -186,7 +190,7 @@ export default function Session5Form({
       };
       if (mode === "existing") body.space_id = data.genie_space_id || "";
       else { body.new_title = newTitle; body.new_description = newDescription; }
-      const res = await api.pushToGenie(engagementId, body);
+      const res = await api.pushToGenie(engagementId, body, getUpdatedAt?.());
       // Refresh parent's optimistic-lock token BEFORE the onChange cascade
       // so the next autosave doesn't 409.
       if (res.updated_at) onPushed?.(res.updated_at);
@@ -197,7 +201,16 @@ export default function Session5Form({
         ? `Created new Genie Space. View it at ${res.space_url}`
         : `Updated Genie Space. View it at ${res.space_url}`);
     } catch (err: any) {
-      setPushError(err.message || "Push failed");
+      // Stale-engagement 409: tell the user explicitly that someone else
+      // edited the row and they need to refresh. err.current_updated_at lets
+      // the parent re-sync if it wants to handle this gracefully later.
+      if (err?.stale) {
+        setPushError(
+          "This engagement was updated by another user. Refresh the page to load the latest state, then try Push again.",
+        );
+      } else {
+        setPushError(err.message || "Push failed");
+      }
     }
     setPushing(false);
   };

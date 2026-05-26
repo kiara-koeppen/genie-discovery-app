@@ -4669,8 +4669,12 @@ def _build_serialized_space(eng, plan):
                 s = (s or "").strip()
                 if s and s not in all_aliases:
                     all_aliases.append(s)
-            joined = ", ".join(f'"{s}"' for s in all_aliases)
-            line = f"Value '{col_value}' is also referred to as: {joined}."
+            # Backslash-escape any literal " in the alias so the rendered
+            # description doesn't break out of its surrounding quotes.
+            joined = ", ".join(f'"{s.replace(chr(34), chr(92) + chr(34))}"' for s in all_aliases)
+            # Same for col_value — analysts can put quotes inside category names.
+            col_value_safe = col_value.replace("'", "\\'")
+            line = f"Value '{col_value_safe}' is also referred to as: {joined}."
             desc = cc.get("description") or []
             if line not in desc:
                 desc.append(line)
@@ -4830,6 +4834,20 @@ def push_to_genie(eid):
     new_description = (data.get("new_description") or "").strip()
     new_parent_path = (data.get("new_parent_path") or "").strip()
 
+    # Optimistic-lock check BEFORE we read the engagement: if the client's
+    # If-Match doesn't match the row's updated_at, refuse the push. Without
+    # this, two analysts working the same engagement can race -- one pushes
+    # stale serialized_space while the other is mid-edit, silently clobbering
+    # the live Genie space with out-of-date data.
+    try:
+        _check_optimistic_lock(eid)
+    except StaleEngagementError as e:
+        return jsonify({
+            "error": "stale",
+            "current_updated_at": e.current_updated_at,
+            "message": "This engagement was updated by another user. Refresh before pushing.",
+        }), 409
+
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if not rows:
         return jsonify({"error": "Engagement not found"}), 404
@@ -4949,8 +4967,15 @@ def uc_catalogs():
     try:
         cats = list(user_w.catalogs.list())
     except Exception as e:
-        print(f"[/api/uc/catalogs] {type(e).__name__}: {e}", flush=True)
-        return jsonify([])
+        # Surface the failure instead of swallowing it -- a silent empty list
+        # leaves the user staring at an empty picker with no idea why. Auth
+        # errors translate to a reauth_required code the frontend already
+        # knows how to render; everything else gets a generic error message.
+        msg = f"{type(e).__name__}: {e}"
+        print(f"[/api/uc/catalogs] {msg}", flush=True)
+        status = 401 if "401" in msg or "PERMISSION_DENIED" in msg or "unauthorized" in msg.lower() else 502
+        code = "reauth_required" if status == 401 else "catalogs_list_failed"
+        return jsonify({"error": code, "message": msg}), status
     names = [c.name for c in cats if c.name and not c.name.startswith("__")]
     names.sort(key=str.lower)
     return jsonify(names)

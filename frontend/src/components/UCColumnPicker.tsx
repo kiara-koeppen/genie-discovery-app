@@ -12,7 +12,13 @@ const cache: Record<string, any[]> = {};
 async function fetchCached(url: string): Promise<any[]> {
   if (cache[url]) return cache[url];
   const res = await fetch(url);
-  const data = await res.json();
+  const data = await res.json().catch(() => []);
+  // /api/uc/catalogs returns {error, message} on failure now; coerce to []
+  // here so the picker still renders cleanly. Errors are logged for debug.
+  if (!Array.isArray(data)) {
+    console.warn(`[UC picker] ${url} returned non-array response:`, data);
+    return [];
+  }
   cache[url] = data;
   return data;
 }

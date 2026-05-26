@@ -69,8 +69,18 @@ async function json<T>(url: string, opts?: RequestInit): Promise<T> {
     ...opts,
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `${res.status} ${res.statusText}`);
+    const body = await res.json().catch(() => ({} as any));
+    // Prefer body.message (human-readable) over body.error (machine code).
+    // Without this, a 409 surfaces as Error("stale") which the recovery code
+    // can't pattern-match to trigger the refresh-and-retry flow.
+    const message = body.message || body.error || `${res.status} ${res.statusText}`;
+    const err: any = new Error(message);
+    err.status = res.status;
+    if (res.status === 409) {
+      err.stale = true;
+      err.current_updated_at = body.current_updated_at;
+    }
+    throw err;
   }
   return res.json();
 }
@@ -441,7 +451,10 @@ export const api = {
       measures:   { name: string; display_name: string; synonyms: string[]; comment: string; data_type: string }[];
     }>(`/uc/metric-view-details?fqn=${encodeURIComponent(fqn)}&warehouse_id=${encodeURIComponent(warehouseId)}`),
 
-  pushToGenie: (
+  /** Push the engagement plan to a Genie Space. Honors If-Match optimistic
+   *  lock so a concurrent edit can't race in stale data; 409 surfaces a
+   *  stale-error the caller can show as "refresh before pushing". */
+  pushToGenie: async (
     id: string,
     body: {
       mode: "existing" | "new";
@@ -458,8 +471,26 @@ export const api = {
       example_queries?: ExampleQuery[];
       joins?: UcJoin[];
     },
-  ) =>
-    json<{
+    ifMatch?: string,
+  ) => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (ifMatch) headers["If-Match"] = ifMatch;
+    const res = await fetch(`${BASE}/engagements/${id}/push-to-genie`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    const respBody = await res.json().catch(() => ({}));
+    if (res.status === 409) {
+      const err: any = new Error(
+        respBody.message || "Engagement was updated by another user. Refresh before pushing.",
+      );
+      err.stale = true;
+      err.current_updated_at = respBody.current_updated_at;
+      throw err;
+    }
+    if (!res.ok) throw new Error(respBody.error || `${res.status} ${res.statusText}`);
+    return respBody as {
       mode: string;
       space_id: string;
       space_url: string;
@@ -467,8 +498,6 @@ export const api = {
       updated?: boolean;
       warnings?: string[];
       updated_at?: string;
-    }>(`/engagements/${id}/push-to-genie`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
+    };
+  },
 };

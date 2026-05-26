@@ -710,7 +710,17 @@ export default function Session3Form({
             {/* ---- Synonym Routing Summary (read-only) ---- */}
             {/* Groups every Synonym-classified term by where it'll land at S5
                 push. Renders only when at least one term is classified as
-                Synonym so blank engagements stay quiet. */}
+                Synonym so blank engagements stay quiet.
+
+                Each row is tagged "will push" vs "will NOT push" using the same
+                rules the backend applies in _build_serialized_space:
+                  - column kind: needs a 4-part FQN AND that table must be in
+                    the data plan (otherwise backend drops silently)
+                  - value kind:  same + a non-empty column_value
+                  - cross_cutting: always valid
+                We surface invalid rows in red with a "Won't push" chip so the
+                analyst sees the gap before clicking Push, instead of finding
+                out by testing the live Genie space. */}
             {(() => {
               interface SynRow {
                 term: string;
@@ -718,19 +728,55 @@ export default function Session3Form({
                 kind: string;
                 column_fqn: string;
                 column_value: string;
+                /** False if the backend will silently filter this out at push
+                 *  time. Mirrors the filter rules in app.py:_build_serialized_space. */
+                willPush: boolean;
+                /** Human-readable reason; only set when willPush=false. */
+                blockReason: string;
               }
+              // In-scope table FQNs (must match _build_serialized_space.table_fqns_in_scope).
+              const inScopeTableFqns = new Set<string>(
+                (session4Data?.data_plan || [])
+                  .filter((d: any) => d.include_in_space === "Yes" && d.type !== "Metric View")
+                  .map((d: any) => (d.table_or_view || "").trim())
+                  .filter((fqn: string) => fqn && fqn.split(".").length === 3),
+              );
               const synonymRows: SynRow[] = (data.term_classifications || [])
                 .filter((c: any) => (c.types || []).includes("Synonym"))
                 .map((c: any) => {
                   const vocab = vocabTerms.find((v: any) => v.business_term === c.business_term);
                   const target = c.synonym_target || { kind: "cross_cutting" };
-                  return {
-                    term: c.business_term,
-                    synonyms: (vocab?.synonyms || "").split(",").map((s: string) => s.trim()).filter(Boolean),
-                    kind: target.kind,
-                    column_fqn: target.column_fqn || "",
-                    column_value: target.column_value || "",
-                  };
+                  const kind = target.kind;
+                  const fqn = (target.column_fqn || "").trim();
+                  const colValue = (target.column_value || "").trim();
+                  const synonyms = (vocab?.synonyms || "").split(",").map((s: string) => s.trim()).filter(Boolean);
+
+                  let willPush = true;
+                  let blockReason = "";
+                  if (kind === "column" || kind === "value") {
+                    const parts = fqn.split(".");
+                    if (!fqn) {
+                      willPush = false;
+                      blockReason = "no column picked";
+                    } else if (parts.length !== 4) {
+                      willPush = false;
+                      blockReason = "FQN missing column (need catalog.schema.table.column)";
+                    } else {
+                      const tableFqn = parts.slice(0, 3).join(".");
+                      if (!inScopeTableFqns.has(tableFqn)) {
+                        willPush = false;
+                        blockReason = `${tableFqn} is not in the data plan above`;
+                      } else if (kind === "value" && !colValue) {
+                        willPush = false;
+                        blockReason = "value kind needs a non-empty column value";
+                      }
+                    }
+                    if (willPush && synonyms.length === 0) {
+                      willPush = false;
+                      blockReason = "no synonyms in S2 vocab";
+                    }
+                  }
+                  return { term: c.business_term, synonyms, kind, column_fqn: fqn, column_value: colValue, willPush, blockReason };
                 });
               if (!synonymRows.length) return null;
 
@@ -738,26 +784,63 @@ export default function Session3Form({
               const valueEntries  = synonymRows.filter((r: SynRow) => r.kind === "value");
               const generalEntries = synonymRows.filter((r: SynRow) => r.kind === "cross_cutting");
 
+              const colPush  = columnEntries.filter((r) => r.willPush).length;
+              const valPush  = valueEntries.filter((r) => r.willPush).length;
+              const genPush  = generalEntries.filter((r) => r.willPush).length;
+              const totalRows = synonymRows.length;
+              const totalPush = colPush + valPush + genPush;
+              const blockedRows = totalRows - totalPush;
+
               const renderEntries = (entries: SynRow[], fmt: (r: SynRow) => ReactNode) =>
                 entries.length === 0 ? null : (
                   <Box component="ul" sx={{ pl: 3, my: 0.5, "& li": { mb: 0.25 } }}>
-                    {entries.map((r: SynRow, i: number) => <li key={i}>{fmt(r)}</li>)}
+                    {entries.map((r: SynRow, i: number) => (
+                      <li key={i} style={r.willPush ? undefined : { opacity: 0.65 }}>{fmt(r)}</li>
+                    ))}
                   </Box>
+                );
+
+              // Render a "Won't push: <reason>" chip after the row content.
+              const blockChip = (r: SynRow) =>
+                r.willPush ? null : (
+                  <Chip
+                    size="small"
+                    color="warning"
+                    variant="outlined"
+                    label={`Won't push: ${r.blockReason}`}
+                    sx={{ ml: 1, height: 18, fontSize: 11 }}
+                  />
                 );
 
               return (
                 <Box sx={{ mt: 3, p: 2, bgcolor: "action.hover", borderRadius: 1 }}>
-                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5 }}>
+                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5, flexWrap: "wrap", gap: 0.5 }}>
                     <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
                       Synonym Routing Summary
                     </Typography>
-                    <Chip size="small" variant="outlined" label={`${columnEntries.length} column`} />
-                    <Chip size="small" variant="outlined" label={`${valueEntries.length} value`} />
-                    <Chip size="small" variant="outlined" label={`${generalEntries.length} general space`} />
+                    <Chip size="small" variant="outlined" label={`${colPush} column`} />
+                    <Chip size="small" variant="outlined" label={`${valPush} value`} />
+                    <Chip size="small" variant="outlined" label={`${genPush} general space`} />
+                    {blockedRows > 0 && (
+                      <Chip
+                        size="small"
+                        color="warning"
+                        variant="filled"
+                        label={`${blockedRows} won't push`}
+                      />
+                    )}
                     <Typography variant="caption" color="text.secondary" sx={{ ml: "auto" }}>
-                      Auto-applied when you push at Session 5 — no manual Genie UI work needed.
+                      {totalPush} of {totalRows} synonyms will push at Session 5.
                     </Typography>
                   </Stack>
+
+                  {blockedRows > 0 && (
+                    <Alert severity="warning" sx={{ mb: 1.5, py: 0.5 }}>
+                      {blockedRows} synonym routing{blockedRows === 1 ? " is" : "s are"} incomplete and will be silently
+                      dropped at push. Fix the highlighted rows below — pick a column, add the table to the data plan,
+                      or fill in the column value as the warning indicates.
+                    </Alert>
+                  )}
 
                   {columnEntries.length > 0 && (
                     <Box sx={{ mb: 1.5 }}>
@@ -765,13 +848,14 @@ export default function Session3Form({
                         Will be pushed to <code>column.synonyms</code>:
                       </Typography>
                       {renderEntries(columnEntries, (r) => (
-                        <Typography variant="body2">
+                        <Typography variant="body2" component="span">
                           <code style={{ fontSize: 12 }}>{r.column_fqn || <em style={{ color: "#c62828" }}>(no column picked)</em>}</code>
                           {" ← "}
                           {r.synonyms.length > 0
                             ? r.synonyms.map((s: string, i: number) => <code key={i} style={{ fontSize: 12, marginRight: 4 }}>"{s}"</code>)
                             : <em style={{ color: "#999" }}>(no synonyms in S2 vocab)</em>}
                           {" "}<span style={{ color: "#999" }}>(from "{r.term}")</span>
+                          {blockChip(r)}
                         </Typography>
                       ))}
                     </Box>
@@ -783,7 +867,7 @@ export default function Session3Form({
                         Will be pushed to <code>column.description</code> + Entity Matching enabled:
                       </Typography>
                       {renderEntries(valueEntries, (r) => (
-                        <Typography variant="body2">
+                        <Typography variant="body2" component="span">
                           <code style={{ fontSize: 12 }}>{r.column_fqn || <em style={{ color: "#c62828" }}>(no column picked)</em>}</code>
                           {r.column_value && <> value <code style={{ fontSize: 12 }}>'{r.column_value}'</code></>}
                           {" ← "}
@@ -791,6 +875,7 @@ export default function Session3Form({
                             ? r.synonyms.map((s: string, i: number) => <code key={i} style={{ fontSize: 12, marginRight: 4 }}>"{s}"</code>)
                             : <em style={{ color: "#999" }}>(no synonyms in S2 vocab)</em>}
                           {" "}<span style={{ color: "#999" }}>(from "{r.term}")</span>
+                          {blockChip(r)}
                         </Typography>
                       ))}
                     </Box>
@@ -802,7 +887,7 @@ export default function Session3Form({
                         Will appear in the space's <code>General Instructions</code>:
                       </Typography>
                       {renderEntries(generalEntries, (r) => (
-                        <Typography variant="body2">
+                        <Typography variant="body2" component="span">
                           <strong>{r.term}</strong>
                           {" → "}
                           {r.synonyms.length > 0
@@ -811,6 +896,7 @@ export default function Session3Form({
                           <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
                             (auto-pre-filled in the Text Instructions section below — you can edit the phrasing)
                           </Typography>
+                          {blockChip(r)}
                         </Typography>
                       ))}
                     </Box>
