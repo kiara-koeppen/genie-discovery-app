@@ -154,12 +154,16 @@ export default function DataSourcesPanel({
 
   // Load warehouse list for the inline picker on mount (only if the parent
   // wired the onChange callback -- otherwise the picker doesn't render).
+  // Deliberately not depending on `onChangeWarehouseId` directly because the
+  // parent passes a new closure each render, which would re-fire the effect
+  // every render and spam /api/warehouses. Boolean-coerced dep stays stable.
+  const hasWarehouseChangeCallback = !!onChangeWarehouseId;
   useEffect(() => {
-    if (!onChangeWarehouseId) return;
+    if (!hasWarehouseChangeCallback) return;
     api.listWarehouses()
       .then(setWarehouses)
       .catch(() => setWarehouses([]));
-  }, [onChangeWarehouseId]);
+  }, [hasWarehouseChangeCallback]);
 
   const handleAddTable = async () => {
     if (!pickerValue || pickerValue.split(".").length !== 3) return;
