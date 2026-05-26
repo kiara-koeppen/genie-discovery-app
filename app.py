@@ -4638,11 +4638,19 @@ def _build_serialized_space(eng, plan):
             # and enable entity_matching so Genie can match user phrasings to
             # values automatically. We don't push value synonyms structurally
             # because Genie's column_configs schema has no value-aliases field
-            # -- entity_matching is the supported mechanism.
+            # -- description text + entity_matching toggle is the supported
+            # mechanism.
             col_value = (target.get("column_value") or "").strip()
             if not col_value:
                 continue
-            joined = ", ".join(f'"{s}"' for s in syns_list)
+            # The canonical term IS an alias for the value (just like the S2
+            # synonyms are). Include it first, dedupe.
+            all_aliases = []
+            for s in [term] + syns_list:
+                s = (s or "").strip()
+                if s and s not in all_aliases:
+                    all_aliases.append(s)
+            joined = ", ".join(f'"{s}"' for s in all_aliases)
             line = f"Value '{col_value}' is also referred to as: {joined}."
             desc = cc.get("description") or []
             if line not in desc:

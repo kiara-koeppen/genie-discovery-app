@@ -537,9 +537,9 @@ export default function Session3Form({
                                         })
                                       }
                                     >
-                                      <MenuItem value="column">A column name (alt name for the column)</MenuItem>
-                                      <MenuItem value="value">A value in a column (entity matching)</MenuItem>
-                                      <MenuItem value="cross_cutting">Cross-cutting term (no specific column)</MenuItem>
+                                      <MenuItem value="column">A column name — the column itself goes by this synonym</MenuItem>
+                                      <MenuItem value="value">A value in a column — a specific value in the column goes by this synonym</MenuItem>
+                                      <MenuItem value="cross_cutting">Cross-cutting term — general team jargon, no specific column</MenuItem>
                                     </Select>
                                   </FormControl>
                                   {targetIncomplete && (
