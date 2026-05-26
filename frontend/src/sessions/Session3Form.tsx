@@ -442,12 +442,15 @@ export default function Session3Form({
             <Alert severity="info" sx={{ mb: 2 }} variant="outlined">
               <Typography variant="body2">
                 <strong>For Synonyms:</strong> after checking the Synonym type, specify whether the
-                synonym refers to a <strong>column name</strong> (alternate name for a column),
-                a <strong>value in a column</strong> (alternate name for one of the column's values
-                — used for entity matching), or a <strong>cross-cutting term</strong> (no specific
-                column — falls back to the space's general instructions). Column- and value-level
-                synonyms get surfaced in Session 5's narrative as TODOs to set on the column in the
-                Genie UI; cross-cutting synonyms flow into general instructions automatically.
+                synonym refers to:
+              </Typography>
+              <Box component="ul" sx={{ pl: 3, my: 0.5 }}>
+                <li><Typography variant="body2"><strong>A column name</strong> — the column itself goes by this synonym. Lands in the column's <em>Synonyms</em> field at push.</Typography></li>
+                <li><Typography variant="body2"><strong>A value in a column</strong> — a specific value in the column goes by this synonym. Lands in the column's <em>Description</em> at push (and turns on Entity Matching for the column).</Typography></li>
+                <li><Typography variant="body2"><strong>A general space term</strong> — not tied to any column; just team vocabulary. Lands in the space's <em>General Instructions</em> at push.</Typography></li>
+              </Box>
+              <Typography variant="body2" sx={{ mt: 0.5 }}>
+                All three are pushed automatically when you go through Session 5. No manual UI work needed in the Genie space afterwards.
               </Typography>
             </Alert>
 
@@ -537,9 +540,9 @@ export default function Session3Form({
                                         })
                                       }
                                     >
-                                      <MenuItem value="column">A column name — the column itself goes by this synonym</MenuItem>
-                                      <MenuItem value="value">A value in a column — a specific value in the column goes by this synonym</MenuItem>
-                                      <MenuItem value="cross_cutting">Cross-cutting term — general team jargon, no specific column</MenuItem>
+                                      <MenuItem value="column">A column name — the column itself goes by this synonym (lands in the column's Synonyms field)</MenuItem>
+                                      <MenuItem value="value">A value in a column — a specific value in the column goes by this synonym (lands in the column's Description)</MenuItem>
+                                      <MenuItem value="cross_cutting">A general space term — applies to the whole space, not a specific column (lands in the space's General Instructions)</MenuItem>
                                     </Select>
                                   </FormControl>
                                   {targetIncomplete && (
@@ -589,7 +592,7 @@ export default function Session3Form({
                                 )}
                                 {target.kind === "cross_cutting" && (
                                   <Typography variant="caption" color="text.secondary" sx={{ pl: 15 }}>
-                                    No specific column needed. Synonyms flow into the space's general instructions at Session 5.
+                                    No column needed. This term and its synonyms will be added to the space's General Instructions at Session 5 push.
                                   </Typography>
                                 )}
                               </Stack>
