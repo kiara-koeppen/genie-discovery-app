@@ -12,6 +12,7 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import AddIcon from "@mui/icons-material/Add";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import LockIcon from "@mui/icons-material/Lock";
+import MenuBookIcon from "@mui/icons-material/MenuBook";
 import ExpandableTextField from "../components/ExpandableTextField";
 import { api, SqlSnippet, ExampleQuery, UcJoin, BenchmarkQuestion } from "../api";
 
@@ -645,6 +646,58 @@ export default function Session5Form({
           )}
         </AccordionDetails>
       </Accordion>
+
+      {/* Pre-push checklist: surface authoritative Genie best-practices docs at
+          the exact moment of decision so the analyst stays responsible for
+          verifying what the LLM proposed. The links open in a new tab so the
+          analyst can review without losing this page. */}
+      <Alert
+        severity="info"
+        icon={<MenuBookIcon />}
+        sx={{ mb: 2, "& a": { fontWeight: 500 } }}
+      >
+        <Typography variant="body2" sx={{ fontWeight: 500, mb: 0.5 }}>
+          Before you push: review Databricks Genie best practices
+        </Typography>
+        <Typography variant="body2" sx={{ mb: 1 }}>
+          The AI plan above is a draft. You're responsible for what gets pushed.
+          Read these official docs and verify the plan against them — especially
+          column-level synonyms, instruction-surface placement, and trusted
+          assets. Open in new tabs:
+        </Typography>
+        <Stack spacing={0.5}>
+          <Link
+            href="https://docs.databricks.com/aws/en/genie/best-practices"
+            target="_blank"
+            rel="noopener noreferrer"
+            sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}
+          >
+            Curate an effective Genie Space <OpenInNewIcon sx={{ fontSize: 14 }} />
+          </Link>
+          <Link
+            href="https://docs.databricks.com/aws/en/genie/knowledge-store"
+            target="_blank"
+            rel="noopener noreferrer"
+            sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}
+          >
+            Build a knowledge store (column-level synonyms, format assistance, entity matching) <OpenInNewIcon sx={{ fontSize: 14 }} />
+          </Link>
+          <Link
+            href="https://docs.databricks.com/aws/en/genie/tune-quality"
+            target="_blank"
+            rel="noopener noreferrer"
+            sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}
+          >
+            Tune Genie Space quality <OpenInNewIcon sx={{ fontSize: 14 }} />
+          </Link>
+        </Stack>
+        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+          Known caveat: the LLM sometimes places per-column synonyms in
+          general_instructions when they should be on the column itself. Skim
+          general_instructions before pushing and move any column-specific
+          synonyms into the column's UC metadata or the space's column_configs.
+        </Typography>
+      </Alert>
 
       {/* Push to Genie */}
       <Accordion id="section-5-push" defaultExpanded>

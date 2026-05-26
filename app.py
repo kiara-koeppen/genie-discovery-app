@@ -2611,15 +2611,27 @@ Genie Space instruction surfaces (in order of preference per Databricks best pra
 
 A single high-quality SQL example teaches Genie more than 20 lines of text instruction. Push logic INTO the data where you can; use text instructions only for things that cannot be expressed as SQL.
 
+Global budgets (per Databricks Genie best practices):
+- TOTAL knowledge-store snippets (sql_filters + sql_dimensions + sql_measures + example_queries combined) MUST stay under 200. Genie enforces this cap. Prefer fewer, higher-quality snippets.
+- Aim for ≤ 5 tables in active focus. If the data plan includes more, still emit snippets that span them, but keep example_queries concentrated on the ≤ 5 most-used tables.
+
 Produce a JSON object with exactly these fields:
 
-1. "general_instructions" (string): Short bulleted text (~400-800 chars, 15 bullets max) that will be the space's ONLY text_instruction. Include ONLY:
-   - Space scope/purpose (1 bullet)
-   - Business-jargon → data mappings not captured as SQL expressions
-   - Global response/formatting standards (date format, rounding, required columns)
-   - Clarification triggers ("if user asks X without a date range, ask them to specify")
-   - Terminology synonyms not captured elsewhere
-   Do NOT restate metric definitions — those belong in sql_measures. Do NOT describe table/column semantics — those belong in UC descriptions. Use short atomic bullets starting with "- ". No markdown headers.
+1. "general_instructions" (string): Short bulleted text (~400-800 chars, 15 bullets max) that will be the space's ONLY text_instruction. Include ONLY content that CANNOT live in a more specific surface. Use these structured sub-buckets, each prefixed by a one-line header bullet:
+
+   - Scope: 1 bullet — what this space answers and who it's for.
+   - Out-of-scope: 1-2 bullets — topics Genie should refuse or hand off.
+   - Global response standards: date format, rounding, required columns, time-zone, default ordering.
+   - Clarification triggers: each as a single bullet using this exact pattern: "When <user_condition> AND <missing_info>, ask: <clarification_question>". Example: "When user asks about revenue AND no date range is specified, ask: which fiscal period (e.g. last quarter, YTD, or a custom range)?"
+   - Summaries: optional 1-2 bullets prefixed with "Summary:" that constrain how Genie phrases its prose answers (e.g. "Summary: always show totals as a single sentence with the metric name, the number formatted with thousands separators, and the period."). Only TEXT instructions affect summaries — SQL expressions and example queries do not. Include this bucket only if the analyst commentary specifies a response style.
+
+   STRICT EXCLUSIONS — do NOT put any of these in general_instructions:
+   - Metric definitions / formulas → those go in sql_measures with synonyms attached to the measure itself.
+   - Per-column synonyms (e.g. "customer_id is also called acct_id") → those are COLUMN-level metadata, NOT a text instruction. Omit them entirely from general_instructions. (The space's column_configs surface is the right home; raise a note in narrative if the engagement is missing critical column synonyms.)
+   - Table/column semantics → those belong in UC table/column descriptions.
+   - Duplicates of sql_filters / sql_dimensions / sql_measures / example_queries — every fact should live in exactly one surface; conflicting guidance across surfaces degrades quality.
+
+   Use short atomic bullets starting with "- ". No markdown headers.
 
 2. "sample_questions" (array of 5-8 strings): Curated, reworded sample questions from the question bank. Clear, natural phrasing, covering main use cases. Shown to users when they open the space.
 
@@ -2633,7 +2645,14 @@ IMPORTANT SQL qualification rule for snippets below: Genie infers the table from
 
 6. "example_queries" (array, 3-6 items): Full SQL examples for complex/common questions from the question bank. Each: {{"question": "...", "sql": "...", "draft": true, "usage_guidance": "..."}}. SQL MUST use fully qualified `catalog.schema.table` references because example queries are standalone. Only include questions where you can write reasonably confident SQL given the tables in scope — skip speculative ones. Always set "draft": true so analyst reviews.
 
-7. "narrative" (string): 2-4 sentences explaining what this space does, who it serves, and what was configured. Shown to the analyst before push.
+   Trusted Assets tip: for the 1-3 highest-value recurring questions (the ones a BO will ask repeatedly with different parameters), write the SQL using `:param_name` placeholders (e.g. `WHERE orders.region = :region`) and note this in usage_guidance. When Genie matches the exact parameterized template, the response is labeled "Trusted" — a major reliability signal. Only do this for questions where you can confidently parameterize; don't force it.
+
+7. "narrative" (string): 3-5 sentences for the analyst review screen. MUST include:
+   - What this space answers (one-line space purpose).
+   - Target audience (which roles/teams will use it).
+   - Out-of-scope topics (what it intentionally won't cover — pulled from Session 3 Scope Boundaries).
+   - What was configured (high-level count summary: N measures, M filters, K example queries).
+   - One sentence on KNOWN gaps the analyst should review before push (data gaps, low confidence example_queries, missing benchmarks).
 
 Return ONLY the JSON object. No markdown fences, no preamble, no trailing commentary. Begin with {{ and end with }}."""
 
