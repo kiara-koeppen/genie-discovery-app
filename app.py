@@ -2598,12 +2598,101 @@ These are the ACTUAL columns that exist on each in-scope table (from UC DESCRIBE
 </table_schemas>
 """
 
+    # ----- Classified synonyms block -----
+    # In Session 3, the analyst classifies each business term and, for terms
+    # marked as Synonym, specifies whether the synonym is a column-level alias
+    # (e.g. "acct_id" is another name for `customer_id`), a value-level alias
+    # (e.g. "voided" is another name for `status = 'CANCELLED'`), or a
+    # cross-cutting team term with no specific column. The S5 prompt needs
+    # this routing so it doesn't dump column synonyms into general_instructions
+    # — they belong on the column itself via Genie's column_configs surface.
+    # Unset synonym_target falls back to cross_cutting for backward compat with
+    # engagements classified before this routing existed.
+    column_syns, value_syns, cross_syns = [], [], []
+    s2_vocab_by_term = {
+        (v.get("business_term") or "").strip(): v
+        for v in (s2.get("vocabulary_metrics") or [])
+        if isinstance(v, dict) and (v.get("business_term") or "").strip()
+    }
+    for c in (s3.get("term_classifications") or []):
+        if not isinstance(c, dict):
+            continue
+        term = (c.get("business_term") or "").strip()
+        types = c.get("types") or []
+        if not term or "Synonym" not in types:
+            continue
+        vocab = s2_vocab_by_term.get(term)
+        synonyms_raw = (vocab.get("synonyms") if vocab else "") or ""
+        synonyms_list = [s.strip() for s in synonyms_raw.split(",") if s.strip()]
+        if not synonyms_list:
+            continue
+        target = c.get("synonym_target") or {}
+        kind = (target.get("kind") or "cross_cutting").strip().lower()
+        col_fqn = (target.get("column_fqn") or "").strip()
+        col_value = (target.get("column_value") or "").strip()
+        if kind == "column" and col_fqn:
+            column_syns.append((term, synonyms_list, col_fqn))
+        elif kind == "value" and col_fqn and col_value:
+            value_syns.append((term, synonyms_list, col_fqn, col_value))
+        else:
+            # Cross-cutting OR incomplete column/value rows (no target picked
+            # yet). Fall back to cross_cutting so the LLM has something to
+            # work with rather than silently dropping the term.
+            cross_syns.append((term, synonyms_list))
+
+    synonyms_block = ""
+    if column_syns or value_syns or cross_syns:
+        parts = []
+        if column_syns:
+            sub = ["### Column-level synonyms (alternate names for a SPECIFIC COLUMN)"]
+            sub.append("These belong on the column via Genie's column_configs surface — they are")
+            sub.append("NOT a text instruction. Do NOT emit them in general_instructions or as")
+            sub.append("sql_expressions synonyms. Instead, surface them in the `narrative` field")
+            sub.append("as an explicit TODO list so the analyst sets them on each column in the")
+            sub.append("Genie UI before relying on the space (e.g. \"Set column synonyms on")
+            sub.append("`<fqn>`: <synonyms>\").")
+            for term, syns, fqn in column_syns:
+                joined_syns = ", ".join(f'"{s}"' for s in syns)
+                sub.append(f"- `{fqn}` — also called: {joined_syns} (canonical term: \"{term}\")")
+            parts.append("\n".join(sub))
+        if value_syns:
+            sub = ["### Value-level synonyms (alternate names for a SPECIFIC VALUE in a column)"]
+            sub.append("These belong as Entity Matching on the column via Genie's column_configs.")
+            sub.append("Do NOT emit them in general_instructions or sql_expressions. Surface them")
+            sub.append("in `narrative` as a TODO: \"Set entity matching on `<fqn>` for value")
+            sub.append("'<column_value>' → <synonyms>\".")
+            for term, syns, fqn, val in value_syns:
+                joined_syns = ", ".join(f'"{s}"' for s in syns)
+                sub.append(
+                    f"- `{fqn}` value `'{val}'` — also called: {joined_syns} "
+                    f"(canonical term: \"{term}\")"
+                )
+            parts.append("\n".join(sub))
+        if cross_syns:
+            sub = ["### Cross-cutting synonyms (no specific column — OK in general_instructions)"]
+            sub.append("These are space-level team jargon with no specific column target. They MAY")
+            sub.append("be included in general_instructions if they don't fit any other surface.")
+            sub.append("Keep them tight; one bullet per term.")
+            for term, syns in cross_syns:
+                joined_syns = ", ".join(f'"{s}"' for s in syns)
+                sub.append(f"- \"{term}\" — also called: {joined_syns}")
+            parts.append("\n".join(sub))
+        joined = "\n\n".join(parts)
+        synonyms_block = f"""
+<classified_synonyms>
+The analyst classified each Synonym term in Session 3 with a routing target.
+Use this block as the AUTHORITATIVE source for where each synonym goes — do
+not re-derive routing from the raw vocabulary list above.
+{joined}
+</classified_synonyms>
+"""
+
     prompt = f"""You are a Databricks Genie Space configuration expert. An analyst just completed 4 sessions of discovery with a business owner. Use this discovery to populate every instruction surface Genie supports.
 
 <discovery_data>
 {discovery}
 </discovery_data>
-{mv_block}{schemas_block}{gold_block}{benchmarks_block}
+{mv_block}{schemas_block}{synonyms_block}{gold_block}{benchmarks_block}
 Genie Space instruction surfaces (in order of preference per Databricks best practices):
 1. SQL Expressions (Filters / Dimensions / Measures) — reusable business concepts attached to a table
 2. Example SQL queries — full SQL for complex or frequent questions
@@ -2625,9 +2714,14 @@ Produce a JSON object with exactly these fields:
    - Clarification triggers: each as a single bullet using this exact pattern: "When <user_condition> AND <missing_info>, ask: <clarification_question>". Example: "When user asks about revenue AND no date range is specified, ask: which fiscal period (e.g. last quarter, YTD, or a custom range)?"
    - Summaries: optional 1-2 bullets prefixed with "Summary:" that constrain how Genie phrases its prose answers (e.g. "Summary: always show totals as a single sentence with the metric name, the number formatted with thousands separators, and the period."). Only TEXT instructions affect summaries — SQL expressions and example queries do not. Include this bucket only if the analyst commentary specifies a response style.
 
+   Synonym routing (see <classified_synonyms> block above for the authoritative list):
+   - Cross-cutting synonyms (kind="cross_cutting") MAY be included as bullets here. Keep them tight.
+   - Column-level synonyms (kind="column") MUST NOT be in general_instructions. They belong on the column via column_configs — surface them in `narrative` as a TODO instead.
+   - Value-level synonyms (kind="value") MUST NOT be in general_instructions. They belong as entity matching on the column — surface them in `narrative` as a TODO instead.
+
    STRICT EXCLUSIONS — do NOT put any of these in general_instructions:
    - Metric definitions / formulas → those go in sql_measures with synonyms attached to the measure itself.
-   - Per-column synonyms (e.g. "customer_id is also called acct_id") → those are COLUMN-level metadata, NOT a text instruction. Omit them entirely from general_instructions. (The space's column_configs surface is the right home; raise a note in narrative if the engagement is missing critical column synonyms.)
+   - Column-level or value-level synonyms (see Synonym routing above) → narrative TODO, not text instructions.
    - Table/column semantics → those belong in UC table/column descriptions.
    - Duplicates of sql_filters / sql_dimensions / sql_measures / example_queries — every fact should live in exactly one surface; conflicting guidance across surfaces degrades quality.
 
@@ -2647,12 +2741,17 @@ IMPORTANT SQL qualification rule for snippets below: Genie infers the table from
 
    Trusted Assets tip: for the 1-3 highest-value recurring questions (the ones a BO will ask repeatedly with different parameters), write the SQL using `:param_name` placeholders (e.g. `WHERE orders.region = :region`) and note this in usage_guidance. When Genie matches the exact parameterized template, the response is labeled "Trusted" — a major reliability signal. Only do this for questions where you can confidently parameterize; don't force it.
 
-7. "narrative" (string): 3-5 sentences for the analyst review screen. MUST include:
+7. "narrative" (string): 3-5 sentences for the analyst review screen plus an optional Manual TODOs section. MUST include:
    - What this space answers (one-line space purpose).
    - Target audience (which roles/teams will use it).
    - Out-of-scope topics (what it intentionally won't cover — pulled from Session 3 Scope Boundaries).
    - What was configured (high-level count summary: N measures, M filters, K example queries).
    - One sentence on KNOWN gaps the analyst should review before push (data gaps, low confidence example_queries, missing benchmarks).
+
+   If <classified_synonyms> contains column-level or value-level synonyms, end the narrative with a "Manual TODOs (set in Genie UI before relying on this space):" line followed by a markdown bulleted list — one bullet per synonym TODO. Format examples:
+   - "Column synonyms on `catalog.schema.table.column_name`: \"alt_name_1\", \"alt_name_2\""
+   - "Entity matching on `catalog.schema.table.status` for value 'CANCELLED': \"voided\", \"killed\""
+   If <classified_synonyms> has no column/value entries, omit the TODOs line entirely.
 
 Return ONLY the JSON object. No markdown fences, no preamble, no trailing commentary. Begin with {{ and end with }}."""
 

@@ -71,6 +71,28 @@ export interface Session2Data {
 export interface TermClassification {
   business_term: string;
   types: string[];
+  /**
+   * Only populated when "Synonym" is in `types`. Tells the S5 prompt where to
+   * route this term's synonyms:
+   *   - kind="column": the term is another name for a specific column
+   *     (alternate column name). Pushed to column_configs on column_fqn.
+   *   - kind="value": the term is another name for a specific VALUE inside a
+   *     column (entity matching). Pushed to column_configs entity matching
+   *     on column_fqn for column_value.
+   *   - kind="cross_cutting": general team jargon with no specific column.
+   *     Falls back to general_instructions.
+   *
+   * If absent (legacy / unset), treated as cross_cutting for backward compat.
+   */
+  synonym_target?: SynonymTarget;
+}
+
+export interface SynonymTarget {
+  kind: "column" | "value" | "cross_cutting";
+  /** FQN of the column for "column" or "value" kind. Empty for "cross_cutting". */
+  column_fqn?: string;
+  /** For "value" kind only: which value the synonym refers to. */
+  column_value?: string;
 }
 
 export interface SqlExpression {

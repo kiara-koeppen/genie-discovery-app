@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, Fragment } from "react";
 import {
   Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert, Chip,
   Paper, Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
@@ -13,8 +13,9 @@ import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
+import UCColumnPicker from "../components/UCColumnPicker";
 import { api } from "../api";
-import type { ColumnDef } from "../types";
+import type { ColumnDef, SynonymTarget } from "../types";
 
 const SQL_EXPR_COLS: ColumnDef[] = [
   { key: "metric_name", label: "Metric Name" },
@@ -135,9 +136,17 @@ export default function Session3Form({
     const classifications = [...(data.term_classifications || [])];
     const idx = classifications.findIndex((c: any) => c.business_term === termName);
     const oldTypes: string[] = idx >= 0 ? (classifications[idx].types || []) : [];
+    const oldTarget: SynonymTarget | undefined =
+      idx >= 0 ? classifications[idx].synonym_target : undefined;
 
-    if (idx >= 0) classifications[idx] = { business_term: termName, types: newTypes };
-    else classifications.push({ business_term: termName, types: newTypes });
+    const newRow: any = { business_term: termName, types: newTypes };
+    // Preserve existing synonym_target if "Synonym" is still selected; drop it
+    // entirely if Synonym was unchecked.
+    if (newTypes.includes("Synonym") && oldTarget) {
+      newRow.synonym_target = oldTarget;
+    }
+    if (idx >= 0) classifications[idx] = newRow;
+    else classifications.push(newRow);
     onChange("term_classifications", classifications);
 
     const addedTypes = newTypes.filter((t) => !oldTypes.includes(t));
@@ -153,8 +162,12 @@ export default function Session3Form({
     let exprsChanged = false;
     let instrsChanged = false;
 
-    // Types that create text instructions
-    const INSTR_TYPES = ["Filter", "Date Logic", "Synonym"];
+    // Types that auto-create a text_instructions row. Synonym is INTENTIONALLY
+    // not in this list anymore -- synonyms now route via the structured
+    // synonym_target field on TermClassification (see handleSynonymTarget).
+    // Cross-cutting synonyms still surface in general_instructions via the
+    // S5 LLM, but they don't need a row in the text_instructions table.
+    const INSTR_TYPES = ["Filter", "Date Logic"];
 
     // Add rows for newly selected types
     for (const type of addedTypes) {
@@ -168,11 +181,7 @@ export default function Session3Form({
         INSTR_TYPES.includes(type) &&
         !instrs.some((i: any) => i.title === termName)
       ) {
-        const synonymList = vocab?.synonyms || "";
-        const prefill = type === "Synonym" && synonymList
-          ? `When users say "${synonymList.split(",").map((s: string) => s.trim()).join('" or "')}", they mean "${termName}".`
-          : "";
-        instrs.push({ title: termName, instruction: prefill });
+        instrs.push({ title: termName, instruction: "" });
         instrsChanged = true;
       }
     }
@@ -196,6 +205,31 @@ export default function Session3Form({
 
     if (exprsChanged) onChange("sql_expressions", exprs);
     if (instrsChanged) onChange("text_instructions", instrs);
+  };
+
+  // --- Synonym target handler ---
+  // Stores the routing decision (column / value / cross-cutting) for a term
+  // classified as Synonym. Used by the S5 prompt to route the term's synonyms
+  // to the right Genie surface (column_configs, entity matching, or general
+  // instructions). Phase 1 only stores the data; Phase 2 will push column-level
+  // synonyms to Genie's column_configs at push time.
+  const handleSynonymTarget = (termName: string, patch: Partial<SynonymTarget>) => {
+    const classifications = [...(data.term_classifications || [])];
+    const idx = classifications.findIndex((c: any) => c.business_term === termName);
+    if (idx < 0) return; // shouldn't happen — the row only renders when classified
+    const current: SynonymTarget = classifications[idx].synonym_target || {
+      kind: "cross_cutting",
+    };
+    const merged: SynonymTarget = { ...current, ...patch };
+    // Clean up fields that don't apply to the new kind
+    if (merged.kind === "cross_cutting") {
+      delete merged.column_fqn;
+      delete merged.column_value;
+    } else if (merged.kind === "column") {
+      delete merged.column_value;
+    }
+    classifications[idx] = { ...classifications[idx], synonym_target: merged };
+    onChange("term_classifications", classifications);
   };
 
   // Load catalogs + warehouses once for the MV builder
@@ -402,9 +436,20 @@ export default function Session3Form({
               Here are the business terms from Session 2. Classify each one (a term can have multiple types).
               Selecting a type auto-populates it into the matching section below.
               <strong> Metric</strong> = SQL expression.{" "}
-              <strong>Synonym</strong> = text instruction (entity matching).{" "}
-              <strong>Filter / Date Logic</strong> = text instruction.
+              <strong>Filter / Date Logic</strong> = text instruction.{" "}
+              <strong>Synonym</strong> = route via the kind picker that appears below the row.
             </Typography>
+            <Alert severity="info" sx={{ mb: 2 }} variant="outlined">
+              <Typography variant="body2">
+                <strong>For Synonyms:</strong> after checking the Synonym type, specify whether the
+                synonym refers to a <strong>column name</strong> (alternate name for a column),
+                a <strong>value in a column</strong> (alternate name for one of the column's values
+                — used for entity matching), or a <strong>cross-cutting term</strong> (no specific
+                column — falls back to the space's general instructions). Column- and value-level
+                synonyms get surfaced in Session 5's narrative as TODOs to set on the column in the
+                Genie UI; cross-cutting synonyms flow into general instructions automatically.
+              </Typography>
+            </Alert>
 
             <Box sx={{ mb: 2 }}>
               <LinearProgress
@@ -427,38 +472,131 @@ export default function Session3Form({
                 <TableBody>
                   {vocabTerms.map((v: any, i: number) => {
                     const types = typeMap.get(v.business_term) || [];
+                    const isSynonym = types.includes("Synonym");
+                    // Look up the saved synonym_target for this term (if any)
+                    const classification = (data.term_classifications || []).find(
+                      (c: any) => c.business_term === v.business_term,
+                    );
+                    const target: SynonymTarget = classification?.synonym_target || {
+                      kind: "cross_cutting",
+                    };
+                    // Incomplete state: kind picked but the required follow-up field is empty.
+                    // Surfaced as a small warning chip so the analyst notices before pushing.
+                    const targetIncomplete =
+                      isSynonym &&
+                      ((target.kind === "column" && !target.column_fqn) ||
+                        (target.kind === "value" && (!target.column_fqn || !target.column_value)));
+
                     return (
-                      <TableRow key={i} hover>
-                        <TableCell sx={{ fontSize: 14, fontWeight: 500 }}>{v.business_term}</TableCell>
-                        <TableCell sx={{ fontSize: 13, color: "text.secondary" }}>{v.what_they_mean}</TableCell>
-                        <TableCell sx={{ fontSize: 13, color: "text.secondary" }}>{v.synonyms}</TableCell>
-                        <TableCell>
-                          {readOnly ? (
-                            <span>{types.length > 0 ? types.join(", ") : "--"}</span>
-                          ) : (
-                            <Select
-                              multiple
-                              size="small"
-                              fullWidth
-                              value={types}
-                              onChange={(e) => handleClassify(v.business_term, e.target.value as string[])}
-                              displayEmpty
-                              renderValue={(selected) => {
-                                const sel = selected as string[];
-                                if (sel.length === 0) return <span style={{ color: "#999" }}>--</span>;
-                                return sel.join(", ");
-                              }}
-                            >
-                              {TERM_TYPES.map((t) => (
-                                <MenuItem key={t} value={t}>
-                                  <Checkbox size="small" checked={types.includes(t)} />
-                                  <ListItemText primary={t} />
-                                </MenuItem>
-                              ))}
-                            </Select>
-                          )}
-                        </TableCell>
-                      </TableRow>
+                      <Fragment key={i}>
+                        <TableRow hover>
+                          <TableCell sx={{ fontSize: 14, fontWeight: 500 }}>{v.business_term}</TableCell>
+                          <TableCell sx={{ fontSize: 13, color: "text.secondary" }}>{v.what_they_mean}</TableCell>
+                          <TableCell sx={{ fontSize: 13, color: "text.secondary" }}>{v.synonyms}</TableCell>
+                          <TableCell>
+                            {readOnly ? (
+                              <span>{types.length > 0 ? types.join(", ") : "--"}</span>
+                            ) : (
+                              <Select
+                                multiple
+                                size="small"
+                                fullWidth
+                                value={types}
+                                onChange={(e) => handleClassify(v.business_term, e.target.value as string[])}
+                                displayEmpty
+                                renderValue={(selected) => {
+                                  const sel = selected as string[];
+                                  if (sel.length === 0) return <span style={{ color: "#999" }}>--</span>;
+                                  return sel.join(", ");
+                                }}
+                              >
+                                {TERM_TYPES.map((t) => (
+                                  <MenuItem key={t} value={t}>
+                                    <Checkbox size="small" checked={types.includes(t)} />
+                                    <ListItemText primary={t} />
+                                  </MenuItem>
+                                ))}
+                              </Select>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                        {isSynonym && (
+                          <TableRow sx={{ bgcolor: "action.hover" }}>
+                            <TableCell colSpan={4} sx={{ py: 1.5, borderTop: "none" }}>
+                              <Stack direction="column" spacing={1.5} sx={{ pl: 2 }}>
+                                <Stack direction="row" alignItems="center" spacing={1}>
+                                  <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", minWidth: 120 }}>
+                                    Synonym for:
+                                  </Typography>
+                                  <FormControl size="small" sx={{ minWidth: 240 }} disabled={readOnly}>
+                                    <Select
+                                      value={target.kind}
+                                      onChange={(e) =>
+                                        handleSynonymTarget(v.business_term, {
+                                          kind: e.target.value as SynonymTarget["kind"],
+                                        })
+                                      }
+                                    >
+                                      <MenuItem value="column">A column name (alt name for the column)</MenuItem>
+                                      <MenuItem value="value">A value in a column (entity matching)</MenuItem>
+                                      <MenuItem value="cross_cutting">Cross-cutting term (no specific column)</MenuItem>
+                                    </Select>
+                                  </FormControl>
+                                  {targetIncomplete && (
+                                    <Chip
+                                      size="small"
+                                      color="warning"
+                                      variant="outlined"
+                                      label="Pick a column to finish"
+                                    />
+                                  )}
+                                </Stack>
+                                {(target.kind === "column" || target.kind === "value") && (
+                                  <Stack direction="row" alignItems="center" spacing={1}>
+                                    <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", minWidth: 120 }}>
+                                      Target column:
+                                    </Typography>
+                                    <UCColumnPicker
+                                      value={target.column_fqn || ""}
+                                      onChange={(fqn) =>
+                                        handleSynonymTarget(v.business_term, { column_fqn: fqn })
+                                      }
+                                      readOnly={readOnly}
+                                    />
+                                  </Stack>
+                                )}
+                                {target.kind === "value" && (
+                                  <Stack direction="row" alignItems="center" spacing={1}>
+                                    <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", minWidth: 120 }}>
+                                      Column value:
+                                    </Typography>
+                                    <TextField
+                                      size="small"
+                                      placeholder="e.g. CANCELLED"
+                                      value={target.column_value || ""}
+                                      onChange={(e) =>
+                                        handleSynonymTarget(v.business_term, {
+                                          column_value: e.target.value,
+                                        })
+                                      }
+                                      disabled={readOnly}
+                                      sx={{ minWidth: 220 }}
+                                    />
+                                    <Typography variant="caption" color="text.secondary">
+                                      The specific value the synonyms refer to (e.g. "{(v.synonyms || "").split(",")[0]?.trim() || "voided"}" is another name for value "CANCELLED").
+                                    </Typography>
+                                  </Stack>
+                                )}
+                                {target.kind === "cross_cutting" && (
+                                  <Typography variant="caption" color="text.secondary" sx={{ pl: 15 }}>
+                                    No specific column needed. Synonyms flow into the space's general instructions at Session 5.
+                                  </Typography>
+                                )}
+                              </Stack>
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </Fragment>
                     );
                   })}
                 </TableBody>
