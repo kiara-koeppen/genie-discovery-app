@@ -3,6 +3,7 @@ import os
 import random
 import secrets
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import traceback
 import uuid
@@ -4416,6 +4417,95 @@ def uc_table_type():
     })
 
 
+def _list_mvs_in_schema(host, hdrs, cat, sch):
+    """List MV candidate FQNs in a single (catalog, schema) via REST.
+
+    Returns (fqns, error_message) -- error is None on success. The caller
+    surfaces errors in the response so the UI can distinguish "0 MVs in
+    scope" from "couldn't read this schema."
+    """
+    try:
+        r = requests.get(
+            f"{host}/api/2.1/unity-catalog/tables",
+            params={"catalog_name": cat, "schema_name": sch, "max_results": 200},
+            headers=hdrs, timeout=15,
+        )
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    if not r.ok:
+        return [], f"HTTP {r.status_code}: {r.text[:200]}"
+    fqns = [
+        f"{cat}.{sch}.{t['name']}"
+        for t in (r.json().get("tables") or [])
+        if t.get("table_type") == "METRIC_VIEW" and t.get("name")
+    ]
+    return fqns, None
+
+
+def _fetch_mv_dependencies(host, hdrs, fqn):
+    """Return ({fqn metadata + dependencies set}, error_message). The
+    caller filters by the intersect with picked tables. Per-MV REST calls
+    are parallelized in the discovery endpoint via ThreadPoolExecutor."""
+    try:
+        r = requests.get(
+            f"{host}/api/2.1/unity-catalog/tables/{fqn}",
+            headers=hdrs, timeout=15,
+        )
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    if not r.ok:
+        return None, f"HTTP {r.status_code}"
+    body = r.json()
+    deps_raw = (body.get("view_dependencies") or {}).get("dependencies") or []
+    dep_fqns = set()
+    for d in deps_raw:
+        tbl = (d or {}).get("table") or {}
+        fn = tbl.get("table_full_name")
+        if fn:
+            dep_fqns.add(fn)
+    return {
+        "body": body,
+        "dep_fqns": dep_fqns,
+    }, None
+
+
+def _broad_mv_scan(user_w, warehouse_id):
+    """Use system.information_schema.tables to find every metric view
+    visible to the user, regardless of catalog/schema. Catches MVs in
+    personal catalogs that depend on shared source tables -- a common
+    DSA pattern that the per-schema scan misses.
+
+    Returns (fqns, error). On any failure (permission denied, warehouse
+    cold, system table not enabled) returns ([], err) and the caller falls
+    back to per-schema scan.
+    """
+    if not warehouse_id:
+        return [], "no warehouse_id provided"
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id,
+            statement="""
+                SELECT table_catalog || '.' || table_schema || '.' || table_name AS fqn
+                FROM system.information_schema.tables
+                WHERE table_type = 'METRIC_VIEW'
+            """,
+            wait_timeout="30s",
+        )
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    state = ""
+    if resp.status and resp.status.state:
+        state = str(resp.status.state.value if hasattr(resp.status.state, "value")
+                    else resp.status.state)
+    if state != "SUCCEEDED" or not resp.result:
+        msg = ""
+        if resp.status and resp.status.error:
+            msg = (resp.status.error.message or "")[:200]
+        return [], f"system.information_schema query failed ({state}): {msg}"
+    rows = resp.result.data_array or []
+    return [r[0] for r in rows if r and r[0]], None
+
+
 @app.route("/api/uc/metric-views-for-tables")
 def uc_metric_views_for_tables():
     """Find Metric Views that depend on any of the given source tables.
@@ -4425,86 +4515,111 @@ def uc_metric_views_for_tables():
     reuse them instead of re-authoring measures from scratch.
 
     Query params:
-        fqns: comma-separated catalog.schema.table list
+        fqns: comma-separated catalog.schema.table list (required)
+        warehouse_id: optional. If provided, the discovery also queries
+            system.information_schema.tables for a broader scan that catches
+            MVs in catalogs/schemas different from the picked tables (common
+            DSA pattern where MVs live in personal catalogs but reference
+            shared source tables). If absent or the broad scan fails, falls
+            back to per-(catalog,schema) scan only.
 
-    Returns:
-        [{fqn, catalog, schema, name, comment, owner, updated_at, dependencies}]
-        Filtered to MVs whose view_dependencies intersect the picked tables.
-
-    Phase 1 scope: scans every (catalog, schema) where a picked table lives.
-    Misses MVs that live in a different schema from their source tables --
-    a follow-up enhancement could broaden to system.information_schema, but
-    most customer MVs co-locate with their sources so we start narrow.
+    Response shape:
+        {
+            "metric_views": [{fqn, catalog, schema, name, comment, owner,
+                              updated_at, dependencies}],
+            "errors": ["<schema>: <message>", ...],  -- non-empty when one or
+                more candidate enumeration calls failed; lets the UI
+                distinguish "0 matches" from "couldn't search."
+            "warnings": ["..."]  -- non-fatal notes (e.g. broad scan unavailable,
+                falling back to schema-only).
+            "scope": {
+                "broad": bool  -- true iff system.information_schema was used
+            }
+        }
     """
     user_w, err = _require_obo()
     if err:
         return err
     raw = request.args.get("fqns", "")
+    warehouse_id = (request.args.get("warehouse_id") or "").strip()
     picked = {
         t.strip() for t in raw.split(",")
         if t.strip() and t.count(".") == 2
     }
     if not picked:
-        return jsonify([])
+        return jsonify({"metric_views": [], "errors": [], "warnings": [], "scope": {"broad": False}})
 
-    # Step 1: enumerate MV candidates in every (catalog, schema) that a
-    # picked table lives in. We use the UC tables REST list endpoint (NOT
-    # the SDK's tables.list) because databricks-sdk 0.44.0 (pinned in
-    # requirements.txt) returns METRIC_VIEW as `TableType.MANAGED` in the
-    # TableInfo struct -- the METRIC_VIEW enum value was added in a later
-    # SDK version. The REST response carries the correct `table_type`
-    # string, so this filter actually matches.
-    schemas = {".".join(t.split(".")[:2]) for t in picked}
     host = user_w.config.host.rstrip("/")
-    token = user_w.config.token
-    hdrs = {"Authorization": f"Bearer {token}"}
-    candidates = []
-    for cs in schemas:
-        cat, sch = cs.split(".", 1)
-        try:
-            r = requests.get(
-                f"{host}/api/2.1/unity-catalog/tables",
-                params={"catalog_name": cat, "schema_name": sch, "max_results": 200},
-                headers=hdrs, timeout=15,
+    hdrs = {"Authorization": f"Bearer {user_w.config.token}"}
+    errors = []
+    warnings = []
+    candidates = set()
+    broad_used = False
+
+    # Step 1a: try the broad scan first if a warehouse is available. One SQL
+    # query finds every MV visible to the user. If it fails (system table
+    # disabled, no warehouse access, etc.) we silently fall back to the
+    # narrower per-schema scan -- but the UI gets a warning so the user
+    # knows discovery was scoped.
+    if warehouse_id:
+        broad_fqns, broad_err = _broad_mv_scan(user_w, warehouse_id)
+        if broad_err:
+            warnings.append(
+                f"Broad MV scan via system.information_schema failed: {broad_err}. "
+                "Falling back to schema-scoped scan (MVs in different catalogs/"
+                "schemas from your picked tables won't be found)."
             )
-            if not r.ok:
-                print(f"[/api/uc/metric-views-for-tables] list({cs}): "
-                      f"{r.status_code} {r.text[:200]}", flush=True)
-                continue
-            for t in (r.json().get("tables") or []):
-                if t.get("table_type") == "METRIC_VIEW" and t.get("name"):
-                    candidates.append(f"{cat}.{sch}.{t['name']}")
-        except Exception as e:
-            print(f"[/api/uc/metric-views-for-tables] list({cs}): "
-                  f"{type(e).__name__}: {e}", flush=True)
-            continue
+        else:
+            candidates.update(broad_fqns)
+            broad_used = True
+
+    # Step 1b: schema-scoped scan as fallback / supplement. Parallelize
+    # across the (catalog, schema) pairs of picked tables -- usually 1-3
+    # schemas, but parallelism shaves the round-trip cost regardless.
+    schemas = {".".join(t.split(".")[:2]) for t in picked}
+    if not broad_used:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {
+                pool.submit(_list_mvs_in_schema, host, hdrs, *cs.split(".", 1)): cs
+                for cs in schemas
+            }
+            for fut in futures:
+                cs = futures[fut]
+                fqns, scan_err = fut.result()
+                if scan_err:
+                    errors.append(f"{cs}: {scan_err}")
+                else:
+                    candidates.update(fqns)
 
     if not candidates:
-        return jsonify([])
+        return jsonify({
+            "metric_views": [],
+            "errors": errors,
+            "warnings": warnings,
+            "scope": {"broad": broad_used},
+        })
 
-    # Step 2: REST-fetch each candidate to read view_dependencies. The LIST
-    # response above returns `view_dependencies: null`, so a per-MV GET is
-    # required to read the dependency list. Skip candidates we can't read
-    # (private MVs the user lacks grants on -- logged-and-skipped, not fatal).
+    # Step 2: REST-fetch view_dependencies for every candidate in parallel.
+    # The LIST response above returns view_dependencies: null, so we need
+    # per-MV GETs to read the dependency list. Parallelism here is the
+    # biggest win -- a schema with 30 MVs goes from sequential ~6s to a
+    # bounded ~1s. Failed fetches are logged-and-skipped (e.g. private MVs
+    # the user lacks grants on).
     results = []
-    for fqn in candidates:
-        try:
-            r = requests.get(
-                f"{host}/api/2.1/unity-catalog/tables/{fqn}",
-                headers=hdrs, timeout=15,
-            )
-            if not r.ok:
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {
+            pool.submit(_fetch_mv_dependencies, host, hdrs, fqn): fqn
+            for fqn in sorted(candidates)
+        }
+        for fut in futures:
+            fqn = futures[fut]
+            data, dep_err = fut.result()
+            if dep_err:
+                print(f"[/api/uc/metric-views-for-tables] {fqn}: {dep_err}", flush=True)
                 continue
-            body = r.json()
-            deps_raw = (body.get("view_dependencies") or {}).get("dependencies") or []
-            dep_fqns = set()
-            for d in deps_raw:
-                tbl = (d or {}).get("table") or {}
-                fn = tbl.get("table_full_name")
-                if fn:
-                    dep_fqns.add(fn)
-            if not (dep_fqns & picked):
+            if not (data["dep_fqns"] & picked):
                 continue
+            body = data["body"]
             parts = fqn.split(".")
             results.append({
                 "fqn": fqn,
@@ -4514,15 +4629,16 @@ def uc_metric_views_for_tables():
                 "comment": body.get("comment", "") or "",
                 "owner": body.get("owner", "") or "",
                 "updated_at": body.get("updated_at"),
-                "dependencies": sorted(dep_fqns),
+                "dependencies": sorted(data["dep_fqns"]),
             })
-        except Exception as e:
-            print(f"[/api/uc/metric-views-for-tables] {fqn}: "
-                  f"{type(e).__name__}: {e}", flush=True)
-            continue
 
     results.sort(key=lambda x: x["fqn"])
-    return jsonify(results)
+    return jsonify({
+        "metric_views": results,
+        "errors": errors,
+        "warnings": warnings,
+        "scope": {"broad": broad_used},
+    })
 
 
 @app.route("/api/uc/metric-view-details")

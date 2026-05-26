@@ -3,12 +3,14 @@ import {
   Box, Typography, Stack, IconButton, Button, Paper, Alert,
   CircularProgress, Accordion, AccordionSummary, AccordionDetails,
   Checkbox, Table, TableBody, TableCell, TableHead, TableRow,
+  FormControl, InputLabel, Select, MenuItem, TextField,
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import DeleteIcon from "@mui/icons-material/Delete";
 import AddIcon from "@mui/icons-material/Add";
 import TableChartIcon from "@mui/icons-material/TableChart";
 import InsightsIcon from "@mui/icons-material/Insights";
+import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import UCTablePicker from "./UCTablePicker";
 import { api } from "../api";
 
@@ -37,9 +39,13 @@ interface DataPlanEntry {
 interface Props {
   dataPlan: DataPlanEntry[];
   onChangeDataPlan: (next: DataPlanEntry[]) => void;
-  /** SQL warehouse used to run DESCRIBE EXTENDED for MV details. If empty,
-   *  the "view columns" expander shows a hint pointing to Session 5's warehouse picker. */
+  /** SQL warehouse used for (a) DESCRIBE EXTENDED on MV details and (b)
+   *  the broad discovery scan via system.information_schema. */
   warehouseId: string;
+  /** Persists a new warehouse_id selection back to the engagement (the
+   *  inline picker writes to S5's plan_warehouse_id so it's used in the
+   *  Generate Plan flow too). Optional -- if absent, the picker is hidden. */
+  onChangeWarehouseId?: (warehouseId: string) => void;
   readOnly?: boolean;
 }
 
@@ -69,7 +75,7 @@ interface MvDetails {
 }
 
 export default function DataSourcesPanel({
-  dataPlan, onChangeDataPlan, warehouseId, readOnly,
+  dataPlan, onChangeDataPlan, warehouseId, onChangeWarehouseId, readOnly,
 }: Props) {
   const [pickerValue, setPickerValue] = useState("");
   // Loading state for the Add button -- briefly true while we look up
@@ -78,11 +84,23 @@ export default function DataSourcesPanel({
   const [addError, setAddError] = useState("");
   const [discoveredMvs, setDiscoveredMvs] = useState<DiscoveredMv[]>([]);
   const [discoveringMvs, setDiscoveringMvs] = useState(false);
-  const [discoveryError, setDiscoveryError] = useState("");
+  // Discovery surface: fatal/partial errors per schema, non-fatal warnings,
+  // and whether the broad scan via system.information_schema ran. Lets the
+  // UI distinguish "0 MVs in scope" from "couldn't search" and tells the
+  // analyst when discovery is narrowed.
+  const [discoveryErrors, setDiscoveryErrors] = useState<string[]>([]);
+  const [discoveryWarnings, setDiscoveryWarnings] = useState<string[]>([]);
+  const [scopeBroad, setScopeBroad] = useState(false);
   // Per-MV details cache (DESCRIBE EXTENDED) -- fetched lazily on first expand.
   const [mvDetailsCache, setMvDetailsCache] = useState<Record<string, MvDetails>>({});
   const [loadingDetails, setLoadingDetails] = useState<Set<string>>(new Set());
   const [detailsErrors, setDetailsErrors] = useState<Record<string, string>>({});
+  // Warehouse list for the inline picker (#8). Loaded once when the panel
+  // mounts. The picker only renders when no warehouse is set yet AND the
+  // parent has wired onChangeWarehouseId.
+  const [warehouses, setWarehouses] = useState<
+    { id: string; name: string; state: string; size: string }[]
+  >([]);
 
   // Derived: tables vs metric views, both filtered to "Yes" inclusion.
   const tableEntries = useMemo(
@@ -108,19 +126,40 @@ export default function DataSourcesPanel({
   useEffect(() => {
     if (!pickedTableFqns.length) {
       setDiscoveredMvs([]);
-      setDiscoveryError("");
+      setDiscoveryErrors([]);
+      setDiscoveryWarnings([]);
+      setScopeBroad(false);
       return;
     }
     let cancelled = false;
     setDiscoveringMvs(true);
-    setDiscoveryError("");
-    api.findMetricViewsForTables(pickedTableFqns)
-      .then(results => { if (!cancelled) setDiscoveredMvs(results); })
-      .catch(err => { if (!cancelled) setDiscoveryError(err?.message || "Discovery failed"); })
+    setDiscoveryErrors([]);
+    setDiscoveryWarnings([]);
+    api.findMetricViewsForTables(pickedTableFqns, warehouseId || undefined)
+      .then(result => {
+        if (cancelled) return;
+        setDiscoveredMvs(result.metric_views);
+        setDiscoveryErrors(result.errors || []);
+        setDiscoveryWarnings(result.warnings || []);
+        setScopeBroad(!!result.scope?.broad);
+      })
+      .catch(err => {
+        if (cancelled) return;
+        setDiscoveryErrors([err?.message || "Discovery failed"]);
+      })
       .finally(() => { if (!cancelled) setDiscoveringMvs(false); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pickedKey]);
+  }, [pickedKey, warehouseId]);
+
+  // Load warehouse list for the inline picker on mount (only if the parent
+  // wired the onChange callback -- otherwise the picker doesn't render).
+  useEffect(() => {
+    if (!onChangeWarehouseId) return;
+    api.listWarehouses()
+      .then(setWarehouses)
+      .catch(() => setWarehouses([]));
+  }, [onChangeWarehouseId]);
 
   const handleAddTable = async () => {
     if (!pickerValue || pickerValue.split(".").length !== 3) return;
@@ -149,12 +188,27 @@ export default function DataSourcesPanel({
           notes: info.comment || "",
         },
       ]);
-      setPickerValue("");
+      // Bulk-add UX (#10): preserve catalog+schema after each Add so the
+      // analyst can keep adding from the same schema without re-navigating
+      // the dropdowns. Resets just the Table portion of the FQN.
+      const parts = pickerValue.split(".");
+      setPickerValue(`${parts[0]}.${parts[1]}`);
     } catch (err: any) {
       setAddError(err?.message || "Failed to look up table type.");
     } finally {
       setAddingTable(false);
     }
+  };
+
+  // Inline notes editing for data plan entries (#11). The old EditableTable
+  // in S4 exposed a notes column; the new panel didn't. We add it back as a
+  // small TextField under each entry so existing notes (auto-filled from
+  // table descriptions on Add) can be edited and so analyst-authored
+  // commentary survives the round trip.
+  const handleNotesChange = (fqn: string, notes: string) => {
+    onChangeDataPlan(
+      dataPlan.map(d => (d.table_or_view === fqn ? { ...d, notes } : d)),
+    );
   };
 
   const handleRemove = (fqn: string) => {
@@ -229,6 +283,41 @@ export default function DataSourcesPanel({
         measures. Checked items flow into the Session 4 Data Plan automatically.
       </Alert>
 
+      {/* Inline warehouse picker (#8). Renders only when the analyst hasn't
+          configured a warehouse yet AND the parent passed onChangeWarehouseId.
+          Wiring through to S5's plan_warehouse_id means setting it once here
+          also unblocks the Generate Plan flow. */}
+      {!readOnly && !warehouseId && onChangeWarehouseId && (
+        <Paper variant="outlined" sx={{ p: 1.5, mb: 2 }}>
+          <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap">
+            <Typography variant="body2" sx={{ fontWeight: 500, flexShrink: 0 }}>
+              SQL warehouse:
+            </Typography>
+            <FormControl size="small" sx={{ minWidth: 280 }}>
+              <InputLabel>Pick a warehouse</InputLabel>
+              <Select
+                label="Pick a warehouse"
+                value=""
+                onChange={(e) => onChangeWarehouseId(e.target.value)}
+              >
+                <MenuItem value="">--</MenuItem>
+                {warehouses.map((w) => (
+                  <MenuItem key={w.id} value={w.id}>
+                    {w.name} <Typography component="span" variant="caption" color="text.secondary" sx={{ ml: 0.5 }}>
+                      ({w.size} · {w.state})
+                    </Typography>
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+            <Typography variant="caption" color="text.secondary">
+              Used for MV details (DESCRIBE EXTENDED) and the broad MV discovery scan.
+              Setting this here also propagates to Session 5's Generate Plan.
+            </Typography>
+          </Stack>
+        </Paper>
+      )}
+
       {/* Tables / Views */}
       <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
         Tables / Views in scope ({tableEntries.length})
@@ -238,22 +327,39 @@ export default function DataSourcesPanel({
           No tables picked yet. Add at least one below to discover related Metric Views.
         </Typography>
       ) : (
-        <Stack spacing={0.5} sx={{ mb: 2 }}>
+        <Stack spacing={1} sx={{ mb: 2 }}>
           {tableEntries.map((e, i) => (
-            <Stack key={i} direction="row" alignItems="center" spacing={1}>
-              <TableChartIcon fontSize="small" color="action" />
-              <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: 13, flexGrow: 1 }}>
-                {e.table_or_view}
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                {e.type || "Table"}
-              </Typography>
-              {!readOnly && (
-                <IconButton size="small" onClick={() => handleRemove(e.table_or_view)} title="Remove from data plan">
-                  <DeleteIcon fontSize="small" />
-                </IconButton>
-              )}
-            </Stack>
+            <Box key={i}>
+              <Stack direction="row" alignItems="center" spacing={1}>
+                <TableChartIcon fontSize="small" color="action" />
+                <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: 13, flexGrow: 1 }}>
+                  {e.table_or_view}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {e.type || "Table"}
+                </Typography>
+                {!readOnly && (
+                  <IconButton size="small" onClick={() => handleRemove(e.table_or_view)} title="Remove from data plan">
+                    <DeleteIcon fontSize="small" />
+                  </IconButton>
+                )}
+              </Stack>
+              {/* Notes (#11): inline editable. Surfaces the existing notes
+                  field on data_plan entries (was previously editable only
+                  in S4's old data plan table). */}
+              <Box sx={{ pl: 4 }}>
+                <TextField
+                  size="small"
+                  variant="standard"
+                  fullWidth
+                  placeholder="Notes (optional)"
+                  value={e.notes || ""}
+                  onChange={(ev) => handleNotesChange(e.table_or_view, ev.target.value)}
+                  disabled={readOnly}
+                  InputProps={{ sx: { fontSize: 12 } }}
+                />
+              </Box>
+            </Box>
           ))}
         </Stack>
       )}
@@ -293,21 +399,55 @@ export default function DataSourcesPanel({
       {/* Metric Views */}
       {pickedTableFqns.length > 0 && (
         <Box>
-          <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+          <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }} flexWrap="wrap">
             <InsightsIcon fontSize="small" color="primary" />
             <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
               Existing Metric Views built on these tables ({allMvFqns.length} found)
             </Typography>
             {discoveringMvs && <CircularProgress size={14} />}
+            {!discoveringMvs && (
+              <Typography variant="caption" color="text.secondary" sx={{ ml: 0.5 }}>
+                {scopeBroad
+                  ? "scanned all visible catalogs"
+                  : "scanned only the schemas of your picked tables"}
+              </Typography>
+            )}
           </Stack>
 
-          {discoveryError && (
-            <Alert severity="warning" sx={{ mb: 2 }}>{discoveryError}</Alert>
+          {/* Discovery errors -- one or more schemas couldn't be searched.
+              Distinguishes "0 matches" (no alert) from "couldn't search this
+              schema" (warning). */}
+          {discoveryErrors.length > 0 && (
+            <Alert severity="warning" icon={<WarningAmberIcon />} sx={{ mb: 2 }}>
+              <Typography variant="body2" sx={{ fontWeight: 500, mb: 0.5 }}>
+                Some scopes couldn't be searched ({discoveryErrors.length}):
+              </Typography>
+              <Box component="ul" sx={{ pl: 3, my: 0.5, "& li": { fontSize: 12 } }}>
+                {discoveryErrors.map((e, i) => (
+                  <li key={i}><Typography variant="caption">{e}</Typography></li>
+                ))}
+              </Box>
+              <Typography variant="caption">
+                Discovered MVs below may be incomplete. Most common cause: the
+                user doesn't have READ on one of the picked tables' schemas.
+              </Typography>
+            </Alert>
           )}
 
-          {allMvFqns.length === 0 && !discoveringMvs && (
+          {/* Non-fatal warnings, e.g. broad scan fell back to schema-only. */}
+          {discoveryWarnings.length > 0 && (
             <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
-              No existing Metric Views in these schemas use the picked tables.
+              {discoveryWarnings.map((w, i) => (
+                <Typography key={i} variant="caption" sx={{ display: "block" }}>
+                  {w}
+                </Typography>
+              ))}
+            </Alert>
+          )}
+
+          {allMvFqns.length === 0 && !discoveringMvs && discoveryErrors.length === 0 && (
+            <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
+              No existing Metric Views use the picked tables {scopeBroad ? "(scanned all visible catalogs)" : "in these schemas"}.
               You can author a new one from scratch in the Metric View section below.
             </Alert>
           )}
@@ -366,6 +506,23 @@ export default function DataSourcesPanel({
                         of its source tables above. To remove, click the trash
                         icon at right.
                       </Typography>
+                    )}
+
+                    {/* Notes (#11): inline editable, only when this MV is
+                        actually checked into the data plan (otherwise it's
+                        a discovery candidate that hasn't been picked yet). */}
+                    {checked && (
+                      <TextField
+                        size="small"
+                        variant="standard"
+                        fullWidth
+                        placeholder="Notes (optional)"
+                        value={mvEntries.find(e => e.table_or_view === fqn)?.notes || ""}
+                        onChange={(ev) => handleNotesChange(fqn, ev.target.value)}
+                        disabled={readOnly}
+                        InputProps={{ sx: { fontSize: 12 } }}
+                        sx={{ mt: 0.5 }}
+                      />
                     )}
 
                     <Accordion

@@ -56,10 +56,17 @@ interface Props {
   /** Writer for S4 fields. The Data Sources panel uses this to update data_plan
    *  from S3. The parent (Engagement.tsx) routes it through to the S4 save path. */
   onChangeSession4?: (section: string, value: any) => void;
-  /** SQL warehouse ID for DESCRIBE EXTENDED on metric views in the Data
-   *  Sources panel. Resolved by the parent from S5's plan_warehouse_id; empty
-   *  is OK -- the panel just disables the MV details expander with a hint. */
+  /** Writer for S5 fields. The Data Sources panel uses this for the inline
+   *  warehouse picker (which persists to plan_warehouse_id so the same
+   *  warehouse carries through to Generate Plan). */
+  onChangeSession5?: (section: string, value: any) => void;
+  /** SQL warehouse ID for DESCRIBE EXTENDED on metric views + the broad MV
+   *  discovery scan. Resolved by the parent from S5's plan_warehouse_id;
+   *  empty is OK -- the panel renders an inline picker to set it. */
   warehouseId?: string;
+  /** True when the current user is a BO (not COE). Forces read-only on the
+   *  Data Sources panel since BOs can't write to S3/S4 fields. */
+  isBoOnly?: boolean;
   engagementId?: string;
   /** Called after Create Metric View persists, so the parent can refresh its
    *  optimistic-lock token (updatedAtRef) and avoid a 409 on next autosave. */
@@ -68,7 +75,8 @@ interface Props {
 
 export default function Session3Form({
   data, onChange, readOnly, session1Data, session2Data, session4Data,
-  onChangeSession4, warehouseId, engagementId, onMetricViewCreated,
+  onChangeSession4, onChangeSession5, warehouseId, isBoOnly, engagementId,
+  onMetricViewCreated,
 }: Props) {
   const [joins, setJoins] = useState<{ table: string; keys: string }[]>([]);
   const [metricViews, setMetricViews] = useState<string[]>([]);
@@ -342,7 +350,12 @@ export default function Session3Form({
             dataPlan={session4Data?.data_plan || []}
             onChangeDataPlan={(next) => onChangeSession4?.("data_plan", next)}
             warehouseId={warehouseId || ""}
-            readOnly={readOnly || !onChangeSession4}
+            onChangeWarehouseId={
+              onChangeSession5
+                ? (id) => onChangeSession5("plan_warehouse_id", id)
+                : undefined
+            }
+            readOnly={readOnly || isBoOnly || !onChangeSession4}
           />
         </AccordionDetails>
       </Accordion>
