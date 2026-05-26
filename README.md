@@ -22,22 +22,48 @@ The app is a 6-session workbook. Each session is a form backed by a Delta table 
 - Build the question bank (what does the BO actually want to ask?).
 - Define vocabulary terms and their data meaning (synonyms, definitions).
 
+### Pre-work Excel upload (optional shortcut for S1 + S2)
+
+Sessions 1 and 2 can be pre-populated from an Excel template instead of typed live during the session:
+
+- **"Download Template"** in the engagement header builds a fresh `.xlsx` workbook with sheets for Business Context Discovery, Pain Points, Existing Reports, Question Bank, and Vocabulary & Metrics. The analyst emails it to the BO before the kickoff call.
+- **"Upload Pre-Work"** opens a modal that parses the BO's filled-in workbook server-side, shows a preview per section with per-section checkboxes, and lets the analyst pick which sections to apply.
+- **Defense in depth on upload**: file-extension check, magic-byte check, size cap, and a whitelist of section keys + row keys per sheet so a crafted payload can't smuggle extra columns into the engagement row.
+- **Atomic apply** under the engagement's optimistic lock — partial failures can't leave the engagement half-applied. Apply also advances `current_session` past the highest touched session so the next tab unlocks automatically.
+
 ### Session 3 — Technical Design (Analyst solo)
-- **SQL Expressions** — write reusable filter / dimension / measure snippets tied to UC tables. Analyst classifies type; UI uses 4-level cascading UC pickers (catalog → schema → table → column).
-- **Text Instructions** — analyst guidance that can't be expressed as SQL.
-- **Data Gaps** — capture concepts the BO asked about that have no data home yet.
+
+S3 is data-sources-first: pick the tables and metric views the space will use *before* implementing measures, so the rest of S3 (and S4's Data Plan) is grounded in real UC objects from the start.
+
+- **Data Sources panel** (top of S3) — the single place the analyst declares what's in scope:
+  - Inline warehouse picker (also propagates to Session 5).
+  - **Bulk table-or-MV picker** with 3-level UC cascade (catalog → schema → table). Adds land as either "Table" or "Metric View" automatically, detected via the UC REST API (the SDK's `table_type` field misreports MVs as MANAGED on some versions, so the broad-scan path uses `/api/2.1/unity-catalog/tables` directly).
+  - **Existing Metric Views discovery** — broad scan across all visible catalogs (`system.information_schema.tables`) finds every MV whose underlying tables overlap the analyst's scope. Each candidate shows owner, source tables, and (on expand) the actual `DESCRIBE EXTENDED` dimensions / measures so the analyst can decide whether to reuse it instead of re-authoring measures. Checkbox flows the MV into S4's Data Plan automatically.
+  - Per-row Notes textarea (lands in `column_configs` description or table description at push).
+  - Both tables and MVs flow into Session 4's Data Plan automatically; S4 is read-only with a redirect back to S3.
+- **Classify Terms** — every business term captured in Session 2 appears here for classification (one term can have multiple types):
+  - **Metric** → auto-creates a row in SQL Expressions for the analyst to fill in.
+  - **Filter / Date Logic** → auto-creates a row in Text Instructions.
+  - **Synonym** → routes via a sub-picker:
+    - *"A column name"* — pushes to `column_configs.synonyms` on the column at S5 push.
+    - *"A value in a column"* — pushes to `column_configs.description` and enables Entity Matching on the column (Genie's column_configs schema has no value-aliases field; description + entity-matching toggle is the supported mechanism).
+    - *"A general space term"* — auto-populates the Text Instructions section; lands in the space's General Instructions at push.
+- **Synonym Routing Summary** — a read-only panel that previews exactly what will be pushed where. Marks any incomplete routing (no column picked, FQN missing the column segment, table not in the Data Plan, value-kind missing a column value, no synonyms in S2 vocab) with a per-row `Won't push: <reason>` chip, excludes them from the "N column / N value / N general" counts, and shows an "X of Y will push at Session 5" banner with an alert listing the gaps to fix. No more silent drops at push time.
+- **SQL Expressions** — reusable filter / dimension / measure snippets tied to UC tables. Pick a table via the inline cascade; the synonyms column auto-fills from the matching S2 vocabulary row when the term was classified as Metric.
+- **Text Instructions** — analyst guidance that can't be expressed as SQL. Rows are auto-seeded by Classify Terms.
+- **Data Gaps** — concepts the BO asked about that have no data home yet.
 - **Scope Boundaries** — explicit "we are / are not covering X."
-- **Global Filter** — a space-wide WHERE clause (e.g., `region = 'North'`) that flows through to the metric view YAML and plan.
+- **Global Filter** — a space-wide WHERE clause (e.g., `voided_flag = 'N'`) that flows through to the metric view YAML and plan.
 - **Optional Metric View builder** —
   - Click "Draft YAML" and the app produces a Databricks-spec metric view YAML grounded in the actual UC column schemas of the source tables (DESCRIBE-driven, no hallucinated columns).
   - The YAML honors the global filter, detected PK/FK joins, and the analyst's Session 3 SQL expressions.
-  - "Create Metric View" deploys it to UC under your OBO token (respects your grants, not the app SP's). If the FQN already exists the app returns ownership info rather than overwriting blindly.
+  - "Create Metric View" deploys it to UC under your OBO token (respects your grants, not the app SP's). If the FQN already exists the app returns ownership info rather than overwriting blindly. Created MVs auto-appear in the Existing Metric Views section above so the analyst can immediately check them.
 
 ### Session 4 — COE Review + Benchmarks (COE group)
 - **Readiness Brief** — async LLM call (via the background-job runner, see *Cross-cutting design choices*) that synthesizes Sessions 1–3 + Data Plan into a citation-backed brief with coverage analysis and a gaps section. Auto-fires on first visit if S1–S3 has any content; gated on having at least one S1 response, S2 question, or S3 SQL expression so a brand-new empty engagement doesn't trigger an LLM call.
 - **Analyst commentary** — per-gap responses preserved across regenerations via fuzzy-match.
-- **Data plan** — the single source of truth for which tables and metric views will be in scope for the Genie Space. A row per table/view with include=Yes/No and notes.
-- **Reactive sync**: when a metric view is created in Session 3, it auto-appears in Session 4's data plan (no manual copy step).
+- **Data Plan (read-only)** — the consolidated list of tables and metric views the space will use. **Edits happen in Session 3's Data Sources panel**, not here. S4 shows the plan with a banner pointing back to S3 so analysts don't try to add/remove things in the wrong place. A row per table/view with include=Yes/No and notes; notes flow into column descriptions or `column_configs` at push.
+- **Reactive sync**: when a metric view is created or added in Session 3, it auto-appears in Session 4's data plan (no manual copy step).
 - **Benchmark Questions** — the acceptance-test bank the space is measured against. Highlights:
   - **Draft N Benchmarks** with a count input (1–50). When existing benchmarks are present, a confirm dialog forces Replace vs. Append.
   - Under the hood the LLM brainstorms **N+10 candidates**, scores each on coverage / BO-phrasing / table coverage / realism, drops duplicates, and returns the top N in priority order.
@@ -65,7 +91,11 @@ This is where discovery becomes a real Genie Space configuration.
    - `narrative` — short plain-English summary of what got configured.
 6. **Fetches joins deterministically.** UC PK/FK constraints between in-scope tables are pulled via the SDK (not LLM-inferred) and auto-seed the joins table.
 7. **Analyst-editable joins** — UC-seeded rows are tagged "UC FK" (read-only); the analyst can click "Add manual join" to declare relationships that aren't in UC. Regenerate Plan refreshes UC joins but preserves manual rows.
-8. **Push to Genie Space** — create-new or update-existing flow using the Genie REST API, authed OBO as the end user (so the user's `CAN MANAGE` on the space governs the push). All four instruction surfaces (instructions + sample questions + SQL snippets + example queries + joins) are serialized and pushed.
+8. **Push to Genie Space** — create-new or update-existing flow using the Genie REST API, authed OBO as the end user (so the user's `CAN MANAGE` on the space governs the push). The serialized space includes:
+   - Tables + metric views from the Data Plan
+   - General instructions, sample questions, SQL filters / dimensions / measures, example queries, joins
+   - **`column_configs`** — auto-built from Session 3's Classify Terms routing. Column-kind synonyms land in `column_configs.synonyms`; value-kind synonyms land in `column_configs.description` with `enable_entity_matching=true`. Cross-cutting (general-space) synonyms flow through `general_instructions` via the S5 LLM plan.
+   - Push honors the engagement's optimistic lock (`If-Match: <updated_at>`). If another writer has bumped the engagement since the page loaded, push returns 409 with a clear "refresh before pushing" message instead of silently overwriting the live space with stale data.
 
 ### Session 6 — Prototype Review (Analyst + BO, gated)
 - Run through the benchmark questions against the live space.
@@ -88,6 +118,7 @@ This is where discovery becomes a real Genie Space configuration.
 - **Two-step LLM flows** for SQL + summary so the explanation always describes the actual code.
 - **Delta-backed persistence** with a single engagement row; JSON columns per session. `ensure_table()` auto-creates the engagement table on first run and additively migrates the schema on every startup so pulling updates doesn't require manual SQL.
 - **Popup editing + debounced autosave** on every table — you never lose work between clicks.
+- **Floating section nav.** Sessions 3 / 4 / 5 have many accordions; the engagement page renders a left-side rail listing the sessions and an "IN THIS SESSION" sub-rail with every accordion in the current tab. Sub-section IDs (`section-3-data-sources`, `section-3-classify-terms`, ...) are defined in one place (`frontend/src/sessions/sectionConfig.ts`) so the rail and the Accordion `id`s stay in sync.
 
 ### Who calls what: OBO vs App Service Principal
 
@@ -157,15 +188,19 @@ genie-discovery-app/
       sessions/
         Session1Form.tsx
         Session2Form.tsx
-        Session3Form.tsx         # Includes metric view builder (LLM YAML + UC create)
-        Session4Form.tsx         # Includes benchmark runner (draft N+10, run inline, BO approve)
+        Session3Form.tsx         # Data Sources + Classify Terms + Routing Summary + SQL Expressions + MV builder
+        Session4Form.tsx         # Read-only Data Plan + benchmark runner (draft N+10, run inline, BO approve)
         Session5Form.tsx         # Generate Plan + editable preview + joins + push to Genie
         Session6Form.tsx
+        sectionConfig.ts         # Single source of truth for section IDs + labels in the floating nav
       components/
         EditableTable.tsx
         ExpandableTextField.tsx  # Long-form popup editor with autosize
         UCTablePicker.tsx
         UCColumnPicker.tsx
+        DataSourcesPanel.tsx     # S3 top-of-page: tables/MVs picker, broad-scan MV discovery, notes
+        PreworkUploadModal.tsx   # BO Excel upload → parse preview → atomic apply to S1+S2
+        SectionToc.tsx           # Floating section nav (sessions rail + in-this-session sub-rail)
   static/                        # Vite build output (gitignored)
 ```
 
@@ -347,8 +382,13 @@ The app auto-creates the engagement table and adds any missing Delta columns on 
 Functional today:
 
 - All 6 session forms with autosave + popup text editing + bounded auto-retry on stale-token 409
+- Floating section nav (sessions rail + in-this-session sub-rail) on every engagement page
+- Pre-work Excel upload (BO template download + atomic apply to S1+S2 under optimistic lock)
 - Group-based access: default analyst access, COE-restricted approval, optional BO-restricted view (S1/S2 + BO-Approved checkbox only)
-- UC pickers, PK/FK join detection (with verbose logging for debugging), metric view discovery
+- UC pickers, PK/FK join detection (with verbose logging for debugging), broad-scan metric view discovery across all visible catalogs
+- Session 3 Data Sources panel: bulk add tables/MVs, inline warehouse picker, notes, MV reuse discovery with `DESCRIBE EXTENDED` previews
+- Session 3 Classify Terms with synonym kind picker (column / value / general space) and Routing Summary panel that flags incomplete routings before push
+- Session 4 Data Plan rendered read-only (edits flow back from S3's Data Sources panel)
 - Async job runner for long LLM calls (avoids the gateway 60s sync timeout); per-task `max_tokens` and model selection; one-retry exponential backoff on transient model errors
 - Cold-warehouse aware `sql_exec` (returns 503 with retry hint instead of fake 404)
 - Readiness Brief (Session 4): citation-backed, gap analysis, gated on having S1–S3 content before auto-firing
@@ -357,7 +397,7 @@ Functional today:
 - COE gating on Sessions 5 & 6 (OBO-verified group membership)
 - Generate Plan (Session 5): schema-grounded, MV-aware, benchmark-style-aware, strips benchmark overlaps, surfaces warnings
 - Joins: UC PK/FK auto-seeded + analyst-editable manual joins, regenerate preserves manual rows
-- Push to Genie Space: create-new and update-existing via REST API, OBO-authed, all four instruction surfaces serialized; benchmarks land in the Benchmarks tab
+- Push to Genie Space: create-new and update-existing via REST API, OBO-authed, full instruction surface serialized (instructions + sample questions + SQL snippets + example queries + joins + `column_configs`); benchmarks land in the Benchmarks tab. Push honors If-Match optimistic lock — refuses to push stale data.
 
 Pending:
 
