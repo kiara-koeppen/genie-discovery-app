@@ -346,6 +346,30 @@ export const api = {
   listSchemas: (catalog: string) =>
     json<string[]>(`/uc/schemas?catalog=${encodeURIComponent(catalog)}`),
 
+  /** S3 data-sources-first flow: find existing Metric Views that depend on
+   *  any of the picked source tables. Used to surface reusable MVs to the
+   *  analyst so they don't have to re-author measures from scratch. */
+  findMetricViewsForTables: (fqns: string[]) =>
+    json<{
+      fqn: string;
+      catalog: string;
+      schema: string;
+      name: string;
+      comment: string;
+      owner: string;
+      updated_at?: string;
+      dependencies: string[];
+    }[]>(`/uc/metric-views-for-tables?fqns=${encodeURIComponent(fqns.join(","))}`),
+
+  /** Deterministic "what this MV covers" view: dimensions + measures + each
+   *  column's display_name, synonyms, and comment. No LLM needed. */
+  fetchMetricViewDetails: (fqn: string, warehouseId: string) =>
+    json<{
+      fqn: string;
+      dimensions: { name: string; display_name: string; synonyms: string[]; comment: string; data_type: string }[];
+      measures:   { name: string; display_name: string; synonyms: string[]; comment: string; data_type: string }[];
+    }>(`/uc/metric-view-details?fqn=${encodeURIComponent(fqn)}&warehouse_id=${encodeURIComponent(warehouseId)}`),
+
   pushToGenie: (
     id: string,
     body: {

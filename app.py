@@ -4365,6 +4365,189 @@ def uc_metric_views():
     return jsonify(results)
 
 
+@app.route("/api/uc/metric-views-for-tables")
+def uc_metric_views_for_tables():
+    """Find Metric Views that depend on any of the given source tables.
+
+    Used by S3's data-sources-first flow: the analyst picks tables, the app
+    surfaces existing MVs that already use those tables so the analyst can
+    reuse them instead of re-authoring measures from scratch.
+
+    Query params:
+        fqns: comma-separated catalog.schema.table list
+
+    Returns:
+        [{fqn, catalog, schema, name, comment, owner, updated_at, dependencies}]
+        Filtered to MVs whose view_dependencies intersect the picked tables.
+
+    Phase 1 scope: scans every (catalog, schema) where a picked table lives.
+    Misses MVs that live in a different schema from their source tables --
+    a follow-up enhancement could broaden to system.information_schema, but
+    most customer MVs co-locate with their sources so we start narrow.
+    """
+    user_w, err = _require_obo()
+    if err:
+        return err
+    raw = request.args.get("fqns", "")
+    picked = {
+        t.strip() for t in raw.split(",")
+        if t.strip() and t.count(".") == 2
+    }
+    if not picked:
+        return jsonify([])
+
+    # Step 1: enumerate MV candidates in every (catalog, schema) that a
+    # picked table lives in. Uses the SDK's tables.list() under OBO so the
+    # user's UC grants apply. Errors are logged-and-skipped per scope so
+    # one inaccessible schema doesn't kill the whole discovery.
+    schemas = {".".join(t.split(".")[:2]) for t in picked}
+    candidates = []
+    for cs in schemas:
+        cat, sch = cs.split(".", 1)
+        try:
+            tables = list(user_w.tables.list(catalog_name=cat, schema_name=sch))
+        except Exception as e:
+            print(f"[/api/uc/metric-views-for-tables] list({cs}): "
+                  f"{type(e).__name__}: {e}", flush=True)
+            continue
+        for t in tables:
+            tt = str(getattr(t, "table_type", "") or "").upper()
+            if "METRIC_VIEW" in tt and t.name:
+                candidates.append(f"{cat}.{sch}.{t.name}")
+
+    if not candidates:
+        return jsonify([])
+
+    # Step 2: REST-fetch each candidate to read view_dependencies. The SDK's
+    # TableInfo doesn't surface view_dependencies, so we hit /unity-catalog/
+    # tables/<fqn> directly. Skip candidates we can't read (private MVs the
+    # user lacks grants on -- logged-and-skipped, not fatal).
+    host = user_w.config.host.rstrip("/")
+    token = user_w.config.token
+    hdrs = {"Authorization": f"Bearer {token}"}
+    results = []
+    for fqn in candidates:
+        try:
+            r = requests.get(
+                f"{host}/api/2.1/unity-catalog/tables/{fqn}",
+                headers=hdrs, timeout=15,
+            )
+            if not r.ok:
+                continue
+            body = r.json()
+            deps_raw = (body.get("view_dependencies") or {}).get("dependencies") or []
+            dep_fqns = set()
+            for d in deps_raw:
+                tbl = (d or {}).get("table") or {}
+                fn = tbl.get("table_full_name")
+                if fn:
+                    dep_fqns.add(fn)
+            if not (dep_fqns & picked):
+                continue
+            parts = fqn.split(".")
+            results.append({
+                "fqn": fqn,
+                "catalog": parts[0],
+                "schema": parts[1],
+                "name": parts[2],
+                "comment": body.get("comment", "") or "",
+                "owner": body.get("owner", "") or "",
+                "updated_at": body.get("updated_at"),
+                "dependencies": sorted(dep_fqns),
+            })
+        except Exception as e:
+            print(f"[/api/uc/metric-views-for-tables] {fqn}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            continue
+
+    results.sort(key=lambda x: x["fqn"])
+    return jsonify(results)
+
+
+@app.route("/api/uc/metric-view-details")
+def uc_metric_view_details():
+    """Return structured dimensions + measures for a Metric View.
+
+    Used by S3's data-sources panel to render "what does this MV cover?" --
+    column names, display names, synonyms, comments, and measure markers --
+    without needing an LLM. The deterministic part of Phase 1.
+
+    Query params:
+        fqn:          catalog.schema.metric_view_name (required)
+        warehouse_id: SQL warehouse to run DESCRIBE on (required)
+
+    Returns:
+        { fqn, dimensions: [...], measures: [...] }
+      where each entry is:
+        { name, display_name, synonyms: [...], comment, data_type }
+
+    Measure detection: DESCRIBE EXTENDED on a metric view returns each
+    column's data_type with a trailing " measure" marker (e.g.
+    "bigint measure"). We split on that marker.
+    """
+    user_w, err = _require_obo()
+    if err:
+        return err
+    fqn = request.args.get("fqn", "")
+    warehouse_id = request.args.get("warehouse_id", "")
+    if not fqn or fqn.count(".") != 2:
+        return jsonify({"error": "fqn (3-part) is required"}), 400
+    if not warehouse_id:
+        return jsonify({"error": "warehouse_id is required"}), 400
+
+    parts = fqn.split(".")
+    stmt = f"DESCRIBE EXTENDED `{parts[0]}`.`{parts[1]}`.`{parts[2]}`"
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id, statement=stmt, wait_timeout="30s",
+        )
+    except Exception as e:
+        print(f"[/api/uc/metric-view-details] {type(e).__name__}: {e}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 502
+
+    state = ""
+    if resp.status and resp.status.state:
+        state = str(resp.status.state.value if hasattr(resp.status.state, "value")
+                    else resp.status.state)
+    if state != "SUCCEEDED" or not resp.result or not resp.result.data_array:
+        msg = ""
+        if resp.status and resp.status.error:
+            msg = (resp.status.error.message or "")[:300]
+        return jsonify({"error": f"DESCRIBE failed ({state}): {msg}"}), 502
+
+    dimensions, measures = [], []
+    for row in resp.result.data_array:
+        if not row:
+            continue
+        col_name = (row[0] or "").strip() if row[0] else ""
+        # The "# Detailed Table Information" section comes after the
+        # columns. Stop on the first blank or comment-banner row -- the
+        # column metadata we care about all lives above it.
+        if not col_name or col_name.startswith("#"):
+            break
+        data_type = (row[1] or "").strip() if len(row) > 1 and row[1] else ""
+        comment = (row[2] or "").strip() if len(row) > 2 and row[2] else ""
+        metadata_raw = (row[3] or "").strip() if len(row) > 3 and row[3] else ""
+        meta = {}
+        if metadata_raw:
+            try:
+                meta = json.loads(metadata_raw)
+            except Exception:
+                meta = {}
+        entry = {
+            "name": col_name,
+            "data_type": data_type,
+            "comment": comment,
+            "display_name": (meta.get("display_name") or "").strip(),
+            "synonyms": meta.get("synonyms") or [],
+        }
+        if "measure" in data_type.lower():
+            measures.append(entry)
+        else:
+            dimensions.append(entry)
+    return jsonify({"fqn": fqn, "dimensions": dimensions, "measures": measures})
+
+
 # ---------------------------------------------------------------------------
 # SPA catch-all
 # ---------------------------------------------------------------------------

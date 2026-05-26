@@ -485,6 +485,9 @@ export default function Engagement({ readOnly = false }: Props) {
             {...sessionProps(3)}
             session1Data={sessionDrafts[1]}
             session2Data={sessionDrafts[2]}
+            session4Data={sessionDrafts[4]}
+            onChangeSession4={(section, value) => updateDraft(4, section, value)}
+            warehouseId={sessionDrafts[5]?.plan_warehouse_id || ""}
             engagementId={id}
             onMetricViewCreated={(ts) => { updatedAtRef.current = ts; }}
           />
