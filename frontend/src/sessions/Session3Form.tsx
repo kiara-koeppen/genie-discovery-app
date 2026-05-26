@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo, Fragment } from "react";
+import { useEffect, useState, useMemo, Fragment, type ReactNode } from "react";
 import {
   Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert, Chip,
   Paper, Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
@@ -130,18 +130,103 @@ export default function Session3Form({
     ).then((results) => setMetricViews(results.flat()));
   }, [selectedTables]);
 
+  // --- Auto-row reconciliation ---
+  //
+  // A term has an auto-generated SQL Expressions row IFF it is classified as
+  // Metric. A term has an auto-generated Text Instructions row IFF it is
+  // classified as Filter, Date Logic, OR Synonym with kind = general space
+  // term (cross_cutting). For column- and value-kind synonyms, NO text_instr
+  // row is created -- those route to column_configs at push, not to space-
+  // level text instructions.
+  //
+  // This single invariant replaces the old "track added/removed types and
+  // mutate" logic. Whenever classifications or a synonym target change, we
+  // call _reconcileAutoRows with the new classification state, and it
+  // computes the deltas vs. the current exprs/instrs.
+  const _buildAutoInstrPrefill = (vocab: any, termName: string) => {
+    const synonymList = vocab?.synonyms || "";
+    if (!synonymList) return "";
+    const parts = synonymList.split(",").map((s: string) => s.trim()).filter(Boolean);
+    if (!parts.length) return "";
+    return `When users say "${parts.join('" or "')}", they mean "${termName}".`;
+  };
+
+  const _reconcileAutoRows = (
+    classifications: any[],
+    exprs: any[],
+    instrs: any[],
+  ): { exprs: any[]; instrs: any[]; changed: boolean } => {
+    // Build {termName: types, target} index from the new classification state
+    const byTerm = new Map<string, { types: string[]; target?: SynonymTarget }>();
+    for (const c of classifications) {
+      if (!c?.business_term) continue;
+      byTerm.set(c.business_term, {
+        types: c.types || [],
+        target: c.synonym_target,
+      });
+    }
+
+    let changed = false;
+    let nextExprs = exprs;
+    let nextInstrs = instrs;
+
+    for (const v of vocabTerms) {
+      const term = v.business_term;
+      if (!term) continue;
+      const info = byTerm.get(term) || { types: [] };
+      const types = info.types;
+
+      // -- Metric row
+      const shouldHaveExpr = types.includes("Metric");
+      const hasExpr = nextExprs.some((e: any) => e.metric_name === term);
+      if (shouldHaveExpr && !hasExpr) {
+        nextExprs = [...nextExprs, {
+          metric_name: term, uc_table: "", sql_code: "",
+          synonyms: v.synonyms || "",
+        }];
+        changed = true;
+      } else if (!shouldHaveExpr && hasExpr) {
+        nextExprs = nextExprs.filter((e: any) => e.metric_name !== term);
+        changed = true;
+      }
+
+      // -- Text instruction row (Filter, Date Logic, or Synonym/cross_cutting)
+      const synKind = (info.target?.kind || "cross_cutting");
+      const isGeneralSpaceSynonym =
+        types.includes("Synonym") && synKind === "cross_cutting";
+      const shouldHaveInstr =
+        types.includes("Filter") ||
+        types.includes("Date Logic") ||
+        isGeneralSpaceSynonym;
+
+      const instrIdx = nextInstrs.findIndex((i: any) => i.title === term);
+      const hasInstr = instrIdx >= 0;
+      if (shouldHaveInstr && !hasInstr) {
+        // Pre-fill only for general-space-term synonyms; Filter / Date Logic
+        // get an empty instruction (analyst writes the rule).
+        const prefill = isGeneralSpaceSynonym
+          ? _buildAutoInstrPrefill(v, term)
+          : "";
+        nextInstrs = [...nextInstrs, { title: term, instruction: prefill }];
+        changed = true;
+      } else if (!shouldHaveInstr && hasInstr) {
+        nextInstrs = nextInstrs.filter((i: any) => i.title !== term);
+        changed = true;
+      }
+    }
+    return { exprs: nextExprs, instrs: nextInstrs, changed };
+  };
+
   // --- Classification handler (multi-type) ---
   const handleClassify = (termName: string, newTypes: string[]) => {
-    // Update classifications
     const classifications = [...(data.term_classifications || [])];
     const idx = classifications.findIndex((c: any) => c.business_term === termName);
-    const oldTypes: string[] = idx >= 0 ? (classifications[idx].types || []) : [];
     const oldTarget: SynonymTarget | undefined =
       idx >= 0 ? classifications[idx].synonym_target : undefined;
 
     const newRow: any = { business_term: termName, types: newTypes };
-    // Preserve existing synonym_target if "Synonym" is still selected; drop it
-    // entirely if Synonym was unchecked.
+    // Preserve existing synonym_target if "Synonym" is still selected; drop
+    // it entirely if Synonym was unchecked.
     if (newTypes.includes("Synonym") && oldTarget) {
       newRow.synonym_target = oldTarget;
     }
@@ -149,79 +234,30 @@ export default function Session3Form({
     else classifications.push(newRow);
     onChange("term_classifications", classifications);
 
-    const addedTypes = newTypes.filter((t) => !oldTypes.includes(t));
-    const removedTypes = oldTypes.filter((t) => !newTypes.includes(t));
-
-    if (addedTypes.length === 0 && removedTypes.length === 0) return;
-
-    const vocab = vocabTerms.find((v: any) => v.business_term === termName);
-
-    // Build changes locally to avoid stale-state issues across multiple onChange calls
-    let exprs = [...(data.sql_expressions || [])];
-    let instrs = [...(data.text_instructions || [])];
-    let exprsChanged = false;
-    let instrsChanged = false;
-
-    // Types that auto-create a text_instructions row. Synonym is INTENTIONALLY
-    // not in this list anymore -- synonyms now route via the structured
-    // synonym_target field on TermClassification (see handleSynonymTarget).
-    // Cross-cutting synonyms still surface in general_instructions via the
-    // S5 LLM, but they don't need a row in the text_instructions table.
-    const INSTR_TYPES = ["Filter", "Date Logic"];
-
-    // Add rows for newly selected types
-    for (const type of addedTypes) {
-      if (type === "Metric" && !exprs.some((e: any) => e.metric_name === termName)) {
-        exprs.push({
-          metric_name: termName, uc_table: "", sql_code: "",
-          synonyms: vocab?.synonyms || "",
-        });
-        exprsChanged = true;
-      } else if (
-        INSTR_TYPES.includes(type) &&
-        !instrs.some((i: any) => i.title === termName)
-      ) {
-        instrs.push({ title: termName, instruction: "" });
-        instrsChanged = true;
-      }
+    const res = _reconcileAutoRows(
+      classifications,
+      data.sql_expressions || [],
+      data.text_instructions || [],
+    );
+    if (res.changed) {
+      onChange("sql_expressions", res.exprs);
+      onChange("text_instructions", res.instrs);
     }
-
-    // Remove rows for deselected types
-    for (const type of removedTypes) {
-      if (type === "Metric") {
-        const before = exprs.length;
-        exprs = exprs.filter((e: any) => e.metric_name !== termName);
-        if (exprs.length !== before) exprsChanged = true;
-      } else if (INSTR_TYPES.includes(type)) {
-        // Only remove if no instruction-producing type is still selected
-        const stillHasInstrType = newTypes.some((t) => INSTR_TYPES.includes(t));
-        if (!stillHasInstrType) {
-          const before = instrs.length;
-          instrs = instrs.filter((i: any) => i.title !== termName);
-          if (instrs.length !== before) instrsChanged = true;
-        }
-      }
-    }
-
-    if (exprsChanged) onChange("sql_expressions", exprs);
-    if (instrsChanged) onChange("text_instructions", instrs);
   };
 
   // --- Synonym target handler ---
-  // Stores the routing decision (column / value / cross-cutting) for a term
-  // classified as Synonym. Used by the S5 prompt to route the term's synonyms
-  // to the right Genie surface (column_configs, entity matching, or general
-  // instructions). Phase 1 only stores the data; Phase 2 will push column-level
-  // synonyms to Genie's column_configs at push time.
+  // Stores the routing decision (column / value / general space term) for a
+  // term classified as Synonym. Each change re-reconciles auto-rows so a kind
+  // flip (e.g. general space term → column) removes the orphaned text_instr
+  // entry, and a flip the other direction adds a fresh pre-filled instruction.
   const handleSynonymTarget = (termName: string, patch: Partial<SynonymTarget>) => {
     const classifications = [...(data.term_classifications || [])];
     const idx = classifications.findIndex((c: any) => c.business_term === termName);
-    if (idx < 0) return; // shouldn't happen — the row only renders when classified
+    if (idx < 0) return; // shouldn't happen — sub-row only renders when classified
     const current: SynonymTarget = classifications[idx].synonym_target || {
       kind: "cross_cutting",
     };
     const merged: SynonymTarget = { ...current, ...patch };
-    // Clean up fields that don't apply to the new kind
     if (merged.kind === "cross_cutting") {
       delete merged.column_fqn;
       delete merged.column_value;
@@ -230,6 +266,16 @@ export default function Session3Form({
     }
     classifications[idx] = { ...classifications[idx], synonym_target: merged };
     onChange("term_classifications", classifications);
+
+    const res = _reconcileAutoRows(
+      classifications,
+      data.sql_expressions || [],
+      data.text_instructions || [],
+    );
+    if (res.changed) {
+      onChange("sql_expressions", res.exprs);
+      onChange("text_instructions", res.instrs);
+    }
   };
 
   // Load catalogs + warehouses once for the MV builder
@@ -613,6 +659,118 @@ export default function Session3Form({
                 </TableBody>
               </Table>
             </TableContainer>
+
+            {/* ---- Synonym Routing Summary (read-only) ---- */}
+            {/* Groups every Synonym-classified term by where it'll land at S5
+                push. Renders only when at least one term is classified as
+                Synonym so blank engagements stay quiet. */}
+            {(() => {
+              interface SynRow {
+                term: string;
+                synonyms: string[];
+                kind: string;
+                column_fqn: string;
+                column_value: string;
+              }
+              const synonymRows: SynRow[] = (data.term_classifications || [])
+                .filter((c: any) => (c.types || []).includes("Synonym"))
+                .map((c: any) => {
+                  const vocab = vocabTerms.find((v: any) => v.business_term === c.business_term);
+                  const target = c.synonym_target || { kind: "cross_cutting" };
+                  return {
+                    term: c.business_term,
+                    synonyms: (vocab?.synonyms || "").split(",").map((s: string) => s.trim()).filter(Boolean),
+                    kind: target.kind,
+                    column_fqn: target.column_fqn || "",
+                    column_value: target.column_value || "",
+                  };
+                });
+              if (!synonymRows.length) return null;
+
+              const columnEntries = synonymRows.filter((r: SynRow) => r.kind === "column");
+              const valueEntries  = synonymRows.filter((r: SynRow) => r.kind === "value");
+              const generalEntries = synonymRows.filter((r: SynRow) => r.kind === "cross_cutting");
+
+              const renderEntries = (entries: SynRow[], fmt: (r: SynRow) => ReactNode) =>
+                entries.length === 0 ? null : (
+                  <Box component="ul" sx={{ pl: 3, my: 0.5, "& li": { mb: 0.25 } }}>
+                    {entries.map((r: SynRow, i: number) => <li key={i}>{fmt(r)}</li>)}
+                  </Box>
+                );
+
+              return (
+                <Box sx={{ mt: 3, p: 2, bgcolor: "action.hover", borderRadius: 1 }}>
+                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5 }}>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+                      Synonym Routing Summary
+                    </Typography>
+                    <Chip size="small" variant="outlined" label={`${columnEntries.length} column`} />
+                    <Chip size="small" variant="outlined" label={`${valueEntries.length} value`} />
+                    <Chip size="small" variant="outlined" label={`${generalEntries.length} general space`} />
+                    <Typography variant="caption" color="text.secondary" sx={{ ml: "auto" }}>
+                      Auto-applied when you push at Session 5 — no manual Genie UI work needed.
+                    </Typography>
+                  </Stack>
+
+                  {columnEntries.length > 0 && (
+                    <Box sx={{ mb: 1.5 }}>
+                      <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                        Will be pushed to <code>column.synonyms</code>:
+                      </Typography>
+                      {renderEntries(columnEntries, (r) => (
+                        <Typography variant="body2">
+                          <code style={{ fontSize: 12 }}>{r.column_fqn || <em style={{ color: "#c62828" }}>(no column picked)</em>}</code>
+                          {" ← "}
+                          {r.synonyms.length > 0
+                            ? r.synonyms.map((s: string, i: number) => <code key={i} style={{ fontSize: 12, marginRight: 4 }}>"{s}"</code>)
+                            : <em style={{ color: "#999" }}>(no synonyms in S2 vocab)</em>}
+                          {" "}<span style={{ color: "#999" }}>(from "{r.term}")</span>
+                        </Typography>
+                      ))}
+                    </Box>
+                  )}
+
+                  {valueEntries.length > 0 && (
+                    <Box sx={{ mb: 1.5 }}>
+                      <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                        Will be pushed to <code>column.description</code> + Entity Matching enabled:
+                      </Typography>
+                      {renderEntries(valueEntries, (r) => (
+                        <Typography variant="body2">
+                          <code style={{ fontSize: 12 }}>{r.column_fqn || <em style={{ color: "#c62828" }}>(no column picked)</em>}</code>
+                          {r.column_value && <> value <code style={{ fontSize: 12 }}>'{r.column_value}'</code></>}
+                          {" ← "}
+                          {r.synonyms.length > 0
+                            ? r.synonyms.map((s: string, i: number) => <code key={i} style={{ fontSize: 12, marginRight: 4 }}>"{s}"</code>)
+                            : <em style={{ color: "#999" }}>(no synonyms in S2 vocab)</em>}
+                          {" "}<span style={{ color: "#999" }}>(from "{r.term}")</span>
+                        </Typography>
+                      ))}
+                    </Box>
+                  )}
+
+                  {generalEntries.length > 0 && (
+                    <Box>
+                      <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                        Will appear in the space's <code>General Instructions</code>:
+                      </Typography>
+                      {renderEntries(generalEntries, (r) => (
+                        <Typography variant="body2">
+                          <strong>{r.term}</strong>
+                          {" → "}
+                          {r.synonyms.length > 0
+                            ? r.synonyms.map((s: string, i: number) => <code key={i} style={{ fontSize: 12, marginRight: 4 }}>"{s}"</code>)
+                            : <em style={{ color: "#999" }}>(no synonyms in S2 vocab)</em>}
+                          <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
+                            (auto-pre-filled in the Text Instructions section below — you can edit the phrasing)
+                          </Typography>
+                        </Typography>
+                      ))}
+                    </Box>
+                  )}
+                </Box>
+              );
+            })()}
           </AccordionDetails>
         </Accordion>
       ) : (
