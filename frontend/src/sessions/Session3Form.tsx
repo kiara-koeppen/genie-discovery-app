@@ -527,11 +527,11 @@ export default function Session3Form({
                           <TableRow sx={{ bgcolor: "action.hover" }}>
                             <TableCell colSpan={4} sx={{ py: 1.5, borderTop: "none" }}>
                               <Stack direction="column" spacing={1.5} sx={{ pl: 2 }}>
-                                <Stack direction="row" alignItems="center" spacing={1}>
+                                <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap">
                                   <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", minWidth: 120 }}>
                                     Synonym for:
                                   </Typography>
-                                  <FormControl size="small" sx={{ minWidth: 240 }} disabled={readOnly}>
+                                  <FormControl size="small" sx={{ minWidth: 220 }} disabled={readOnly}>
                                     <Select
                                       value={target.kind}
                                       onChange={(e) =>
@@ -540,9 +540,9 @@ export default function Session3Form({
                                         })
                                       }
                                     >
-                                      <MenuItem value="column">A column name — the column itself goes by this synonym (lands in the column's Synonyms field)</MenuItem>
-                                      <MenuItem value="value">A value in a column — a specific value in the column goes by this synonym (lands in the column's Description)</MenuItem>
-                                      <MenuItem value="cross_cutting">A general space term — applies to the whole space, not a specific column (lands in the space's General Instructions)</MenuItem>
+                                      <MenuItem value="column">A column name</MenuItem>
+                                      <MenuItem value="value">A value in a column</MenuItem>
+                                      <MenuItem value="cross_cutting">A general space term</MenuItem>
                                     </Select>
                                   </FormControl>
                                   {targetIncomplete && (
@@ -554,9 +554,20 @@ export default function Session3Form({
                                     />
                                   )}
                                 </Stack>
+                                {/* Single dynamic helper line explains both what this kind means
+                                    AND where the synonym lands at push. Keeps the dropdown options
+                                    short so they don't overflow the row width. */}
+                                <Typography variant="caption" color="text.secondary" sx={{ pl: 15, mt: -0.5 }}>
+                                  {target.kind === "column" &&
+                                    "The column itself goes by this synonym. Lands in the column's Synonyms field at push."}
+                                  {target.kind === "value" &&
+                                    "A specific value in the column goes by this synonym. Lands in the column's Description at push (and enables Entity Matching on the column)."}
+                                  {target.kind === "cross_cutting" &&
+                                    "Not tied to any column — just team vocabulary. Lands in the space's General Instructions at push."}
+                                </Typography>
                                 {(target.kind === "column" || target.kind === "value") && (
-                                  <Stack direction="row" alignItems="center" spacing={1}>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", minWidth: 120 }}>
+                                  <Stack direction="row" alignItems="flex-start" spacing={1} flexWrap="wrap">
+                                    <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", minWidth: 120, pt: 1 }}>
                                       Target column:
                                     </Typography>
                                     <UCColumnPicker
@@ -569,31 +580,28 @@ export default function Session3Form({
                                   </Stack>
                                 )}
                                 {target.kind === "value" && (
-                                  <Stack direction="row" alignItems="center" spacing={1}>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", minWidth: 120 }}>
-                                      Column value:
-                                    </Typography>
-                                    <TextField
-                                      size="small"
-                                      placeholder="e.g. CANCELLED"
-                                      value={target.column_value || ""}
-                                      onChange={(e) =>
-                                        handleSynonymTarget(v.business_term, {
-                                          column_value: e.target.value,
-                                        })
-                                      }
-                                      disabled={readOnly}
-                                      sx={{ minWidth: 220 }}
-                                    />
-                                    <Typography variant="caption" color="text.secondary">
-                                      The specific value the synonyms refer to (e.g. "{(v.synonyms || "").split(",")[0]?.trim() || "voided"}" is another name for value "CANCELLED").
+                                  <Stack direction="column" spacing={0.5}>
+                                    <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap">
+                                      <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", minWidth: 120 }}>
+                                        Column value:
+                                      </Typography>
+                                      <TextField
+                                        size="small"
+                                        placeholder="e.g. CANCELLED"
+                                        value={target.column_value || ""}
+                                        onChange={(e) =>
+                                          handleSynonymTarget(v.business_term, {
+                                            column_value: e.target.value,
+                                          })
+                                        }
+                                        disabled={readOnly}
+                                        sx={{ minWidth: 220 }}
+                                      />
+                                    </Stack>
+                                    <Typography variant="caption" color="text.secondary" sx={{ pl: 15 }}>
+                                      The specific value the synonyms refer to.
                                     </Typography>
                                   </Stack>
-                                )}
-                                {target.kind === "cross_cutting" && (
-                                  <Typography variant="caption" color="text.secondary" sx={{ pl: 15 }}>
-                                    No column needed. This term and its synonyms will be added to the space's General Instructions at Session 5 push.
-                                  </Typography>
                                 )}
                               </Stack>
                             </TableCell>
