@@ -12,6 +12,8 @@ import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudSyncIcon from "@mui/icons-material/CloudSync";
 import CloudOffIcon from "@mui/icons-material/CloudOff";
+import UploadFileIcon from "@mui/icons-material/UploadFile";
+import DownloadIcon from "@mui/icons-material/Download";
 import { api } from "../api";
 import Session1Form from "../sessions/Session1Form";
 import Session2Form from "../sessions/Session2Form";
@@ -19,6 +21,8 @@ import Session3Form from "../sessions/Session3Form";
 import Session4Form from "../sessions/Session4Form";
 import Session5Form from "../sessions/Session5Form";
 import Session6Form from "../sessions/Session6Form";
+import PreworkUploadModal from "../components/PreworkUploadModal";
+import SectionToc from "../components/SectionToc";
 
 const SESSION_LABELS = [
   "1: Business Context",
@@ -70,6 +74,7 @@ export default function Engagement({ readOnly = false }: Props) {
   // gets full access (COE wins).
   const isBoOnly = isBoMember && !isCoeMember;
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+  const [preworkOpen, setPreworkOpen] = useState(false);
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const skipNextAutosave = useRef(true);
   // Last-known updated_at for the engagement, used as an If-Match optimistic-
@@ -405,6 +410,34 @@ export default function Engagement({ readOnly = false }: Props) {
         )}
         <Box sx={{ flexGrow: 1 }} />
         {renderSaveIndicator()}
+        {!readOnly && (
+          <>
+            <Tooltip title="Download the BO pre-work Excel template to send to your business owner">
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={<DownloadIcon />}
+                component="a"
+                href={api.preworkTemplateUrl}
+                download
+                sx={{ mr: 0.5 }}
+              >
+                Download Template
+              </Button>
+            </Tooltip>
+            <Tooltip title="Upload a filled-in BO pre-work .xlsx to populate Sessions 1 & 2">
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={<UploadFileIcon />}
+                onClick={() => setPreworkOpen(true)}
+                sx={{ mr: 0.5 }}
+              >
+                Upload Pre-Work
+              </Button>
+            </Tooltip>
+          </>
+        )}
         {readOnly && (
           <Chip icon={<LockIcon />} label="Read-Only View" color="info" size="small" />
         )}
@@ -414,6 +447,31 @@ export default function Engagement({ readOnly = false }: Props) {
           color={data.status === "complete" ? "success" : data.status === "in_progress" ? "warning" : "default"}
         />
       </Box>
+
+      {id && (
+        <PreworkUploadModal
+          open={preworkOpen}
+          engagementId={id}
+          currentData={{
+            business_context: (sessionDrafts[1]?.business_context as unknown[]) || [],
+            pain_points: (sessionDrafts[1]?.pain_points as unknown[]) || [],
+            existing_reports: (sessionDrafts[1]?.existing_reports as unknown[]) || [],
+            question_bank: (sessionDrafts[2]?.question_bank as unknown[]) || [],
+            vocabulary_metrics: (sessionDrafts[2]?.vocabulary_metrics as unknown[]) || [],
+          }}
+          ifMatch={updatedAtRef.current}
+          onClose={() => setPreworkOpen(false)}
+          onApplied={(newUpdatedAt, applied) => {
+            updatedAtRef.current = newUpdatedAt;
+            setToast(
+              `Pre-work applied to ${applied.length} section${applied.length === 1 ? "" : "s"}. Reloading…`,
+            );
+            // Reload so the session forms re-render with the new rows. load()
+            // sets skipNextAutosave so this won't trip the autosave timer.
+            load();
+          }}
+        />
+      )}
 
       <Stack
         direction="row"
@@ -440,38 +498,52 @@ export default function Engagement({ readOnly = false }: Props) {
         )}
       </Stack>
 
-      {/* Session Tabs */}
-      <Paper sx={{ mb: 2 }}>
-        <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="fullWidth">
-          {SESSION_LABELS.map((label, i) => {
-            // BO users only see S1, S2, S4. S3, S5, S6 are hidden entirely
-            // (not just locked) so they don't see technical-design / configure-
-            // space / prototype-review surfaces.
-            if (isBoOnly && (i === 2 || i === 4 || i === 5)) return null;
-            const locked = (i === 4 || i === 5) && !isApproved;
-            return (
-              <Tab
-                key={i}
-                value={i}
-                label={
-                  locked ? (
-                    <Tooltip title="Requires COE approval">
-                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, opacity: 0.5 }}>
-                        <LockIcon sx={{ fontSize: 14 }} />
-                        {label}
-                      </Box>
-                    </Tooltip>
-                  ) : label
-                }
-                disabled={locked}
-              />
-            );
-          })}
-        </Tabs>
-      </Paper>
+      {/* Floating section nav + main content. The toc sticks on scroll
+          (hidden below md) so users can jump between sessions or in-page
+          accordion sub-sections without scrolling back to the top tabs. */}
+      <Box sx={{ display: "flex", gap: 2, alignItems: "flex-start" }}>
+        <SectionToc
+          currentSession={tab}
+          onSessionChange={(idx) => setTab(idx)}
+          visibleSessions={
+            isBoOnly ? [0, 1, 3] : [0, 1, 2, 3, 4, 5]
+          }
+          lockedSessions={isApproved ? [] : [4, 5]}
+        />
 
-      {/* Session Content */}
-      <Box sx={{ mb: 3 }}>
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          {/* Session Tabs */}
+          <Paper sx={{ mb: 2 }}>
+            <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="fullWidth">
+              {SESSION_LABELS.map((label, i) => {
+                // BO users only see S1, S2, S4. S3, S5, S6 are hidden entirely
+                // (not just locked) so they don't see technical-design / configure-
+                // space / prototype-review surfaces.
+                if (isBoOnly && (i === 2 || i === 4 || i === 5)) return null;
+                const locked = (i === 4 || i === 5) && !isApproved;
+                return (
+                  <Tab
+                    key={i}
+                    value={i}
+                    label={
+                      locked ? (
+                        <Tooltip title="Requires COE approval">
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, opacity: 0.5 }}>
+                            <LockIcon sx={{ fontSize: 14 }} />
+                            {label}
+                          </Box>
+                        </Tooltip>
+                      ) : label
+                    }
+                    disabled={locked}
+                  />
+                );
+              })}
+            </Tabs>
+          </Paper>
+
+          {/* Session Content */}
+          <Box sx={{ mb: 3 }}>
         {tab === 0 && (
           <Session1Form
             {...sessionProps(1)}
@@ -485,6 +557,11 @@ export default function Engagement({ readOnly = false }: Props) {
             {...sessionProps(3)}
             session1Data={sessionDrafts[1]}
             session2Data={sessionDrafts[2]}
+            session4Data={sessionDrafts[4]}
+            onChangeSession4={(section, value) => updateDraft(4, section, value)}
+            onChangeSession5={(section, value) => updateDraft(5, section, value)}
+            warehouseId={sessionDrafts[5]?.plan_warehouse_id || ""}
+            isBoOnly={isBoOnly}
             engagementId={id}
             onMetricViewCreated={(ts) => { updatedAtRef.current = ts; }}
           />
@@ -512,21 +589,23 @@ export default function Engagement({ readOnly = false }: Props) {
         {tab === 5 && <Session6Form {...sessionProps(6)} />}
       </Box>
 
-      {/* Save Button — BOs only see it on S1+S2 (the only sections they can write).
-          On S4, BO interactions go through the dedicated BO-Approved PATCH from
-          inside Session4Form, so no full-section save is needed. */}
-      {!readOnly && !(isBoOnly && tab === 3) && (
-        <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 2, mb: 4 }}>
-          <Button
-            variant="contained"
-            size="large"
-            onClick={handleManualSave}
-            disabled={saveStatus === "saving"}
-          >
-            {saveStatus === "saving" ? "Saving..." : `Save Session ${tab + 1}`}
-          </Button>
+          {/* Save Button — BOs only see it on S1+S2 (the only sections they can write).
+              On S4, BO interactions go through the dedicated BO-Approved PATCH from
+              inside Session4Form, so no full-section save is needed. */}
+          {!readOnly && !(isBoOnly && tab === 3) && (
+            <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 2, mb: 4 }}>
+              <Button
+                variant="contained"
+                size="large"
+                onClick={handleManualSave}
+                disabled={saveStatus === "saving"}
+              >
+                {saveStatus === "saving" ? "Saving..." : `Save Session ${tab + 1}`}
+              </Button>
+            </Box>
+          )}
         </Box>
-      )}
+      </Box>
 
       <Snackbar
         open={!!toast}

@@ -104,7 +104,7 @@ export default function Session1Form({
         </Box>
       )}
 
-      <Accordion defaultExpanded>
+      <Accordion id="section-1-business-context" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Business Context Discovery</Typography>
         </AccordionSummary>
@@ -121,7 +121,7 @@ export default function Session1Form({
         </AccordionDetails>
       </Accordion>
 
-      <Accordion defaultExpanded>
+      <Accordion id="section-1-pain-points" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Pain Points</Typography>
         </AccordionSummary>
@@ -139,7 +139,7 @@ export default function Session1Form({
         </AccordionDetails>
       </Accordion>
 
-      <Accordion defaultExpanded>
+      <Accordion id="section-1-existing-reports" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Existing Reports & Data Sources</Typography>
         </AccordionSummary>

@@ -3,13 +3,15 @@ import os
 import random
 import secrets
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import traceback
 import uuid
 from datetime import datetime, timezone
+from io import BytesIO
 
 import requests
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
 from databricks.sdk.service.sql import StatementParameterListItem, StatementState
@@ -812,6 +814,10 @@ def _bo_can_access(method, sub_path):
         return True
     if method == "PATCH" and sub_path == "/benchmarks/bo-approved":
         return True
+    # Pre-work Excel upload: BOs can upload their own filled-in template and
+    # apply it to S1/S2 (the only sessions they have edit rights to anyway).
+    if method == "POST" and sub_path in ("/parse-prework", "/apply-prework"):
+        return True
     return False
 
 
@@ -1328,6 +1334,495 @@ def save_session_5(eid):
 @app.route("/api/engagements/<eid>/sessions/6", methods=["PUT"])
 def save_session_6(eid):
     return _save_session_response(eid, 6)
+
+
+# ---------------------------------------------------------------------------
+# API: Business Owner Pre-Work Excel Upload
+# ---------------------------------------------------------------------------
+# Lets the analyst (or BO) send the BO a .xlsx template before the working
+# session, then upload the filled-in version to populate Sessions 1 and 2.
+#
+# Three endpoints:
+#   GET  /api/template/business-owner-prework.xlsx -- download template
+#   POST /api/engagements/<eid>/parse-prework      -- parse + validate, NO mutation
+#   POST /api/engagements/<eid>/apply-prework      -- atomic write, optimistic lock
+#
+# Apply semantics: each chosen section is REPLACED (not appended). The preview
+# UI shows the diff so the user opts in section-by-section. This makes
+# double-upload idempotent.
+
+PREWORK_TEMPLATE_VERSION = "1.0"
+PREWORK_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+
+# Standard S1 business-context questions. Pre-populated in the template (locked
+# columns) so BOs only write the Notes column. Must stay in sync with
+# Session1Form.tsx's CONTEXT_QUESTIONS.
+_PREWORK_S1_CONTEXT = [
+    ("What does your team do day-to-day?", "Scopes the question universe"),
+    ("What decisions do you make with data?", "Identifies the high-value questions"),
+    ("Who else on your team would use this?", "Sizes the audience and skill range"),
+    ("How do you get ad hoc answers today?", "Reveals the bottleneck Genie solves"),
+]
+
+# Frequency dropdown values; must match Session1Form.tsx's REPORT_COLS select.
+_PREWORK_FREQ_OPTIONS = ["Daily", "Weekly", "Monthly", "Quarterly", "Ad hoc"]
+
+# Per-sheet config drives template generation AND parsing -- single source of
+# truth so the two can't drift. Keys map to session column names.
+_PREWORK_SHEETS = [
+    {
+        "name": "S1 Business Context",
+        "key": "business_context",
+        "session": 1,
+        "headers": ["Question", "Why It Matters", "Your Notes"],
+        "row_keys": ["question", "why_it_matters", "response"],
+        "instruction": ("Answer each question in the 'Your Notes' column. "
+                        "Don't edit the Question or Why It Matters columns."),
+    },
+    {
+        "name": "S1 Pain Points",
+        "key": "pain_points",
+        "session": 1,
+        "headers": ["Pain Point"],
+        "row_keys": ["description"],
+        "instruction": ("List the top frustrations your team has with getting "
+                        "data answers today. One pain point per row."),
+    },
+    {
+        "name": "S1 Existing Reports",
+        "key": "existing_reports",
+        "session": 1,
+        "headers": ["Report/Dashboard Name", "What It Shows", "How Often Used", "Known Issues"],
+        "row_keys": ["report_name", "what_it_shows", "frequency", "known_issues"],
+        "instruction": ("Every report, dashboard, or spreadsheet your team "
+                        "references regularly. 'How Often Used' must be one of: "
+                        "Daily, Weekly, Monthly, Quarterly, Ad hoc."),
+    },
+    {
+        "name": "S2 Question Bank",
+        "key": "question_bank",
+        "session": 2,
+        "headers": ["Question", "Decision It Drives"],
+        "row_keys": ["question_text", "decision_it_drives"],
+        "instruction": ("Real questions your team needs answered. For each, "
+                        "note the decision that question helps you make."),
+    },
+    {
+        # Renamed from "Vocabulary & Metrics" in the app -- BOs were reading
+        # the column labels as a pure glossary and missing that metrics belong
+        # here too. Headers and seeded examples make the dual purpose explicit.
+        "name": "S2 Key Terms & Metrics",
+        "key": "vocabulary_metrics",
+        "session": 2,
+        "headers": ["Business Term or Metric",
+                    "Definition or How It's Calculated",
+                    "Other Names / Synonyms"],
+        "row_keys": ["business_term", "what_they_mean", "synonyms"],
+        "instruction": ("Include BOTH vocabulary (jargon, abbreviations, "
+                        "filter logic) AND metrics (anything with a "
+                        "calculation). If it's a number you report on, it "
+                        "goes here. See the example rows below for both types."),
+    },
+]
+
+
+def _build_prework_template():
+    """Generate the pre-work .xlsx in memory and return a BytesIO.
+
+    Pre-populates S1 Business Context with the standard prompts and seeds the
+    Key Terms & Metrics sheet with three examples (one metric, one vocabulary
+    term, one borderline case) to demonstrate the dual purpose. A hidden
+    `_meta` sheet stores the template version so we can detect outdated
+    uploads at parse time.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    wb = Workbook()
+    ws_inst = wb.active
+    ws_inst.title = "Instructions"
+    ws_inst.column_dimensions["A"].width = 110
+    ws_inst["A1"] = "Genie Discovery — Business Owner Pre-Work"
+    ws_inst["A1"].font = Font(bold=True, size=14)
+    ws_inst["A3"] = ("Your analyst will load this file into the discovery app "
+                     "to populate your engagement before the working session.")
+    overview_lines = [
+        "",
+        "How to use this workbook:",
+        "  1. Fill out each sheet listed in the tabs below.",
+        "  2. Do NOT rename sheets or column headers — the app uses those names to find your answers.",
+        "  3. Leave a row blank if you don't have content for it. Blank rows are skipped.",
+        "  4. Save the file and send it back to your analyst.",
+        "",
+        "Sheets in this workbook:",
+    ]
+    for i, line in enumerate(overview_lines):
+        ws_inst[f"A{4+i}"] = line
+    overview_end = 4 + len(overview_lines)
+    for i, sheet in enumerate(_PREWORK_SHEETS):
+        ws_inst[f"A{overview_end+i}"] = f"  • {sheet['name']}: {sheet['instruction']}"
+        ws_inst[f"A{overview_end+i}"].alignment = Alignment(wrap_text=True, vertical="top")
+        ws_inst.row_dimensions[overview_end + i].height = 45
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFF")
+    instruction_font = Font(italic=True, color="555555")
+
+    for sheet in _PREWORK_SHEETS:
+        ws = wb.create_sheet(sheet["name"])
+        # Row 1: instruction banner spanning all columns
+        n_cols = len(sheet["headers"])
+        ws.cell(row=1, column=1, value=sheet["instruction"]).font = instruction_font
+        if n_cols > 1:
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+        ws.row_dimensions[1].height = 45
+        ws.cell(row=1, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+        # Row 2: header
+        for col_idx, header in enumerate(sheet["headers"], start=1):
+            cell = ws.cell(row=2, column=col_idx, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            ws.column_dimensions[get_column_letter(col_idx)].width = 40
+
+        # Pre-fill standard S1 context questions on rows 3+
+        if sheet["key"] == "business_context":
+            for r_idx, (q, why) in enumerate(_PREWORK_S1_CONTEXT, start=3):
+                ws.cell(row=r_idx, column=1, value=q)
+                ws.cell(row=r_idx, column=2, value=why)
+                # Wrap the static columns so long prompts are readable
+                ws.cell(row=r_idx, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.cell(row=r_idx, column=2).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.row_dimensions[r_idx].height = 40
+
+        # Frequency dropdown on existing_reports' column C
+        if sheet["key"] == "existing_reports":
+            dv = DataValidation(
+                type="list",
+                formula1='"' + ",".join(_PREWORK_FREQ_OPTIONS) + '"',
+                allow_blank=True,
+            )
+            ws.add_data_validation(dv)
+            dv.add("C3:C200")
+
+        # Seed three examples on the Key Terms & Metrics sheet to demonstrate
+        # that BOTH metrics and vocabulary belong here. The parser detects and
+        # skips these rows so they don't import as real data even if the BO
+        # forgets to delete them.
+        if sheet["key"] == "vocabulary_metrics":
+            ws.cell(row=6, column=1, value="↓ EXAMPLES (delete these rows and replace with your own) ↓").font = (
+                Font(italic=True, color="888888", bold=True)
+            )
+            ws.merge_cells(start_row=6, start_column=1, end_row=6, end_column=3)
+            examples = [
+                ("Net Revenue",
+                 "Gross sales minus returns and discounts. This is a METRIC -- include calculation logic.",
+                 "NR, Net Sales"),
+                ("Active Customer",
+                 "Customer with at least one order in the trailing 90 days. METRIC -- definition includes the rule.",
+                 "Active account"),
+                ("SKU",
+                 "Stock-keeping unit; the unique identifier for a product. VOCABULARY -- just the definition.",
+                 "Item ID, Product code"),
+            ]
+            for r_idx, (term, defn, syn) in enumerate(examples, start=7):
+                ws.cell(row=r_idx, column=1, value=term).font = Font(italic=True, color="888888")
+                ws.cell(row=r_idx, column=2, value=defn).font = Font(italic=True, color="888888")
+                ws.cell(row=r_idx, column=3, value=syn).font = Font(italic=True, color="888888")
+                ws.cell(row=r_idx, column=2).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.row_dimensions[r_idx].height = 30
+
+    # Hidden metadata sheet for version detection at parse time
+    meta = wb.create_sheet("_meta")
+    meta["A1"] = "template_version"
+    meta["B1"] = PREWORK_TEMPLATE_VERSION
+    meta["A2"] = "generated_at"
+    meta["B2"] = now_ts()
+    meta.sheet_state = "hidden"
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def _parse_prework_xlsx(file_bytes):
+    """Parse a filled-in pre-work workbook.
+
+    Returns (parsed, warnings, errors, template_version).
+      parsed:   dict keyed by section key with arrays of row-dicts. Empty
+                rows are dropped. Seeded example rows on the Key Terms sheet
+                are detected and skipped.
+      warnings: non-fatal (template version mismatch, unknown frequency value,
+                BO edited a standard S1 question prompt).
+      errors:   fatal (missing sheets, renamed column headers, parse failure).
+      template_version: string from the _meta sheet, "" if absent.
+
+    Strictly read-only; no DB writes. Caller decides whether to apply.
+    """
+    from openpyxl import load_workbook
+
+    warnings = []
+    errors = []
+    parsed = {sheet["key"]: [] for sheet in _PREWORK_SHEETS}
+    template_version = ""
+
+    try:
+        wb = load_workbook(BytesIO(file_bytes), data_only=True)
+    except Exception as e:
+        return parsed, warnings, [f"Could not open file as .xlsx: {e}"], ""
+
+    if "_meta" in wb.sheetnames:
+        try:
+            template_version = str(wb["_meta"]["B1"].value or "").strip()
+        except Exception:
+            template_version = ""
+    if not template_version:
+        warnings.append(
+            "Template version not found in file. This may not have come from "
+            "the app's template -- if you see import problems, download a "
+            "fresh template from the upload dialog."
+        )
+    elif template_version != PREWORK_TEMPLATE_VERSION:
+        warnings.append(
+            f"Template version mismatch (file: {template_version}, current: "
+            f"{PREWORK_TEMPLATE_VERSION}). Some fields may not import "
+            "correctly. Download a fresh template if you see issues."
+        )
+
+    standard_s1_questions = {pair[0] for pair in _PREWORK_S1_CONTEXT}
+
+    for sheet_cfg in _PREWORK_SHEETS:
+        name = sheet_cfg["name"]
+        if name not in wb.sheetnames:
+            errors.append(
+                f"Sheet '{name}' is missing. Don't rename or delete sheets — "
+                "re-download the template if needed."
+            )
+            continue
+        ws = wb[name]
+
+        # Validate header row (row 2). Case-insensitive, whitespace-trimmed.
+        actual = []
+        for col_idx in range(1, len(sheet_cfg["headers"]) + 1):
+            v = ws.cell(row=2, column=col_idx).value
+            actual.append((v or "").strip() if isinstance(v, str) else str(v or "").strip())
+        expected = [h.strip() for h in sheet_cfg["headers"]]
+        if [h.lower() for h in actual] != [h.lower() for h in expected]:
+            errors.append(
+                f"Sheet '{name}' headers don't match. Expected {expected!r}, "
+                f"got {actual!r}. Re-download the template if columns were changed."
+            )
+            continue
+
+        # Identify the seeded-example rows on vocabulary_metrics so we don't
+        # import them. Triggered by an "EXAMPLES" banner in column A; the next
+        # three rows are skipped if they still hold the seeded values.
+        skip_rows = set()
+        if sheet_cfg["key"] == "vocabulary_metrics":
+            for r_idx in range(3, min(ws.max_row, 12) + 1):
+                v = ws.cell(row=r_idx, column=1).value
+                if isinstance(v, str) and "examples" in v.lower() and (
+                    "delete" in v.lower() or "replace" in v.lower()
+                ):
+                    skip_rows.add(r_idx)
+                    skip_rows.update({r_idx + 1, r_idx + 2, r_idx + 3})
+                    break
+
+        for r_idx in range(3, ws.max_row + 1):
+            if r_idx in skip_rows:
+                continue
+            values = []
+            for col_idx in range(1, len(sheet_cfg["row_keys"]) + 1):
+                v = ws.cell(row=r_idx, column=col_idx).value
+                if v is None:
+                    values.append("")
+                elif isinstance(v, str):
+                    values.append(v.strip())
+                else:
+                    values.append(str(v).strip())
+            if not any(values):
+                continue
+            row_dict = dict(zip(sheet_cfg["row_keys"], values))
+
+            if sheet_cfg["key"] == "existing_reports":
+                freq = row_dict.get("frequency", "")
+                if freq and freq not in _PREWORK_FREQ_OPTIONS:
+                    warnings.append(
+                        f"'{name}' row {r_idx}: 'How Often Used' value "
+                        f"'{freq}' isn't one of {_PREWORK_FREQ_OPTIONS}. "
+                        "Imported as-is; you can fix it in the app."
+                    )
+
+            if sheet_cfg["key"] == "business_context":
+                q = row_dict.get("question", "")
+                if q and q not in standard_s1_questions:
+                    warnings.append(
+                        f"'{name}' row {r_idx}: question text differs from "
+                        "the standard prompt. The response will still import."
+                    )
+
+            parsed[sheet_cfg["key"]].append(row_dict)
+
+    return parsed, warnings, errors, template_version
+
+
+def _apply_prework_atomic(eid, sections_to_apply, parsed):
+    """Atomically replace the chosen S1/S2 section columns on an engagement.
+
+    sections_to_apply: iterable of section keys (e.g. {'business_context',
+                       'question_bank'}). Anything not listed is left alone.
+    parsed:            dict from _parse_prework_xlsx, keyed by section key.
+
+    Writes all chosen columns in a single UPDATE so a partial failure can't
+    leave the engagement half-applied. Honors If-Match optimistic lock the
+    same way save_session does. Returns the new updated_at.
+    """
+    _check_optimistic_lock(eid)
+
+    section_to_session = {s["key"]: s["session"] for s in _PREWORK_SHEETS}
+    valid_keys = set(section_to_session.keys())
+    keys = [k for k in sections_to_apply if k in valid_keys]
+    if not keys:
+        return _read_updated_at(eid)
+
+    ts = now_ts()
+    params = {"eid": eid, "ts": ts}
+    set_parts = []
+    for k in keys:
+        set_parts.append(f"{k} = :{k}")
+        params[k] = json.dumps(parsed.get(k, []))
+
+    # Unlock the next tab: advance current_session to one past the highest
+    # touched session, but never go backwards.
+    max_session = max(section_to_session[k] for k in keys)
+    set_parts.append(f"current_session = GREATEST(current_session, {max_session + 1})")
+    set_parts.append(
+        "status = CASE WHEN status = 'complete' THEN 'complete' ELSE 'in_progress' END"
+    )
+    set_parts.append("updated_at = :ts")
+
+    sql_run(
+        f"UPDATE {TABLE} SET {', '.join(set_parts)} WHERE engagement_id = :eid",
+        params,
+    )
+    return _read_updated_at(eid)
+
+
+@app.route("/api/template/business-owner-prework.xlsx", methods=["GET"])
+def download_prework_template():
+    """Stream the BO pre-work .xlsx template. Generated fresh per request so
+    we never ship a stale binary."""
+    try:
+        buf = _build_prework_template()
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to build template: {e}"}), 500
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="genie-discovery-bo-prework.xlsx",
+    )
+
+
+@app.route("/api/engagements/<eid>/parse-prework", methods=["POST"])
+def parse_prework(eid):
+    """Parse an uploaded pre-work .xlsx and return a preview WITHOUT mutating.
+
+    multipart/form-data, field name `file`. Returns:
+      { template_version, warnings: [...], errors: [...],
+        preview: { section_key: [row_dict, ...] } }
+
+    If `errors` is non-empty the client must show them and block apply.
+    `warnings` are non-fatal and shown alongside the preview.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded. Use the 'file' form field."}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "No filename in upload."}), 400
+    if not f.filename.lower().endswith(".xlsx"):
+        return jsonify({
+            "error": f"File must be a .xlsx workbook (got '{f.filename}'). "
+                     "Re-save the file as .xlsx and try again."
+        }), 400
+    raw = f.read()
+    if len(raw) > PREWORK_MAX_BYTES:
+        return jsonify({
+            "error": f"File too large ({len(raw)} bytes). Max is {PREWORK_MAX_BYTES} bytes."
+        }), 413
+    if len(raw) < 100:
+        return jsonify({"error": "File appears empty or truncated."}), 400
+    # .xlsx is a zip; magic bytes catch the "wrong format saved with right extension" case
+    if not raw.startswith(b"PK\x03\x04"):
+        return jsonify({
+            "error": "File is not a valid .xlsx (zip signature missing). "
+                     "It may have been saved as .xls or .csv with the wrong extension."
+        }), 400
+
+    parsed, warnings, errors, version = _parse_prework_xlsx(raw)
+    return jsonify({
+        "template_version": version,
+        "warnings": warnings,
+        "errors": errors,
+        "preview": parsed,
+    })
+
+
+@app.route("/api/engagements/<eid>/apply-prework", methods=["POST"])
+def apply_prework(eid):
+    """Atomically apply parsed pre-work to an engagement.
+
+    Body: { sections: [section_key, ...], data: {section_key: [row_dict, ...]} }
+    The client sends back the data it parsed plus the sections the user opted
+    to apply (per-section checkboxes in the preview). Honors If-Match for
+    optimistic locking; returns 409 on stale.
+    """
+    payload = request.get_json(silent=True) or {}
+    sections = payload.get("sections") or []
+    data = payload.get("data") or {}
+    if not isinstance(sections, list) or not isinstance(data, dict):
+        return jsonify({"error": "Body must be {sections: [...], data: {...}}"}), 400
+
+    valid_keys = {s["key"] for s in _PREWORK_SHEETS}
+    sections_set = {s for s in sections if s in valid_keys}
+    if not sections_set:
+        return jsonify({"error": "No valid sections selected to apply."}), 400
+
+    # Defensive normalization: only keep recognized row keys per section so a
+    # crafted payload can't smuggle extra columns into the DB write. Strip and
+    # coerce-to-str so we never serialize an unexpected type.
+    normalized = {}
+    for s_cfg in _PREWORK_SHEETS:
+        k = s_cfg["key"]
+        if k not in sections_set:
+            continue
+        rows = data.get(k) or []
+        if not isinstance(rows, list):
+            return jsonify({"error": f"data.{k} must be a list."}), 400
+        normalized[k] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            clean = {rk: str(r.get(rk) or "").strip() for rk in s_cfg["row_keys"]}
+            if any(clean.values()):
+                normalized[k].append(clean)
+
+    try:
+        ts = _apply_prework_atomic(eid, sections_set, normalized)
+    except StaleEngagementError as e:
+        return jsonify({
+            "error": "stale",
+            "current_updated_at": e.current_updated_at,
+            "message": "This engagement was updated by another user. Refresh to continue.",
+        }), 409
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"success": True, "updated_at": ts, "applied": sorted(sections_set)})
 
 
 # ---------------------------------------------------------------------------
@@ -1989,9 +2484,14 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
         lines.append(f"- {item}: {s.get('notes','')}")
     lines.append("")
 
-    lines.append("## Session 4: COE-Approved Data Plan")
+    # Data plan was originally authored in S4 ("COE-Approved Data Plan"); as
+    # of the S3 redesign it's authored in Session 3's Data Sources panel and
+    # COE just reviews it during S4. The underlying field still lives in S4's
+    # column set, but the heading below reflects the new flow so the LLM
+    # doesn't infer a different review stage.
+    lines.append("## Data Plan (authored in Session 3, reviewed in Session 4)")
     if s4.get("analyst_commentary"):
-        lines.append(f"### Analyst Commentary\n{s4.get('analyst_commentary','')}")
+        lines.append(f"### Session 4 Analyst Commentary\n{s4.get('analyst_commentary','')}")
     lines.append("### Tables & Views in scope")
     for d in s4.get("data_plan", []):
         if d.get("include_in_space") == "Yes":
@@ -2104,12 +2604,102 @@ These are the ACTUAL columns that exist on each in-scope table (from UC DESCRIBE
 </table_schemas>
 """
 
+    # ----- Classified synonyms block -----
+    # In Session 3, the analyst classifies each business term and, for terms
+    # marked as Synonym, specifies whether the synonym is a column-level alias
+    # (e.g. "acct_id" is another name for `customer_id`), a value-level alias
+    # (e.g. "voided" is another name for `status = 'CANCELLED'`), or a
+    # cross-cutting team term with no specific column. The S5 prompt needs
+    # this routing so it doesn't dump column synonyms into general_instructions
+    # — they belong on the column itself via Genie's column_configs surface.
+    # Unset synonym_target falls back to cross_cutting for backward compat with
+    # engagements classified before this routing existed.
+    column_syns, value_syns, cross_syns = [], [], []
+    s2_vocab_by_term = {
+        (v.get("business_term") or "").strip(): v
+        for v in (s2.get("vocabulary_metrics") or [])
+        if isinstance(v, dict) and (v.get("business_term") or "").strip()
+    }
+    for c in (s3.get("term_classifications") or []):
+        if not isinstance(c, dict):
+            continue
+        term = (c.get("business_term") or "").strip()
+        types = c.get("types") or []
+        if not term or "Synonym" not in types:
+            continue
+        vocab = s2_vocab_by_term.get(term)
+        synonyms_raw = (vocab.get("synonyms") if vocab else "") or ""
+        synonyms_list = [s.strip() for s in synonyms_raw.split(",") if s.strip()]
+        if not synonyms_list:
+            continue
+        target = c.get("synonym_target") or {}
+        kind = (target.get("kind") or "cross_cutting").strip().lower()
+        col_fqn = (target.get("column_fqn") or "").strip()
+        col_value = (target.get("column_value") or "").strip()
+        if kind == "column" and col_fqn:
+            column_syns.append((term, synonyms_list, col_fqn))
+        elif kind == "value" and col_fqn and col_value:
+            value_syns.append((term, synonyms_list, col_fqn, col_value))
+        else:
+            # Cross-cutting OR incomplete column/value rows (no target picked
+            # yet). Fall back to cross_cutting so the LLM has something to
+            # work with rather than silently dropping the term.
+            cross_syns.append((term, synonyms_list))
+
+    synonyms_block = ""
+    if column_syns or value_syns or cross_syns:
+        parts = []
+        if column_syns:
+            sub = ["### Column-level synonyms (alternate names for a SPECIFIC COLUMN)"]
+            sub.append("These are AUTO-PUSHED to Genie's column_configs.synonyms at push time. Do NOT")
+            sub.append("emit them in general_instructions or sql_expressions synonyms. Surface them")
+            sub.append("in `narrative` as a manifest line under \"Pushed to column_configs:\" so the")
+            sub.append("analyst sees what got attached to which column.")
+            for term, syns, fqn in column_syns:
+                joined_syns = ", ".join(f'"{s}"' for s in syns)
+                sub.append(f"- `{fqn}` — also called: {joined_syns} (canonical term: \"{term}\")")
+            parts.append("\n".join(sub))
+        if value_syns:
+            sub = ["### Value-level synonyms (alternate names for a SPECIFIC VALUE in a column)"]
+            sub.append("These are AUTO-PUSHED at push time as (1) a description line on the column")
+            sub.append("mapping value → aliases, and (2) enable_entity_matching=true on the column")
+            sub.append("(Genie's supported way to handle value-level matching). Do NOT emit them in")
+            sub.append("general_instructions or sql_expressions. Surface them in `narrative` under")
+            sub.append("\"Pushed to column_configs:\" as a record of what got attached.")
+            for term, syns, fqn, val in value_syns:
+                joined_syns = ", ".join(f'"{s}"' for s in syns)
+                sub.append(
+                    f"- `{fqn}` value `'{val}'` — also called: {joined_syns} "
+                    f"(canonical term: \"{term}\")"
+                )
+            parts.append("\n".join(sub))
+        if cross_syns:
+            sub = ["### Cross-cutting synonyms (no specific column — OK in general_instructions)"]
+            sub.append("These are space-level team jargon with no specific column target. They MAY")
+            sub.append("be included in general_instructions if they don't fit any other surface.")
+            sub.append("Keep them tight; one bullet per term.")
+            for term, syns in cross_syns:
+                joined_syns = ", ".join(f'"{s}"' for s in syns)
+                sub.append(f"- \"{term}\" — also called: {joined_syns}")
+            parts.append("\n".join(sub))
+        joined = "\n\n".join(parts)
+        synonyms_block = f"""
+<classified_synonyms>
+The analyst classified each Synonym term in Session 3 with a routing target.
+Column- and value-level synonyms in this block are AUTO-PUSHED to Genie's
+column_configs at push time (no manual UI action needed). Use this block as
+the authoritative routing source — do NOT re-derive from the raw vocab list
+above.
+{joined}
+</classified_synonyms>
+"""
+
     prompt = f"""You are a Databricks Genie Space configuration expert. An analyst just completed 4 sessions of discovery with a business owner. Use this discovery to populate every instruction surface Genie supports.
 
 <discovery_data>
 {discovery}
 </discovery_data>
-{mv_block}{schemas_block}{gold_block}{benchmarks_block}
+{mv_block}{schemas_block}{synonyms_block}{gold_block}{benchmarks_block}
 Genie Space instruction surfaces (in order of preference per Databricks best practices):
 1. SQL Expressions (Filters / Dimensions / Measures) — reusable business concepts attached to a table
 2. Example SQL queries — full SQL for complex or frequent questions
@@ -2117,15 +2707,32 @@ Genie Space instruction surfaces (in order of preference per Databricks best pra
 
 A single high-quality SQL example teaches Genie more than 20 lines of text instruction. Push logic INTO the data where you can; use text instructions only for things that cannot be expressed as SQL.
 
+Global budgets (per Databricks Genie best practices):
+- TOTAL knowledge-store snippets (sql_filters + sql_dimensions + sql_measures + example_queries combined) MUST stay under 200. Genie enforces this cap. Prefer fewer, higher-quality snippets.
+- Aim for ≤ 5 tables in active focus. If the data plan includes more, still emit snippets that span them, but keep example_queries concentrated on the ≤ 5 most-used tables.
+
 Produce a JSON object with exactly these fields:
 
-1. "general_instructions" (string): Short bulleted text (~400-800 chars, 15 bullets max) that will be the space's ONLY text_instruction. Include ONLY:
-   - Space scope/purpose (1 bullet)
-   - Business-jargon → data mappings not captured as SQL expressions
-   - Global response/formatting standards (date format, rounding, required columns)
-   - Clarification triggers ("if user asks X without a date range, ask them to specify")
-   - Terminology synonyms not captured elsewhere
-   Do NOT restate metric definitions — those belong in sql_measures. Do NOT describe table/column semantics — those belong in UC descriptions. Use short atomic bullets starting with "- ". No markdown headers.
+1. "general_instructions" (string): Short bulleted text (~400-800 chars, 15 bullets max) that will be the space's ONLY text_instruction. Include ONLY content that CANNOT live in a more specific surface. Use these structured sub-buckets, each prefixed by a one-line header bullet:
+
+   - Scope: 1 bullet — what this space answers and who it's for.
+   - Out-of-scope: 1-2 bullets — topics Genie should refuse or hand off.
+   - Global response standards: date format, rounding, required columns, time-zone, default ordering.
+   - Clarification triggers: each as a single bullet using this exact pattern: "When <user_condition> AND <missing_info>, ask: <clarification_question>". Example: "When user asks about revenue AND no date range is specified, ask: which fiscal period (e.g. last quarter, YTD, or a custom range)?"
+   - Summaries: optional 1-2 bullets prefixed with "Summary:" that constrain how Genie phrases its prose answers (e.g. "Summary: always show totals as a single sentence with the metric name, the number formatted with thousands separators, and the period."). Only TEXT instructions affect summaries — SQL expressions and example queries do not. Include this bucket only if the analyst commentary specifies a response style.
+
+   Synonym routing (see <classified_synonyms> block above for the authoritative list):
+   - Cross-cutting synonyms (kind="cross_cutting") MAY be included as bullets here. Keep them tight.
+   - Column-level synonyms (kind="column") MUST NOT be in general_instructions. They belong on the column via column_configs — surface them in `narrative` as a TODO instead.
+   - Value-level synonyms (kind="value") MUST NOT be in general_instructions. They belong as entity matching on the column — surface them in `narrative` as a TODO instead.
+
+   STRICT EXCLUSIONS — do NOT put any of these in general_instructions:
+   - Metric definitions / formulas → those go in sql_measures with synonyms attached to the measure itself.
+   - Column-level or value-level synonyms (see Synonym routing above) → narrative TODO, not text instructions.
+   - Table/column semantics → those belong in UC table/column descriptions.
+   - Duplicates of sql_filters / sql_dimensions / sql_measures / example_queries — every fact should live in exactly one surface; conflicting guidance across surfaces degrades quality.
+
+   Use short atomic bullets starting with "- ". No markdown headers.
 
 2. "sample_questions" (array of 5-8 strings): Curated, reworded sample questions from the question bank. Clear, natural phrasing, covering main use cases. Shown to users when they open the space.
 
@@ -2139,7 +2746,19 @@ IMPORTANT SQL qualification rule for snippets below: Genie infers the table from
 
 6. "example_queries" (array, 3-6 items): Full SQL examples for complex/common questions from the question bank. Each: {{"question": "...", "sql": "...", "draft": true, "usage_guidance": "..."}}. SQL MUST use fully qualified `catalog.schema.table` references because example queries are standalone. Only include questions where you can write reasonably confident SQL given the tables in scope — skip speculative ones. Always set "draft": true so analyst reviews.
 
-7. "narrative" (string): 2-4 sentences explaining what this space does, who it serves, and what was configured. Shown to the analyst before push.
+   Trusted Assets tip: for the 1-3 highest-value recurring questions (the ones a BO will ask repeatedly with different parameters), write the SQL using `:param_name` placeholders (e.g. `WHERE orders.region = :region`) and note this in usage_guidance. When Genie matches the exact parameterized template, the response is labeled "Trusted" — a major reliability signal. Only do this for questions where you can confidently parameterize; don't force it.
+
+7. "narrative" (string): 3-5 sentences for the analyst review screen plus an optional Pushed-to-column-configs manifest. MUST include:
+   - What this space answers (one-line space purpose).
+   - Target audience (which roles/teams will use it).
+   - Out-of-scope topics (what it intentionally won't cover — pulled from Session 3 Scope Boundaries).
+   - What was configured (high-level count summary: N measures, M filters, K example queries).
+   - One sentence on KNOWN gaps the analyst should review before push (data gaps, low confidence example_queries, missing benchmarks).
+
+   If <classified_synonyms> contains column-level or value-level synonyms, end the narrative with a "Pushed to column_configs at push time:" line followed by a markdown bulleted list — one bullet per pushed mapping. Format examples:
+   - "Column synonyms on `catalog.schema.table.column_name`: \"alt_name_1\", \"alt_name_2\""
+   - "Entity matching + value-description on `catalog.schema.table.status` for value 'CANCELLED': \"voided\", \"killed\""
+   These are AUTO-PUSHED — analyst doesn't need to set them in the Genie UI manually. The manifest is just a record so the analyst can verify the right metadata landed on the right columns. If <classified_synonyms> has no column/value entries, omit this section entirely.
 
 Return ONLY the JSON object. No markdown fences, no preamble, no trailing commentary. Begin with {{ and end with }}."""
 
@@ -3171,27 +3790,40 @@ def run_benchmark_sql(eid):
 # ---------------------------------------------------------------------------
 
 def _fetch_metric_view_definition(fqn, user_w=None, warehouse_id=None):
-    """Return the live UC definition of a Metric View as a string (DDL / YAML).
+    """Return the live UC YAML definition of a Metric View.
 
-    Uses SHOW CREATE TABLE under OBO so we inherit the user's UC grants. This
-    is the source of truth — the YAML stored in Session 3 could be stale or
-    absent if the analyst pointed at a pre-existing MV.
+    Uses the UC tables REST endpoint under OBO (so the user's UC grants
+    apply) and returns the `view_definition` field — the metric view's
+    YAML body.
+
+    Previously used SHOW CREATE TABLE, which silently fails on metric views
+    in current DBR with UNSUPPORTED_SHOW_CREATE_TABLE.ON_METRIC_VIEW. That
+    failure caused the S5 plan prompt's <metric_view_definitions> block to
+    be empty for any engagement that referenced an MV, so the LLM had no
+    way to see what the MV already covered and would re-author measures
+    that already existed.
+
+    `warehouse_id` is accepted for backwards compatibility with the call
+    site but is no longer used — the REST API doesn't need a warehouse.
     """
     parts = fqn.split(".")
-    if len(parts) != 3 or not (user_w and warehouse_id):
+    if len(parts) != 3 or not user_w:
         return ""
-    stmt = f"SHOW CREATE TABLE `{parts[0]}`.`{parts[1]}`.`{parts[2]}`"
+    url = f"{user_w.config.host.rstrip('/')}/api/2.1/unity-catalog/tables/{fqn}"
     try:
-        resp = user_w.statement_execution.execute_statement(
-            warehouse_id=warehouse_id, statement=stmt,
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {user_w.config.token}"},
+            timeout=30,
         )
-        state = str(resp.status.state) if resp.status else ""
-        if "SUCCEEDED" not in state or not resp.result or not resp.result.data_array:
-            print(f"[mv-fetch] {fqn}: state={state}", flush=True)
+        if not resp.ok:
+            print(f"[mv-fetch] {fqn}: {resp.status_code} {resp.text[:200]}", flush=True)
             return ""
-        # SHOW CREATE TABLE returns a single row with a single column (createtab_stmt).
-        row = resp.result.data_array[0]
-        return str(row[0]) if row else ""
+        body = resp.json()
+        # `view_definition` holds the YAML body for metric views. For a
+        # regular table or non-MV view, it'll be absent or empty -- that's
+        # fine, the caller treats "" as "no MV definition available."
+        return body.get("view_definition") or ""
     except Exception as e:
         print(f"[mv-fetch] {fqn} failed: {type(e).__name__}: {e}", flush=True)
         return ""
@@ -3954,6 +4586,107 @@ def _build_serialized_space(eng, plan):
     tables.sort(key=lambda x: x["identifier"])
     metric_views.sort(key=lambda x: x["identifier"])
 
+    # ----- Phase 2: Column-level synonyms from Session 3 classifications -----
+    # Build column_configs entries for any term classified as Synonym with a
+    # column- or value-level target. Verified ColumnConfig schema fields
+    # (proto: databricks.datarooms.export.ColumnConfig):
+    #   column_name, description (string[]), display_name, synonyms (string[]),
+    #   enable_format_assistance (bool), enable_entity_matching (bool)
+    # Cross-cutting synonyms are NOT pushed here -- they flow to
+    # general_instructions via the S5 LLM plan.
+    #
+    # NOTE: this overwrites any column_configs the user has set in the Genie
+    # UI for the columns we touch (the push is destructive by design;
+    # serialized_space PATCHes replace-not-merge). Columns we don't touch are
+    # not affected because tables are rebuilt from the data plan each push.
+    s3 = eng["sessions"]["3"]
+    s2 = eng["sessions"]["2"]
+    s2_vocab_by_term = {
+        (v.get("business_term") or "").strip(): v
+        for v in (s2.get("vocabulary_metrics") or [])
+        if isinstance(v, dict) and (v.get("business_term") or "").strip()
+    }
+    # FQN of in-scope tables (the ones we just built) -- column_configs are only
+    # honored when the parent table is in data_sources.tables[]. If an analyst
+    # mapped a synonym to a column in a table that isn't in the data plan, we
+    # silently skip it (the S5 plan's narrative TODO will still surface it for
+    # manual review).
+    table_fqns_in_scope = {t["identifier"] for t in tables}
+
+    # column_configs accumulator: {table_fqn: {column_name: {field: value}}}
+    cc_by_table = {}
+    for c in (s3.get("term_classifications") or []):
+        if not isinstance(c, dict):
+            continue
+        term = (c.get("business_term") or "").strip()
+        types = c.get("types") or []
+        if not term or "Synonym" not in types:
+            continue
+        target = c.get("synonym_target") or {}
+        kind = (target.get("kind") or "cross_cutting").strip().lower()
+        if kind not in ("column", "value"):
+            continue  # cross_cutting handled via general_instructions
+        fqn = (target.get("column_fqn") or "").strip()
+        parts = fqn.split(".")
+        if len(parts) != 4:
+            continue  # malformed FQN (need catalog.schema.table.column)
+        table_fqn = ".".join(parts[:3])
+        column_name = parts[3]
+        if table_fqn not in table_fqns_in_scope:
+            continue  # column's table isn't in the data plan; skip
+
+        vocab = s2_vocab_by_term.get(term)
+        raw_syns = (vocab.get("synonyms") if vocab else "") or ""
+        syns_list = [s.strip() for s in raw_syns.split(",") if s.strip()]
+        if not syns_list:
+            continue
+
+        cc_by_table.setdefault(table_fqn, {})
+        cc = cc_by_table[table_fqn].setdefault(column_name, {"column_name": column_name})
+
+        if kind == "column":
+            # Merge into the column's synonym list (deduped, preserving order)
+            existing = cc.get("synonyms") or []
+            for s in syns_list + [term]:
+                if s and s != column_name and s not in existing:
+                    existing.append(s)
+            if existing:
+                cc["synonyms"] = existing
+        elif kind == "value":
+            # Value-level: append a description line mapping value -> aliases,
+            # and enable entity_matching so Genie can match user phrasings to
+            # values automatically. We don't push value synonyms structurally
+            # because Genie's column_configs schema has no value-aliases field
+            # -- description text + entity_matching toggle is the supported
+            # mechanism.
+            col_value = (target.get("column_value") or "").strip()
+            if not col_value:
+                continue
+            # The canonical term IS an alias for the value (just like the S2
+            # synonyms are). Include it first, dedupe.
+            all_aliases = []
+            for s in [term] + syns_list:
+                s = (s or "").strip()
+                if s and s not in all_aliases:
+                    all_aliases.append(s)
+            joined = ", ".join(f'"{s}"' for s in all_aliases)
+            line = f"Value '{col_value}' is also referred to as: {joined}."
+            desc = cc.get("description") or []
+            if line not in desc:
+                desc.append(line)
+            cc["description"] = desc
+            cc["enable_entity_matching"] = True
+
+    # Attach the accumulated column_configs to the matching table entries
+    if cc_by_table:
+        for entry in tables:
+            cc_map = cc_by_table.get(entry["identifier"])
+            if not cc_map:
+                continue
+            entry["column_configs"] = sorted(
+                cc_map.values(), key=lambda c: c["column_name"]
+            )
+
     # Sample questions
     sq_entries = [{"id": _gen_hex_id(), "question": [q]} for q in sample_questions if q]
     sq_entries.sort(key=lambda x: x["id"])
@@ -4330,7 +5063,13 @@ def uc_joins():
 
 @app.route("/api/uc/metric-views")
 def uc_metric_views():
-    """Detect existing metric views in a catalog.schema via OBO tables.list()."""
+    """Detect existing metric views in a catalog.schema.
+
+    Uses the UC tables REST list endpoint (not the SDK's tables.list)
+    because databricks-sdk 0.44.0 returns METRIC_VIEW as TableType.MANAGED
+    in TableInfo -- the enum value was added in a later SDK version. REST
+    response carries table_type as a string, so the filter works.
+    """
     user_w, err = _require_obo()
     if err:
         return err
@@ -4339,17 +5078,365 @@ def uc_metric_views():
         return jsonify([])
     cat, sch = catalog_schema.split(".", 1)
     try:
-        tables = list(user_w.tables.list(catalog_name=cat, schema_name=sch))
+        r = requests.get(
+            f"{user_w.config.host.rstrip('/')}/api/2.1/unity-catalog/tables",
+            params={"catalog_name": cat, "schema_name": sch, "max_results": 200},
+            headers={"Authorization": f"Bearer {user_w.config.token}"},
+            timeout=15,
+        )
+        if not r.ok:
+            print(f"[/api/uc/metric-views] {r.status_code} {r.text[:200]}", flush=True)
+            return jsonify([])
     except Exception as e:
         print(f"[/api/uc/metric-views] {type(e).__name__}: {e}", flush=True)
         return jsonify([])
-    results = []
-    for t in tables:
-        tt = str(getattr(t, "table_type", "") or "").upper()
-        # True UC metric views show up as METRIC_VIEW; plain SQL views are VIEW.
-        if "METRIC_VIEW" in tt and t.name:
-            results.append(f"{cat}.{sch}.{t.name}")
+    results = [
+        f"{cat}.{sch}.{t['name']}"
+        for t in (r.json().get("tables") or [])
+        if t.get("table_type") == "METRIC_VIEW" and t.get("name")
+    ]
     return jsonify(results)
+
+
+@app.route("/api/uc/table-type")
+def uc_table_type():
+    """Return UC's authoritative table_type for a single FQN.
+
+    Used by S3's Data Sources panel: when the analyst picks a name via
+    UCTablePicker, we don't know if it's a managed table, a view, or a
+    metric view -- the picker dropdown lists all of them by name. This
+    lookup tells us how to categorize on Add.
+    """
+    user_w, err = _require_obo()
+    if err:
+        return err
+    fqn = request.args.get("fqn", "")
+    if not fqn or fqn.count(".") != 2:
+        return jsonify({"error": "fqn (3-part) is required"}), 400
+    try:
+        r = requests.get(
+            f"{user_w.config.host.rstrip('/')}/api/2.1/unity-catalog/tables/{fqn}",
+            headers={"Authorization": f"Bearer {user_w.config.token}"},
+            timeout=15,
+        )
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 502
+    if not r.ok:
+        return jsonify({"error": f"{r.status_code}: {r.text[:200]}"}), r.status_code
+    body = r.json()
+    return jsonify({
+        "fqn": fqn,
+        "table_type": body.get("table_type") or "MANAGED",
+        "comment": body.get("comment") or "",
+    })
+
+
+def _list_mvs_in_schema(host, hdrs, cat, sch):
+    """List MV candidate FQNs in a single (catalog, schema) via REST.
+
+    Returns (fqns, error_message) -- error is None on success. The caller
+    surfaces errors in the response so the UI can distinguish "0 MVs in
+    scope" from "couldn't read this schema."
+    """
+    try:
+        r = requests.get(
+            f"{host}/api/2.1/unity-catalog/tables",
+            params={"catalog_name": cat, "schema_name": sch, "max_results": 200},
+            headers=hdrs, timeout=15,
+        )
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    if not r.ok:
+        return [], f"HTTP {r.status_code}: {r.text[:200]}"
+    fqns = [
+        f"{cat}.{sch}.{t['name']}"
+        for t in (r.json().get("tables") or [])
+        if t.get("table_type") == "METRIC_VIEW" and t.get("name")
+    ]
+    return fqns, None
+
+
+def _fetch_mv_dependencies(host, hdrs, fqn):
+    """Return ({fqn metadata + dependencies set}, error_message). The
+    caller filters by the intersect with picked tables. Per-MV REST calls
+    are parallelized in the discovery endpoint via ThreadPoolExecutor."""
+    try:
+        r = requests.get(
+            f"{host}/api/2.1/unity-catalog/tables/{fqn}",
+            headers=hdrs, timeout=15,
+        )
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    if not r.ok:
+        return None, f"HTTP {r.status_code}"
+    body = r.json()
+    deps_raw = (body.get("view_dependencies") or {}).get("dependencies") or []
+    dep_fqns = set()
+    for d in deps_raw:
+        tbl = (d or {}).get("table") or {}
+        fn = tbl.get("table_full_name")
+        if fn:
+            dep_fqns.add(fn)
+    return {
+        "body": body,
+        "dep_fqns": dep_fqns,
+    }, None
+
+
+def _broad_mv_scan(user_w, warehouse_id):
+    """Use system.information_schema.tables to find every metric view
+    visible to the user, regardless of catalog/schema. Catches MVs in
+    personal catalogs that depend on shared source tables -- a common
+    DSA pattern that the per-schema scan misses.
+
+    Returns (fqns, error). On any failure (permission denied, warehouse
+    cold, system table not enabled) returns ([], err) and the caller falls
+    back to per-schema scan.
+    """
+    if not warehouse_id:
+        return [], "no warehouse_id provided"
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id,
+            statement="""
+                SELECT table_catalog || '.' || table_schema || '.' || table_name AS fqn
+                FROM system.information_schema.tables
+                WHERE table_type = 'METRIC_VIEW'
+            """,
+            wait_timeout="30s",
+        )
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    state = ""
+    if resp.status and resp.status.state:
+        state = str(resp.status.state.value if hasattr(resp.status.state, "value")
+                    else resp.status.state)
+    if state != "SUCCEEDED" or not resp.result:
+        msg = ""
+        if resp.status and resp.status.error:
+            msg = (resp.status.error.message or "")[:200]
+        return [], f"system.information_schema query failed ({state}): {msg}"
+    rows = resp.result.data_array or []
+    return [r[0] for r in rows if r and r[0]], None
+
+
+@app.route("/api/uc/metric-views-for-tables")
+def uc_metric_views_for_tables():
+    """Find Metric Views that depend on any of the given source tables.
+
+    Used by S3's data-sources-first flow: the analyst picks tables, the app
+    surfaces existing MVs that already use those tables so the analyst can
+    reuse them instead of re-authoring measures from scratch.
+
+    Query params:
+        fqns: comma-separated catalog.schema.table list (required)
+        warehouse_id: optional. If provided, the discovery also queries
+            system.information_schema.tables for a broader scan that catches
+            MVs in catalogs/schemas different from the picked tables (common
+            DSA pattern where MVs live in personal catalogs but reference
+            shared source tables). If absent or the broad scan fails, falls
+            back to per-(catalog,schema) scan only.
+
+    Response shape:
+        {
+            "metric_views": [{fqn, catalog, schema, name, comment, owner,
+                              updated_at, dependencies}],
+            "errors": ["<schema>: <message>", ...],  -- non-empty when one or
+                more candidate enumeration calls failed; lets the UI
+                distinguish "0 matches" from "couldn't search."
+            "warnings": ["..."]  -- non-fatal notes (e.g. broad scan unavailable,
+                falling back to schema-only).
+            "scope": {
+                "broad": bool  -- true iff system.information_schema was used
+            }
+        }
+    """
+    user_w, err = _require_obo()
+    if err:
+        return err
+    raw = request.args.get("fqns", "")
+    warehouse_id = (request.args.get("warehouse_id") or "").strip()
+    picked = {
+        t.strip() for t in raw.split(",")
+        if t.strip() and t.count(".") == 2
+    }
+    if not picked:
+        return jsonify({"metric_views": [], "errors": [], "warnings": [], "scope": {"broad": False}})
+
+    host = user_w.config.host.rstrip("/")
+    hdrs = {"Authorization": f"Bearer {user_w.config.token}"}
+    errors = []
+    warnings = []
+    candidates = set()
+    broad_used = False
+
+    # Step 1a: try the broad scan first if a warehouse is available. One SQL
+    # query finds every MV visible to the user. If it fails (system table
+    # disabled, no warehouse access, etc.) we silently fall back to the
+    # narrower per-schema scan -- but the UI gets a warning so the user
+    # knows discovery was scoped.
+    if warehouse_id:
+        broad_fqns, broad_err = _broad_mv_scan(user_w, warehouse_id)
+        if broad_err:
+            warnings.append(
+                f"Broad MV scan via system.information_schema failed: {broad_err}. "
+                "Falling back to schema-scoped scan (MVs in different catalogs/"
+                "schemas from your picked tables won't be found)."
+            )
+        else:
+            candidates.update(broad_fqns)
+            broad_used = True
+
+    # Step 1b: schema-scoped scan as fallback / supplement. Parallelize
+    # across the (catalog, schema) pairs of picked tables -- usually 1-3
+    # schemas, but parallelism shaves the round-trip cost regardless.
+    schemas = {".".join(t.split(".")[:2]) for t in picked}
+    if not broad_used:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {
+                pool.submit(_list_mvs_in_schema, host, hdrs, *cs.split(".", 1)): cs
+                for cs in schemas
+            }
+            for fut in futures:
+                cs = futures[fut]
+                fqns, scan_err = fut.result()
+                if scan_err:
+                    errors.append(f"{cs}: {scan_err}")
+                else:
+                    candidates.update(fqns)
+
+    if not candidates:
+        return jsonify({
+            "metric_views": [],
+            "errors": errors,
+            "warnings": warnings,
+            "scope": {"broad": broad_used},
+        })
+
+    # Step 2: REST-fetch view_dependencies for every candidate in parallel.
+    # The LIST response above returns view_dependencies: null, so we need
+    # per-MV GETs to read the dependency list. Parallelism here is the
+    # biggest win -- a schema with 30 MVs goes from sequential ~6s to a
+    # bounded ~1s. Failed fetches are logged-and-skipped (e.g. private MVs
+    # the user lacks grants on).
+    results = []
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {
+            pool.submit(_fetch_mv_dependencies, host, hdrs, fqn): fqn
+            for fqn in sorted(candidates)
+        }
+        for fut in futures:
+            fqn = futures[fut]
+            data, dep_err = fut.result()
+            if dep_err:
+                print(f"[/api/uc/metric-views-for-tables] {fqn}: {dep_err}", flush=True)
+                continue
+            if not (data["dep_fqns"] & picked):
+                continue
+            body = data["body"]
+            parts = fqn.split(".")
+            results.append({
+                "fqn": fqn,
+                "catalog": parts[0],
+                "schema": parts[1],
+                "name": parts[2],
+                "comment": body.get("comment", "") or "",
+                "owner": body.get("owner", "") or "",
+                "updated_at": body.get("updated_at"),
+                "dependencies": sorted(data["dep_fqns"]),
+            })
+
+    results.sort(key=lambda x: x["fqn"])
+    return jsonify({
+        "metric_views": results,
+        "errors": errors,
+        "warnings": warnings,
+        "scope": {"broad": broad_used},
+    })
+
+
+@app.route("/api/uc/metric-view-details")
+def uc_metric_view_details():
+    """Return structured dimensions + measures for a Metric View.
+
+    Used by S3's data-sources panel to render "what does this MV cover?" --
+    column names, display names, synonyms, comments, and measure markers --
+    without needing an LLM. The deterministic part of Phase 1.
+
+    Query params:
+        fqn:          catalog.schema.metric_view_name (required)
+        warehouse_id: SQL warehouse to run DESCRIBE on (required)
+
+    Returns:
+        { fqn, dimensions: [...], measures: [...] }
+      where each entry is:
+        { name, display_name, synonyms: [...], comment, data_type }
+
+    Measure detection: DESCRIBE EXTENDED on a metric view returns each
+    column's data_type with a trailing " measure" marker (e.g.
+    "bigint measure"). We split on that marker.
+    """
+    user_w, err = _require_obo()
+    if err:
+        return err
+    fqn = request.args.get("fqn", "")
+    warehouse_id = request.args.get("warehouse_id", "")
+    if not fqn or fqn.count(".") != 2:
+        return jsonify({"error": "fqn (3-part) is required"}), 400
+    if not warehouse_id:
+        return jsonify({"error": "warehouse_id is required"}), 400
+
+    parts = fqn.split(".")
+    stmt = f"DESCRIBE EXTENDED `{parts[0]}`.`{parts[1]}`.`{parts[2]}`"
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id, statement=stmt, wait_timeout="30s",
+        )
+    except Exception as e:
+        print(f"[/api/uc/metric-view-details] {type(e).__name__}: {e}", flush=True)
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 502
+
+    state = ""
+    if resp.status and resp.status.state:
+        state = str(resp.status.state.value if hasattr(resp.status.state, "value")
+                    else resp.status.state)
+    if state != "SUCCEEDED" or not resp.result or not resp.result.data_array:
+        msg = ""
+        if resp.status and resp.status.error:
+            msg = (resp.status.error.message or "")[:300]
+        return jsonify({"error": f"DESCRIBE failed ({state}): {msg}"}), 502
+
+    dimensions, measures = [], []
+    for row in resp.result.data_array:
+        if not row:
+            continue
+        col_name = (row[0] or "").strip() if row[0] else ""
+        # The "# Detailed Table Information" section comes after the
+        # columns. Stop on the first blank or comment-banner row -- the
+        # column metadata we care about all lives above it.
+        if not col_name or col_name.startswith("#"):
+            break
+        data_type = (row[1] or "").strip() if len(row) > 1 and row[1] else ""
+        comment = (row[2] or "").strip() if len(row) > 2 and row[2] else ""
+        metadata_raw = (row[3] or "").strip() if len(row) > 3 and row[3] else ""
+        meta = {}
+        if metadata_raw:
+            try:
+                meta = json.loads(metadata_raw)
+            except Exception:
+                meta = {}
+        entry = {
+            "name": col_name,
+            "data_type": data_type,
+            "comment": comment,
+            "display_name": (meta.get("display_name") or "").strip(),
+            "synonyms": meta.get("synonyms") or [],
+        }
+        if "measure" in data_type.lower():
+            measures.append(entry)
+        else:
+            dimensions.append(entry)
+    return jsonify({"fqn": fqn, "dimensions": dimensions, "measures": measures})
 
 
 # ---------------------------------------------------------------------------
