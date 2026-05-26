@@ -220,6 +220,56 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  /** Direct URL for the BO pre-work template download. Use as an href so the
+   *  browser handles the file download natively (no fetch + blob dance). */
+  preworkTemplateUrl: `${BASE}/template/business-owner-prework.xlsx`,
+
+  /** Upload a filled-in pre-work .xlsx and return a parsed preview. Does NOT
+   *  mutate the engagement; the caller must call applyPrework to commit. */
+  parsePrework: async (id: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${BASE}/engagements/${id}/parse-prework`, {
+      method: "POST",
+      body: form,
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `${res.status} ${res.statusText}`);
+    return body as {
+      template_version: string;
+      warnings: string[];
+      errors: string[];
+      preview: Record<string, Record<string, string>[]>;
+    };
+  },
+
+  /** Commit the parsed pre-work to S1/S2 columns. Honors If-Match optimistic
+   *  lock; surfaces 409 with the server's current updated_at so the caller
+   *  can prompt the user to refresh. */
+  applyPrework: async (
+    id: string,
+    sections: string[],
+    data: Record<string, Record<string, string>[]>,
+    ifMatch?: string,
+  ) => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (ifMatch) headers["If-Match"] = ifMatch;
+    const res = await fetch(`${BASE}/engagements/${id}/apply-prework`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ sections, data }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 409) {
+      const err: any = new Error(body.message || "Engagement was updated by another user.");
+      err.stale = true;
+      err.current_updated_at = body.current_updated_at;
+      throw err;
+    }
+    if (!res.ok) throw new Error(body.error || `${res.status} ${res.statusText}`);
+    return body as { success: boolean; updated_at: string; applied: string[] };
+  },
+
   draftBenchmarks: (
     id: string,
     count?: number,

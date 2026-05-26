@@ -55,7 +55,7 @@ export default function Session6Form({ data, onChange, readOnly }: Props) {
         Capture what works, what fails, and what is confusing. Do NOT demo it yourself -- hand the keyboard to the business owner.
       </Alert>
 
-      <Accordion defaultExpanded>
+      <Accordion id="section-6-scorecard" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Prototype Review Scorecard</Typography>
         </AccordionSummary>
@@ -81,7 +81,7 @@ export default function Session6Form({ data, onChange, readOnly }: Props) {
         </AccordionDetails>
       </Accordion>
 
-      <Accordion defaultExpanded>
+      <Accordion id="section-6-fixes" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Fixes Log</Typography>
         </AccordionSummary>
@@ -99,7 +99,7 @@ export default function Session6Form({ data, onChange, readOnly }: Props) {
         </AccordionDetails>
       </Accordion>
 
-      <Accordion defaultExpanded>
+      <Accordion id="section-6-new-benchmarks" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">New Benchmarks Captured</Typography>
         </AccordionSummary>
@@ -116,7 +116,7 @@ export default function Session6Form({ data, onChange, readOnly }: Props) {
         </AccordionDetails>
       </Accordion>
 
-      <Accordion defaultExpanded>
+      <Accordion id="section-6-phrasing" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Phrasing & Entity Matching Notes</Typography>
         </AccordionSummary>

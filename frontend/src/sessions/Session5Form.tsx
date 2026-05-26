@@ -289,7 +289,7 @@ export default function Session5Form({
       </Alert>
 
       {/* Generate Plan */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-ai-plan" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <AutoAwesomeIcon color="primary" />
@@ -334,7 +334,7 @@ export default function Session5Form({
       </Accordion>
 
       {/* Text Instructions */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-text-instructions" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Text Instructions (General)</Typography>
         </AccordionSummary>
@@ -377,7 +377,7 @@ export default function Session5Form({
       </Accordion>
 
       {/* Data Sources (tables + UC joins) */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-data-sources" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Stack direction="row" alignItems="center" spacing={1}>
             <Typography variant="h6">Data Sources</Typography>
@@ -556,7 +556,7 @@ export default function Session5Form({
       )}
 
       {/* Example Queries */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-examples" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Example SQL Queries ({exampleQueries.length})</Typography>
         </AccordionSummary>
@@ -595,7 +595,7 @@ export default function Session5Form({
       </Accordion>
 
       {/* Benchmarks (read-only, from Session 4) */}
-      <Accordion defaultExpanded={benchmarks.length > 0}>
+      <Accordion id="section-5-benchmarks" defaultExpanded={benchmarks.length > 0}>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Stack direction="row" alignItems="center" spacing={1}>
             <Typography variant="h6">Benchmark Questions</Typography>
@@ -647,7 +647,7 @@ export default function Session5Form({
       </Accordion>
 
       {/* Push to Genie */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-push" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <RocketLaunchIcon color="action" />

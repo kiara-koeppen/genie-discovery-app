@@ -315,7 +315,7 @@ export default function Session3Form({
 
       {/* ---- Reference Panel ---- */}
       {(questions.length > 0 || reports.length > 0) && (
-        <Accordion>
+        <Accordion id="section-3-reference">
           <AccordionSummary expandIcon={<ExpandMoreIcon />}>
             <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
               <InfoOutlinedIcon color="action" fontSize="small" />
@@ -385,7 +385,7 @@ export default function Session3Form({
 
       {/* ---- Classify Terms ---- */}
       {vocabTerms.length > 0 ? (
-        <Accordion defaultExpanded>
+        <Accordion id="section-3-classify-terms" defaultExpanded>
           <AccordionSummary expandIcon={<ExpandMoreIcon />}>
             <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
               <Typography variant="h6">Classify Terms</Typography>
@@ -473,7 +473,7 @@ export default function Session3Form({
       )}
 
       {/* ---- Global Filter ---- */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-3-global-filter" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <Typography variant="h6">Global Filter</Typography>
@@ -504,7 +504,7 @@ export default function Session3Form({
       </Accordion>
 
       {/* ---- SQL Expressions (Metrics) ---- */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-3-sql-expressions" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <Typography variant="h6">SQL Expressions</Typography>
@@ -531,7 +531,7 @@ export default function Session3Form({
       </Accordion>
 
       {/* ---- Text Instructions ---- */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-3-text-instructions" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <Typography variant="h6">Text Instructions</Typography>
@@ -556,7 +556,7 @@ export default function Session3Form({
       </Accordion>
 
       {/* ---- Table Summary (always visible) ---- */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-3-table-summary" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <Typography variant="h6">Table Summary</Typography>
@@ -644,7 +644,7 @@ export default function Session3Form({
       </Accordion>
 
       {/* ---- Data Gap Analysis ---- */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-3-data-gaps" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Data Gap Analysis</Typography>
         </AccordionSummary>
@@ -663,7 +663,7 @@ export default function Session3Form({
       </Accordion>
 
       {/* ---- Scope Boundaries ---- */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-3-scope-boundaries" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Scope Boundaries</Typography>
         </AccordionSummary>
@@ -682,7 +682,7 @@ export default function Session3Form({
       </Accordion>
 
       {/* ---- Metric View Builder (LLM-driven) ---- */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-3-metric-view" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <Typography variant="h6">Metric View (Recommended)</Typography>

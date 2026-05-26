@@ -7,9 +7,10 @@ import time
 import traceback
 import uuid
 from datetime import datetime, timezone
+from io import BytesIO
 
 import requests
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
 from databricks.sdk.service.sql import StatementParameterListItem, StatementState
@@ -812,6 +813,10 @@ def _bo_can_access(method, sub_path):
         return True
     if method == "PATCH" and sub_path == "/benchmarks/bo-approved":
         return True
+    # Pre-work Excel upload: BOs can upload their own filled-in template and
+    # apply it to S1/S2 (the only sessions they have edit rights to anyway).
+    if method == "POST" and sub_path in ("/parse-prework", "/apply-prework"):
+        return True
     return False
 
 
@@ -1328,6 +1333,495 @@ def save_session_5(eid):
 @app.route("/api/engagements/<eid>/sessions/6", methods=["PUT"])
 def save_session_6(eid):
     return _save_session_response(eid, 6)
+
+
+# ---------------------------------------------------------------------------
+# API: Business Owner Pre-Work Excel Upload
+# ---------------------------------------------------------------------------
+# Lets the analyst (or BO) send the BO a .xlsx template before the working
+# session, then upload the filled-in version to populate Sessions 1 and 2.
+#
+# Three endpoints:
+#   GET  /api/template/business-owner-prework.xlsx -- download template
+#   POST /api/engagements/<eid>/parse-prework      -- parse + validate, NO mutation
+#   POST /api/engagements/<eid>/apply-prework      -- atomic write, optimistic lock
+#
+# Apply semantics: each chosen section is REPLACED (not appended). The preview
+# UI shows the diff so the user opts in section-by-section. This makes
+# double-upload idempotent.
+
+PREWORK_TEMPLATE_VERSION = "1.0"
+PREWORK_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+
+# Standard S1 business-context questions. Pre-populated in the template (locked
+# columns) so BOs only write the Notes column. Must stay in sync with
+# Session1Form.tsx's CONTEXT_QUESTIONS.
+_PREWORK_S1_CONTEXT = [
+    ("What does your team do day-to-day?", "Scopes the question universe"),
+    ("What decisions do you make with data?", "Identifies the high-value questions"),
+    ("Who else on your team would use this?", "Sizes the audience and skill range"),
+    ("How do you get ad hoc answers today?", "Reveals the bottleneck Genie solves"),
+]
+
+# Frequency dropdown values; must match Session1Form.tsx's REPORT_COLS select.
+_PREWORK_FREQ_OPTIONS = ["Daily", "Weekly", "Monthly", "Quarterly", "Ad hoc"]
+
+# Per-sheet config drives template generation AND parsing -- single source of
+# truth so the two can't drift. Keys map to session column names.
+_PREWORK_SHEETS = [
+    {
+        "name": "S1 Business Context",
+        "key": "business_context",
+        "session": 1,
+        "headers": ["Question", "Why It Matters", "Your Notes"],
+        "row_keys": ["question", "why_it_matters", "response"],
+        "instruction": ("Answer each question in the 'Your Notes' column. "
+                        "Don't edit the Question or Why It Matters columns."),
+    },
+    {
+        "name": "S1 Pain Points",
+        "key": "pain_points",
+        "session": 1,
+        "headers": ["Pain Point"],
+        "row_keys": ["description"],
+        "instruction": ("List the top frustrations your team has with getting "
+                        "data answers today. One pain point per row."),
+    },
+    {
+        "name": "S1 Existing Reports",
+        "key": "existing_reports",
+        "session": 1,
+        "headers": ["Report/Dashboard Name", "What It Shows", "How Often Used", "Known Issues"],
+        "row_keys": ["report_name", "what_it_shows", "frequency", "known_issues"],
+        "instruction": ("Every report, dashboard, or spreadsheet your team "
+                        "references regularly. 'How Often Used' must be one of: "
+                        "Daily, Weekly, Monthly, Quarterly, Ad hoc."),
+    },
+    {
+        "name": "S2 Question Bank",
+        "key": "question_bank",
+        "session": 2,
+        "headers": ["Question", "Decision It Drives"],
+        "row_keys": ["question_text", "decision_it_drives"],
+        "instruction": ("Real questions your team needs answered. For each, "
+                        "note the decision that question helps you make."),
+    },
+    {
+        # Renamed from "Vocabulary & Metrics" in the app -- BOs were reading
+        # the column labels as a pure glossary and missing that metrics belong
+        # here too. Headers and seeded examples make the dual purpose explicit.
+        "name": "S2 Key Terms & Metrics",
+        "key": "vocabulary_metrics",
+        "session": 2,
+        "headers": ["Business Term or Metric",
+                    "Definition or How It's Calculated",
+                    "Other Names / Synonyms"],
+        "row_keys": ["business_term", "what_they_mean", "synonyms"],
+        "instruction": ("Include BOTH vocabulary (jargon, abbreviations, "
+                        "filter logic) AND metrics (anything with a "
+                        "calculation). If it's a number you report on, it "
+                        "goes here. See the example rows below for both types."),
+    },
+]
+
+
+def _build_prework_template():
+    """Generate the pre-work .xlsx in memory and return a BytesIO.
+
+    Pre-populates S1 Business Context with the standard prompts and seeds the
+    Key Terms & Metrics sheet with three examples (one metric, one vocabulary
+    term, one borderline case) to demonstrate the dual purpose. A hidden
+    `_meta` sheet stores the template version so we can detect outdated
+    uploads at parse time.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    wb = Workbook()
+    ws_inst = wb.active
+    ws_inst.title = "Instructions"
+    ws_inst.column_dimensions["A"].width = 110
+    ws_inst["A1"] = "Genie Discovery — Business Owner Pre-Work"
+    ws_inst["A1"].font = Font(bold=True, size=14)
+    ws_inst["A3"] = ("Your analyst will load this file into the discovery app "
+                     "to populate your engagement before the working session.")
+    overview_lines = [
+        "",
+        "How to use this workbook:",
+        "  1. Fill out each sheet listed in the tabs below.",
+        "  2. Do NOT rename sheets or column headers — the app uses those names to find your answers.",
+        "  3. Leave a row blank if you don't have content for it. Blank rows are skipped.",
+        "  4. Save the file and send it back to your analyst.",
+        "",
+        "Sheets in this workbook:",
+    ]
+    for i, line in enumerate(overview_lines):
+        ws_inst[f"A{4+i}"] = line
+    overview_end = 4 + len(overview_lines)
+    for i, sheet in enumerate(_PREWORK_SHEETS):
+        ws_inst[f"A{overview_end+i}"] = f"  • {sheet['name']}: {sheet['instruction']}"
+        ws_inst[f"A{overview_end+i}"].alignment = Alignment(wrap_text=True, vertical="top")
+        ws_inst.row_dimensions[overview_end + i].height = 45
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFF")
+    instruction_font = Font(italic=True, color="555555")
+
+    for sheet in _PREWORK_SHEETS:
+        ws = wb.create_sheet(sheet["name"])
+        # Row 1: instruction banner spanning all columns
+        n_cols = len(sheet["headers"])
+        ws.cell(row=1, column=1, value=sheet["instruction"]).font = instruction_font
+        if n_cols > 1:
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+        ws.row_dimensions[1].height = 45
+        ws.cell(row=1, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+        # Row 2: header
+        for col_idx, header in enumerate(sheet["headers"], start=1):
+            cell = ws.cell(row=2, column=col_idx, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            ws.column_dimensions[get_column_letter(col_idx)].width = 40
+
+        # Pre-fill standard S1 context questions on rows 3+
+        if sheet["key"] == "business_context":
+            for r_idx, (q, why) in enumerate(_PREWORK_S1_CONTEXT, start=3):
+                ws.cell(row=r_idx, column=1, value=q)
+                ws.cell(row=r_idx, column=2, value=why)
+                # Wrap the static columns so long prompts are readable
+                ws.cell(row=r_idx, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.cell(row=r_idx, column=2).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.row_dimensions[r_idx].height = 40
+
+        # Frequency dropdown on existing_reports' column C
+        if sheet["key"] == "existing_reports":
+            dv = DataValidation(
+                type="list",
+                formula1='"' + ",".join(_PREWORK_FREQ_OPTIONS) + '"',
+                allow_blank=True,
+            )
+            ws.add_data_validation(dv)
+            dv.add("C3:C200")
+
+        # Seed three examples on the Key Terms & Metrics sheet to demonstrate
+        # that BOTH metrics and vocabulary belong here. The parser detects and
+        # skips these rows so they don't import as real data even if the BO
+        # forgets to delete them.
+        if sheet["key"] == "vocabulary_metrics":
+            ws.cell(row=6, column=1, value="↓ EXAMPLES (delete these rows and replace with your own) ↓").font = (
+                Font(italic=True, color="888888", bold=True)
+            )
+            ws.merge_cells(start_row=6, start_column=1, end_row=6, end_column=3)
+            examples = [
+                ("Net Revenue",
+                 "Gross sales minus returns and discounts. This is a METRIC -- include calculation logic.",
+                 "NR, Net Sales"),
+                ("Active Customer",
+                 "Customer with at least one order in the trailing 90 days. METRIC -- definition includes the rule.",
+                 "Active account"),
+                ("SKU",
+                 "Stock-keeping unit; the unique identifier for a product. VOCABULARY -- just the definition.",
+                 "Item ID, Product code"),
+            ]
+            for r_idx, (term, defn, syn) in enumerate(examples, start=7):
+                ws.cell(row=r_idx, column=1, value=term).font = Font(italic=True, color="888888")
+                ws.cell(row=r_idx, column=2, value=defn).font = Font(italic=True, color="888888")
+                ws.cell(row=r_idx, column=3, value=syn).font = Font(italic=True, color="888888")
+                ws.cell(row=r_idx, column=2).alignment = Alignment(wrap_text=True, vertical="top")
+                ws.row_dimensions[r_idx].height = 30
+
+    # Hidden metadata sheet for version detection at parse time
+    meta = wb.create_sheet("_meta")
+    meta["A1"] = "template_version"
+    meta["B1"] = PREWORK_TEMPLATE_VERSION
+    meta["A2"] = "generated_at"
+    meta["B2"] = now_ts()
+    meta.sheet_state = "hidden"
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def _parse_prework_xlsx(file_bytes):
+    """Parse a filled-in pre-work workbook.
+
+    Returns (parsed, warnings, errors, template_version).
+      parsed:   dict keyed by section key with arrays of row-dicts. Empty
+                rows are dropped. Seeded example rows on the Key Terms sheet
+                are detected and skipped.
+      warnings: non-fatal (template version mismatch, unknown frequency value,
+                BO edited a standard S1 question prompt).
+      errors:   fatal (missing sheets, renamed column headers, parse failure).
+      template_version: string from the _meta sheet, "" if absent.
+
+    Strictly read-only; no DB writes. Caller decides whether to apply.
+    """
+    from openpyxl import load_workbook
+
+    warnings = []
+    errors = []
+    parsed = {sheet["key"]: [] for sheet in _PREWORK_SHEETS}
+    template_version = ""
+
+    try:
+        wb = load_workbook(BytesIO(file_bytes), data_only=True)
+    except Exception as e:
+        return parsed, warnings, [f"Could not open file as .xlsx: {e}"], ""
+
+    if "_meta" in wb.sheetnames:
+        try:
+            template_version = str(wb["_meta"]["B1"].value or "").strip()
+        except Exception:
+            template_version = ""
+    if not template_version:
+        warnings.append(
+            "Template version not found in file. This may not have come from "
+            "the app's template -- if you see import problems, download a "
+            "fresh template from the upload dialog."
+        )
+    elif template_version != PREWORK_TEMPLATE_VERSION:
+        warnings.append(
+            f"Template version mismatch (file: {template_version}, current: "
+            f"{PREWORK_TEMPLATE_VERSION}). Some fields may not import "
+            "correctly. Download a fresh template if you see issues."
+        )
+
+    standard_s1_questions = {pair[0] for pair in _PREWORK_S1_CONTEXT}
+
+    for sheet_cfg in _PREWORK_SHEETS:
+        name = sheet_cfg["name"]
+        if name not in wb.sheetnames:
+            errors.append(
+                f"Sheet '{name}' is missing. Don't rename or delete sheets — "
+                "re-download the template if needed."
+            )
+            continue
+        ws = wb[name]
+
+        # Validate header row (row 2). Case-insensitive, whitespace-trimmed.
+        actual = []
+        for col_idx in range(1, len(sheet_cfg["headers"]) + 1):
+            v = ws.cell(row=2, column=col_idx).value
+            actual.append((v or "").strip() if isinstance(v, str) else str(v or "").strip())
+        expected = [h.strip() for h in sheet_cfg["headers"]]
+        if [h.lower() for h in actual] != [h.lower() for h in expected]:
+            errors.append(
+                f"Sheet '{name}' headers don't match. Expected {expected!r}, "
+                f"got {actual!r}. Re-download the template if columns were changed."
+            )
+            continue
+
+        # Identify the seeded-example rows on vocabulary_metrics so we don't
+        # import them. Triggered by an "EXAMPLES" banner in column A; the next
+        # three rows are skipped if they still hold the seeded values.
+        skip_rows = set()
+        if sheet_cfg["key"] == "vocabulary_metrics":
+            for r_idx in range(3, min(ws.max_row, 12) + 1):
+                v = ws.cell(row=r_idx, column=1).value
+                if isinstance(v, str) and "examples" in v.lower() and (
+                    "delete" in v.lower() or "replace" in v.lower()
+                ):
+                    skip_rows.add(r_idx)
+                    skip_rows.update({r_idx + 1, r_idx + 2, r_idx + 3})
+                    break
+
+        for r_idx in range(3, ws.max_row + 1):
+            if r_idx in skip_rows:
+                continue
+            values = []
+            for col_idx in range(1, len(sheet_cfg["row_keys"]) + 1):
+                v = ws.cell(row=r_idx, column=col_idx).value
+                if v is None:
+                    values.append("")
+                elif isinstance(v, str):
+                    values.append(v.strip())
+                else:
+                    values.append(str(v).strip())
+            if not any(values):
+                continue
+            row_dict = dict(zip(sheet_cfg["row_keys"], values))
+
+            if sheet_cfg["key"] == "existing_reports":
+                freq = row_dict.get("frequency", "")
+                if freq and freq not in _PREWORK_FREQ_OPTIONS:
+                    warnings.append(
+                        f"'{name}' row {r_idx}: 'How Often Used' value "
+                        f"'{freq}' isn't one of {_PREWORK_FREQ_OPTIONS}. "
+                        "Imported as-is; you can fix it in the app."
+                    )
+
+            if sheet_cfg["key"] == "business_context":
+                q = row_dict.get("question", "")
+                if q and q not in standard_s1_questions:
+                    warnings.append(
+                        f"'{name}' row {r_idx}: question text differs from "
+                        "the standard prompt. The response will still import."
+                    )
+
+            parsed[sheet_cfg["key"]].append(row_dict)
+
+    return parsed, warnings, errors, template_version
+
+
+def _apply_prework_atomic(eid, sections_to_apply, parsed):
+    """Atomically replace the chosen S1/S2 section columns on an engagement.
+
+    sections_to_apply: iterable of section keys (e.g. {'business_context',
+                       'question_bank'}). Anything not listed is left alone.
+    parsed:            dict from _parse_prework_xlsx, keyed by section key.
+
+    Writes all chosen columns in a single UPDATE so a partial failure can't
+    leave the engagement half-applied. Honors If-Match optimistic lock the
+    same way save_session does. Returns the new updated_at.
+    """
+    _check_optimistic_lock(eid)
+
+    section_to_session = {s["key"]: s["session"] for s in _PREWORK_SHEETS}
+    valid_keys = set(section_to_session.keys())
+    keys = [k for k in sections_to_apply if k in valid_keys]
+    if not keys:
+        return _read_updated_at(eid)
+
+    ts = now_ts()
+    params = {"eid": eid, "ts": ts}
+    set_parts = []
+    for k in keys:
+        set_parts.append(f"{k} = :{k}")
+        params[k] = json.dumps(parsed.get(k, []))
+
+    # Unlock the next tab: advance current_session to one past the highest
+    # touched session, but never go backwards.
+    max_session = max(section_to_session[k] for k in keys)
+    set_parts.append(f"current_session = GREATEST(current_session, {max_session + 1})")
+    set_parts.append(
+        "status = CASE WHEN status = 'complete' THEN 'complete' ELSE 'in_progress' END"
+    )
+    set_parts.append("updated_at = :ts")
+
+    sql_run(
+        f"UPDATE {TABLE} SET {', '.join(set_parts)} WHERE engagement_id = :eid",
+        params,
+    )
+    return _read_updated_at(eid)
+
+
+@app.route("/api/template/business-owner-prework.xlsx", methods=["GET"])
+def download_prework_template():
+    """Stream the BO pre-work .xlsx template. Generated fresh per request so
+    we never ship a stale binary."""
+    try:
+        buf = _build_prework_template()
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to build template: {e}"}), 500
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="genie-discovery-bo-prework.xlsx",
+    )
+
+
+@app.route("/api/engagements/<eid>/parse-prework", methods=["POST"])
+def parse_prework(eid):
+    """Parse an uploaded pre-work .xlsx and return a preview WITHOUT mutating.
+
+    multipart/form-data, field name `file`. Returns:
+      { template_version, warnings: [...], errors: [...],
+        preview: { section_key: [row_dict, ...] } }
+
+    If `errors` is non-empty the client must show them and block apply.
+    `warnings` are non-fatal and shown alongside the preview.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded. Use the 'file' form field."}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "No filename in upload."}), 400
+    if not f.filename.lower().endswith(".xlsx"):
+        return jsonify({
+            "error": f"File must be a .xlsx workbook (got '{f.filename}'). "
+                     "Re-save the file as .xlsx and try again."
+        }), 400
+    raw = f.read()
+    if len(raw) > PREWORK_MAX_BYTES:
+        return jsonify({
+            "error": f"File too large ({len(raw)} bytes). Max is {PREWORK_MAX_BYTES} bytes."
+        }), 413
+    if len(raw) < 100:
+        return jsonify({"error": "File appears empty or truncated."}), 400
+    # .xlsx is a zip; magic bytes catch the "wrong format saved with right extension" case
+    if not raw.startswith(b"PK\x03\x04"):
+        return jsonify({
+            "error": "File is not a valid .xlsx (zip signature missing). "
+                     "It may have been saved as .xls or .csv with the wrong extension."
+        }), 400
+
+    parsed, warnings, errors, version = _parse_prework_xlsx(raw)
+    return jsonify({
+        "template_version": version,
+        "warnings": warnings,
+        "errors": errors,
+        "preview": parsed,
+    })
+
+
+@app.route("/api/engagements/<eid>/apply-prework", methods=["POST"])
+def apply_prework(eid):
+    """Atomically apply parsed pre-work to an engagement.
+
+    Body: { sections: [section_key, ...], data: {section_key: [row_dict, ...]} }
+    The client sends back the data it parsed plus the sections the user opted
+    to apply (per-section checkboxes in the preview). Honors If-Match for
+    optimistic locking; returns 409 on stale.
+    """
+    payload = request.get_json(silent=True) or {}
+    sections = payload.get("sections") or []
+    data = payload.get("data") or {}
+    if not isinstance(sections, list) or not isinstance(data, dict):
+        return jsonify({"error": "Body must be {sections: [...], data: {...}}"}), 400
+
+    valid_keys = {s["key"] for s in _PREWORK_SHEETS}
+    sections_set = {s for s in sections if s in valid_keys}
+    if not sections_set:
+        return jsonify({"error": "No valid sections selected to apply."}), 400
+
+    # Defensive normalization: only keep recognized row keys per section so a
+    # crafted payload can't smuggle extra columns into the DB write. Strip and
+    # coerce-to-str so we never serialize an unexpected type.
+    normalized = {}
+    for s_cfg in _PREWORK_SHEETS:
+        k = s_cfg["key"]
+        if k not in sections_set:
+            continue
+        rows = data.get(k) or []
+        if not isinstance(rows, list):
+            return jsonify({"error": f"data.{k} must be a list."}), 400
+        normalized[k] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            clean = {rk: str(r.get(rk) or "").strip() for rk in s_cfg["row_keys"]}
+            if any(clean.values()):
+                normalized[k].append(clean)
+
+    try:
+        ts = _apply_prework_atomic(eid, sections_set, normalized)
+    except StaleEngagementError as e:
+        return jsonify({
+            "error": "stale",
+            "current_updated_at": e.current_updated_at,
+            "message": "This engagement was updated by another user. Refresh to continue.",
+        }), 409
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"success": True, "updated_at": ts, "applied": sorted(sections_set)})
 
 
 # ---------------------------------------------------------------------------
