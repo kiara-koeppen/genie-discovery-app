@@ -1989,9 +1989,14 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
         lines.append(f"- {item}: {s.get('notes','')}")
     lines.append("")
 
-    lines.append("## Session 4: COE-Approved Data Plan")
+    # Data plan was originally authored in S4 ("COE-Approved Data Plan"); as
+    # of the S3 redesign it's authored in Session 3's Data Sources panel and
+    # COE just reviews it during S4. The underlying field still lives in S4's
+    # column set, but the heading below reflects the new flow so the LLM
+    # doesn't infer a different review stage.
+    lines.append("## Data Plan (authored in Session 3, reviewed in Session 4)")
     if s4.get("analyst_commentary"):
-        lines.append(f"### Analyst Commentary\n{s4.get('analyst_commentary','')}")
+        lines.append(f"### Session 4 Analyst Commentary\n{s4.get('analyst_commentary','')}")
     lines.append("### Tables & Views in scope")
     for d in s4.get("data_plan", []):
         if d.get("include_in_space") == "Yes":
@@ -4343,7 +4348,13 @@ def uc_joins():
 
 @app.route("/api/uc/metric-views")
 def uc_metric_views():
-    """Detect existing metric views in a catalog.schema via OBO tables.list()."""
+    """Detect existing metric views in a catalog.schema.
+
+    Uses the UC tables REST list endpoint (not the SDK's tables.list)
+    because databricks-sdk 0.44.0 returns METRIC_VIEW as TableType.MANAGED
+    in TableInfo -- the enum value was added in a later SDK version. REST
+    response carries table_type as a string, so the filter works.
+    """
     user_w, err = _require_obo()
     if err:
         return err
@@ -4352,17 +4363,57 @@ def uc_metric_views():
         return jsonify([])
     cat, sch = catalog_schema.split(".", 1)
     try:
-        tables = list(user_w.tables.list(catalog_name=cat, schema_name=sch))
+        r = requests.get(
+            f"{user_w.config.host.rstrip('/')}/api/2.1/unity-catalog/tables",
+            params={"catalog_name": cat, "schema_name": sch, "max_results": 200},
+            headers={"Authorization": f"Bearer {user_w.config.token}"},
+            timeout=15,
+        )
+        if not r.ok:
+            print(f"[/api/uc/metric-views] {r.status_code} {r.text[:200]}", flush=True)
+            return jsonify([])
     except Exception as e:
         print(f"[/api/uc/metric-views] {type(e).__name__}: {e}", flush=True)
         return jsonify([])
-    results = []
-    for t in tables:
-        tt = str(getattr(t, "table_type", "") or "").upper()
-        # True UC metric views show up as METRIC_VIEW; plain SQL views are VIEW.
-        if "METRIC_VIEW" in tt and t.name:
-            results.append(f"{cat}.{sch}.{t.name}")
+    results = [
+        f"{cat}.{sch}.{t['name']}"
+        for t in (r.json().get("tables") or [])
+        if t.get("table_type") == "METRIC_VIEW" and t.get("name")
+    ]
     return jsonify(results)
+
+
+@app.route("/api/uc/table-type")
+def uc_table_type():
+    """Return UC's authoritative table_type for a single FQN.
+
+    Used by S3's Data Sources panel: when the analyst picks a name via
+    UCTablePicker, we don't know if it's a managed table, a view, or a
+    metric view -- the picker dropdown lists all of them by name. This
+    lookup tells us how to categorize on Add.
+    """
+    user_w, err = _require_obo()
+    if err:
+        return err
+    fqn = request.args.get("fqn", "")
+    if not fqn or fqn.count(".") != 2:
+        return jsonify({"error": "fqn (3-part) is required"}), 400
+    try:
+        r = requests.get(
+            f"{user_w.config.host.rstrip('/')}/api/2.1/unity-catalog/tables/{fqn}",
+            headers={"Authorization": f"Bearer {user_w.config.token}"},
+            timeout=15,
+        )
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 502
+    if not r.ok:
+        return jsonify({"error": f"{r.status_code}: {r.text[:200]}"}), r.status_code
+    body = r.json()
+    return jsonify({
+        "fqn": fqn,
+        "table_type": body.get("table_type") or "MANAGED",
+        "comment": body.get("comment") or "",
+    })
 
 
 @app.route("/api/uc/metric-views-for-tables")

@@ -346,6 +346,14 @@ export const api = {
   listSchemas: (catalog: string) =>
     json<string[]>(`/uc/schemas?catalog=${encodeURIComponent(catalog)}`),
 
+  /** Return UC's authoritative table_type for a FQN. Used by the Data
+   *  Sources panel to categorize a picker selection as Table vs Metric View
+   *  on Add (the picker dropdown lists both kinds by name). */
+  getTableType: (fqn: string) =>
+    json<{ fqn: string; table_type: string; comment: string }>(
+      `/uc/table-type?fqn=${encodeURIComponent(fqn)}`,
+    ),
+
   /** S3 data-sources-first flow: find existing Metric Views that depend on
    *  any of the picked source tables. Used to surface reusable MVs to the
    *  analyst so they don't have to re-author measures from scratch. */

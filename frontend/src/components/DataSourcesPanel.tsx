@@ -72,6 +72,10 @@ export default function DataSourcesPanel({
   dataPlan, onChangeDataPlan, warehouseId, readOnly,
 }: Props) {
   const [pickerValue, setPickerValue] = useState("");
+  // Loading state for the Add button -- briefly true while we look up
+  // the picked FQN's table_type to decide which bucket it belongs in.
+  const [addingTable, setAddingTable] = useState(false);
+  const [addError, setAddError] = useState("");
   const [discoveredMvs, setDiscoveredMvs] = useState<DiscoveredMv[]>([]);
   const [discoveringMvs, setDiscoveringMvs] = useState(false);
   const [discoveryError, setDiscoveryError] = useState("");
@@ -118,14 +122,39 @@ export default function DataSourcesPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pickedKey]);
 
-  const handleAddTable = () => {
+  const handleAddTable = async () => {
     if (!pickerValue || pickerValue.split(".").length !== 3) return;
-    if (dataPlan.some(d => d.table_or_view === pickerValue)) return;
-    onChangeDataPlan([
-      ...dataPlan,
-      { table_or_view: pickerValue, type: "Table", include_in_space: "Yes", notes: "" },
-    ]);
-    setPickerValue("");
+    if (dataPlan.some(d => d.table_or_view === pickerValue)) {
+      setAddError("That FQN is already in the data plan.");
+      return;
+    }
+    setAddingTable(true);
+    setAddError("");
+    try {
+      // The picker dropdown lists managed tables, regular SQL views, and
+      // metric views all by name -- we can't tell them apart from the FQN
+      // alone. Hit /api/uc/table-type to read the authoritative table_type
+      // and categorize accordingly. MVs land in the Metric Views bucket
+      // (type="Metric View"); everything else lands in Tables (type="Table"
+      // for now -- regular views are rare in Genie flows and don't need a
+      // separate bucket).
+      const info = await api.getTableType(pickerValue);
+      const isMv = info.table_type === "METRIC_VIEW";
+      onChangeDataPlan([
+        ...dataPlan,
+        {
+          table_or_view: pickerValue,
+          type: isMv ? "Metric View" : "Table",
+          include_in_space: "Yes",
+          notes: info.comment || "",
+        },
+      ]);
+      setPickerValue("");
+    } catch (err: any) {
+      setAddError(err?.message || "Failed to look up table type.");
+    } finally {
+      setAddingTable(false);
+    }
   };
 
   const handleRemove = (fqn: string) => {
@@ -232,7 +261,8 @@ export default function DataSourcesPanel({
       {!readOnly && (
         <Paper variant="outlined" sx={{ p: 1.5, mb: 3 }}>
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
-            Add a table to the data plan:
+            Add a table or metric view to the data plan. Metric views land in
+            the section below; tables / views land above.
           </Typography>
           <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap">
             <Box sx={{ flexGrow: 1, minWidth: 320 }}>
@@ -242,12 +272,21 @@ export default function DataSourcesPanel({
               variant="contained"
               size="small"
               onClick={handleAddTable}
-              disabled={!pickerValue || pickerValue.split(".").length !== 3}
-              startIcon={<AddIcon />}
+              disabled={
+                !pickerValue ||
+                pickerValue.split(".").length !== 3 ||
+                addingTable
+              }
+              startIcon={addingTable ? <CircularProgress size={14} /> : <AddIcon />}
             >
-              Add
+              {addingTable ? "Adding…" : "Add"}
             </Button>
           </Stack>
+          {addError && (
+            <Alert severity="error" sx={{ mt: 1 }} onClose={() => setAddError("")}>
+              {addError}
+            </Alert>
+          )}
         </Paper>
       )}
 
@@ -321,8 +360,11 @@ export default function DataSourcesPanel({
                     )}
                     {!discovered && (
                       <Typography variant="caption" color="warning.main" sx={{ display: "block", mt: 0.5 }}>
-                        Pinned from a previous data plan. Not in the current discovery
-                        scope -- the tables it depends on may have been removed.
+                        Pinned from an earlier data plan. Not in the current
+                        discovery scope — its source tables are in a different
+                        schema from your picked tables. To re-discover, add one
+                        of its source tables above. To remove, click the trash
+                        icon at right.
                       </Typography>
                     )}
 
@@ -429,6 +471,16 @@ export default function DataSourcesPanel({
                       </AccordionDetails>
                     </Accordion>
                   </Box>
+                  {!readOnly && !discovered && (
+                    <IconButton
+                      size="small"
+                      onClick={() => handleRemove(fqn)}
+                      title="Remove this Metric View from the data plan"
+                      sx={{ mt: 0.5 }}
+                    >
+                      <DeleteIcon fontSize="small" />
+                    </IconButton>
+                  )}
                 </Stack>
               </Paper>
             );
