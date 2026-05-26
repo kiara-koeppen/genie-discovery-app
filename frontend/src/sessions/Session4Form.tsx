@@ -606,7 +606,7 @@ export default function Session4Form({
       )}
 
       {/* Data Plan */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-4-data-plan" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <Typography variant="h6">Data Plan</Typography>
@@ -634,7 +634,7 @@ export default function Session4Form({
       </Accordion>
 
       {/* Readiness Brief */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-4-readiness-brief" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Stack direction="row" alignItems="center" spacing={1}>
             <Typography variant="h6">Readiness Brief</Typography>
@@ -696,7 +696,7 @@ export default function Session4Form({
       </Accordion>
 
       {/* Analyst Commentary -- structured gap responses */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-4-analyst-commentary" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Stack direction="row" alignItems="center" spacing={1}>
             <Typography variant="h6">Analyst Commentary</Typography>
@@ -811,7 +811,7 @@ export default function Session4Form({
       </Accordion>
 
       {/* Benchmark Questions */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-4-benchmarks" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Stack direction="row" alignItems="center" spacing={1}>
             <Typography variant="h6">Benchmark Questions</Typography>
@@ -1207,7 +1207,7 @@ export default function Session4Form({
       {isCoeMember && !readOnly && (
         <>
           <Divider sx={{ my: 3 }} />
-          <Accordion defaultExpanded>
+          <Accordion id="section-4-coe-controls" defaultExpanded>
             <AccordionSummary expandIcon={<ExpandMoreIcon />}>
               <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
                 <Typography variant="h6">COE Review Controls</Typography>

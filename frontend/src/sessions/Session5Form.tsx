@@ -12,6 +12,7 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import AddIcon from "@mui/icons-material/Add";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import LockIcon from "@mui/icons-material/Lock";
+import MenuBookIcon from "@mui/icons-material/MenuBook";
 import ExpandableTextField from "../components/ExpandableTextField";
 import { api, SqlSnippet, ExampleQuery, UcJoin, BenchmarkQuestion } from "../api";
 
@@ -289,7 +290,7 @@ export default function Session5Form({
       </Alert>
 
       {/* Generate Plan */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-ai-plan" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <AutoAwesomeIcon color="primary" />
@@ -334,7 +335,7 @@ export default function Session5Form({
       </Accordion>
 
       {/* Text Instructions */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-text-instructions" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Text Instructions (General)</Typography>
         </AccordionSummary>
@@ -377,7 +378,7 @@ export default function Session5Form({
       </Accordion>
 
       {/* Data Sources (tables + UC joins) */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-data-sources" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Stack direction="row" alignItems="center" spacing={1}>
             <Typography variant="h6">Data Sources</Typography>
@@ -556,7 +557,7 @@ export default function Session5Form({
       )}
 
       {/* Example Queries */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-examples" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Example SQL Queries ({exampleQueries.length})</Typography>
         </AccordionSummary>
@@ -595,7 +596,7 @@ export default function Session5Form({
       </Accordion>
 
       {/* Benchmarks (read-only, from Session 4) */}
-      <Accordion defaultExpanded={benchmarks.length > 0}>
+      <Accordion id="section-5-benchmarks" defaultExpanded={benchmarks.length > 0}>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Stack direction="row" alignItems="center" spacing={1}>
             <Typography variant="h6">Benchmark Questions</Typography>
@@ -646,8 +647,61 @@ export default function Session5Form({
         </AccordionDetails>
       </Accordion>
 
+      {/* Pre-push checklist: surface authoritative Genie best-practices docs at
+          the exact moment of decision so the analyst stays responsible for
+          verifying what the LLM proposed. The links open in a new tab so the
+          analyst can review without losing this page. */}
+      <Alert
+        severity="info"
+        icon={<MenuBookIcon />}
+        sx={{ mb: 2, "& a": { fontWeight: 500 } }}
+      >
+        <Typography variant="body2" sx={{ fontWeight: 500, mb: 0.5 }}>
+          Before you push: review Databricks Genie best practices
+        </Typography>
+        <Typography variant="body2" sx={{ mb: 1 }}>
+          The AI plan above is a draft. You're responsible for what gets pushed.
+          Read these official docs and verify the plan against them — especially
+          column-level synonyms, instruction-surface placement, and trusted
+          assets. Open in new tabs:
+        </Typography>
+        <Stack spacing={0.5}>
+          <Link
+            href="https://docs.databricks.com/aws/en/genie/best-practices"
+            target="_blank"
+            rel="noopener noreferrer"
+            sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}
+          >
+            Curate an effective Genie Space <OpenInNewIcon sx={{ fontSize: 14 }} />
+          </Link>
+          <Link
+            href="https://docs.databricks.com/aws/en/genie/knowledge-store"
+            target="_blank"
+            rel="noopener noreferrer"
+            sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}
+          >
+            Build a knowledge store (column-level synonyms, format assistance, entity matching) <OpenInNewIcon sx={{ fontSize: 14 }} />
+          </Link>
+          <Link
+            href="https://docs.databricks.com/aws/en/genie/tune-quality"
+            target="_blank"
+            rel="noopener noreferrer"
+            sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}
+          >
+            Tune Genie Space quality <OpenInNewIcon sx={{ fontSize: 14 }} />
+          </Link>
+        </Stack>
+        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+          Column-level synonyms classified in Session 3 are auto-pushed to the
+          column's column_configs at push time (synonyms list for "column" kind,
+          description + entity_matching toggle for "value" kind). Look for the
+          "Pushed to column_configs" manifest at the bottom of the narrative
+          field above to verify what got attached to which column.
+        </Typography>
+      </Alert>
+
       {/* Push to Genie */}
-      <Accordion defaultExpanded>
+      <Accordion id="section-5-push" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <RocketLaunchIcon color="action" />

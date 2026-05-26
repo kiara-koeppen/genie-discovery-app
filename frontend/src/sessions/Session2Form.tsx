@@ -9,9 +9,9 @@ const QUESTION_COLS: ColumnDef[] = [
 ];
 
 const VOCAB_COLS: ColumnDef[] = [
-  { key: "business_term", label: "Business Term" },
-  { key: "what_they_mean", label: "What They Mean", type: "textarea" },
-  { key: "synonyms", label: "Synonyms" },
+  { key: "business_term", label: "Business Term or Metric" },
+  { key: "what_they_mean", label: "Definition or How It's Calculated", type: "textarea" },
+  { key: "synonyms", label: "Other Names / Synonyms" },
 ];
 
 interface Props {
@@ -29,7 +29,7 @@ export default function Session2Form({ data, onChange, readOnly }: Props) {
         a complete vocabulary of the business domain and a prioritized list of questions.
       </Alert>
 
-      <Accordion defaultExpanded>
+      <Accordion id="section-2-question-bank" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="h6">Question Bank</Typography>
         </AccordionSummary>
@@ -63,15 +63,18 @@ export default function Session2Form({ data, onChange, readOnly }: Props) {
         </AccordionDetails>
       </Accordion>
 
-      <Accordion defaultExpanded>
+      <Accordion id="section-2-key-terms" defaultExpanded>
         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Typography variant="h6">Vocabulary & Metrics</Typography>
+          <Typography variant="h6">Key Terms & Metrics</Typography>
         </AccordionSummary>
         <AccordionDetails>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Capture every term the business owner uses -- metrics, column names, abbreviations, filter logic,
-            date references. Write down what they mean in their words, plus any synonyms their team uses.
-            Don't classify or map to data yet -- that happens in Session 3.
+            Capture BOTH vocabulary AND metrics here: jargon and abbreviations
+            ("SKU", "AOV"), filter logic, date references, AND any number the
+            team reports on with its calculation ("Net Revenue = gross sales
+            minus returns and discounts"). If it's a term they use OR a number
+            they report on, it goes in this table. Don't classify or map to
+            data yet -- that happens in Session 3.
           </Typography>
           <EditableTable
             columns={VOCAB_COLS}
