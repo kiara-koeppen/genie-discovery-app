@@ -966,6 +966,35 @@ def api_user_role():
     })
 
 
+@app.route("/api/groups", methods=["GET"])
+def list_groups():
+    """Best-effort list of workspace group display names, for the Session 7
+    "intended access" picker. Like space-access, this is wrapped: SCIM group
+    listing may require admin / a scope the app's OBO token doesn't carry, so on
+    ANY failure we return {available: false} and the UI falls back to free-text.
+
+    This is for DOCUMENTING intended recipients only — the app cannot perform
+    the actual share (that needs the access-management scope, which Databricks
+    Apps can't grant to OBO tokens).
+    """
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "reauth_required"}), 401
+    try:
+        resp = _genie_api_call(
+            user_w, "GET",
+            "/api/2.0/preview/scim/v2/Groups?attributes=displayName&count=500",
+        )
+        names = sorted(
+            g.get("displayName") for g in (resp.get("Resources") or [])
+            if g.get("displayName")
+        )
+        return jsonify({"available": True, "groups": names})
+    except Exception as e:
+        print(f"[groups] list failed: {e}", flush=True)
+        return jsonify({"available": False, "reason": str(e)[:200], "groups": []})
+
+
 # ---------------------------------------------------------------------------
 # API: Engagements CRUD
 # ---------------------------------------------------------------------------
@@ -1978,24 +2007,17 @@ def space_access(eid):
 def patch_benchmark_bo_approved(eid):
     """Toggle the bo_approved flag on a single benchmark row.
 
-    Allowed for COE and BO group members (other users get 403). Intentionally
-    DOES NOT bump engagement.updated_at — this is a lightweight checkbox action
-    that lives outside the optimistic lock so a BO clicking the checkbox does
-    not 409 the analyst's autosave on the same engagement. The analyst's
+    Open to any authenticated app user (no group gate) — the BO-Approved
+    checkbox is intentionally not gatekept. Intentionally DOES NOT bump
+    engagement.updated_at — this is a lightweight checkbox action that lives
+    outside the optimistic lock so clicking the checkbox does not 409 the
+    analyst's autosave on the same engagement. The analyst's
     save_session(4, ...) preserves bo_approved values from the DB (see merge in
-    save_session), so the BO's approval is never overwritten by an analyst.
+    save_session), so the approval is never overwritten by an analyst.
     """
     user_w = _user_workspace_client()
     if not user_w:
         return jsonify({"error": "reauth_required"}), 401
-    role = _user_role(user_w)
-    if role not in ("coe", "bo"):
-        return jsonify({
-            "error": (
-                f"Only members of the '{COE_GROUP}' or '{BO_GROUP}' group can "
-                f"change BO Approved."
-            ),
-        }), 403
 
     body = request.json or {}
     idx = body.get("idx")

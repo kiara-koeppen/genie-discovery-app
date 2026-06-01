@@ -16,6 +16,7 @@ import MenuBookIcon from "@mui/icons-material/MenuBook";
 import RestoreIcon from "@mui/icons-material/Restore";
 import ExpandableTextField from "../components/ExpandableTextField";
 import ConfirmDialog from "../components/ConfirmDialog";
+import CompareRestoreDialog from "../components/CompareRestoreDialog";
 import { api, SqlSnippet, ExampleQuery, UcJoin, BenchmarkQuestion } from "../api";
 
 // The Session 5 plan fields that a regeneration overwrites. Order doesn't
@@ -53,6 +54,8 @@ export default function Session5Form({
   const [generateWarnings, setGenerateWarnings] = useState<string[]>([]);
   // Guard the destructive "regenerate" (overwrites the existing plan).
   const [confirmRegenOpen, setConfirmRegenOpen] = useState(false);
+  // Side-by-side compare before committing a plan restore.
+  const [comparePlanOpen, setComparePlanOpen] = useState(false);
   const [pushing, setPushing] = useState(false);
   const [pushResult, setPushResult] = useState<string>("");
   const [pushError, setPushError] = useState<string>("");
@@ -373,7 +376,7 @@ export default function Session5Form({
                 {generating ? "Generating..." : hasPlan ? "Regenerate Plan" : "Generate Plan"}
               </Button>
               {data.plan_previous && planExists(data.plan_previous) && (
-                <Button variant="outlined" onClick={handleRestorePlan} disabled={generating}
+                <Button variant="outlined" onClick={() => setComparePlanOpen(true)} disabled={generating}
                   startIcon={<RestoreIcon />}>
                   Restore previous plan
                 </Button>
@@ -874,6 +877,37 @@ export default function Session5Form({
         confirmLabel="Regenerate"
         onConfirm={() => { setConfirmRegenOpen(false); handleGenerate(); }}
         onCancel={() => setConfirmRegenOpen(false)}
+      />
+
+      <CompareRestoreDialog
+        open={comparePlanOpen}
+        title="Compare plan versions"
+        rows={(() => {
+          const prev = (data.plan_previous || {}) as Record<string, any>;
+          const fmt = (v: any): string => {
+            if (Array.isArray(v)) {
+              return v.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join("\n");
+            }
+            return v == null ? "" : String(v);
+          };
+          const fields: [string, string][] = [
+            ["General instructions", "plan_general_instructions"],
+            ["Narrative", "plan_narrative"],
+            ["Sample questions", "plan_sample_questions"],
+            ["Filters", "plan_sql_filters"],
+            ["Dimensions", "plan_sql_dimensions"],
+            ["Measures", "plan_sql_measures"],
+            ["Example queries", "plan_example_queries"],
+            ["Joins", "plan_joins"],
+          ];
+          return fields.map(([label, key]) => ({
+            label,
+            current: fmt(data[key]),
+            previous: fmt(prev[key]),
+          }));
+        })()}
+        onConfirm={() => { setComparePlanOpen(false); handleRestorePlan(); }}
+        onCancel={() => setComparePlanOpen(false)}
       />
     </Box>
   );

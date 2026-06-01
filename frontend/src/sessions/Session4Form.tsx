@@ -102,7 +102,9 @@ export default function Session4Form({
   // PATCH endpoint (api.setBenchmarkBoApproved) rather than going through
   // the normal section save path so it doesn't conflict with optimistic
   // locking on the rest of S4.
-  const canToggleBoApproved = !!isCoeMember || !!isBoOnly;
+  // BO-Approved is intentionally NOT gatekept by group — anyone who can view
+  // the engagement (and isn't in global read-only mode) can toggle it.
+  const canToggleBoApproved = !readOnly;
   const [summary, setSummary] = useState("");
   const [loadingSummary, setLoadingSummary] = useState(false);
   const [briefError, setBriefError] = useState("");

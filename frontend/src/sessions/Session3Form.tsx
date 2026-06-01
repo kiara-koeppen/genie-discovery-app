@@ -17,6 +17,7 @@ import ExpandableTextField from "../components/ExpandableTextField";
 import UCColumnPicker from "../components/UCColumnPicker";
 import DataSourcesPanel from "../components/DataSourcesPanel";
 import ConfirmDialog from "../components/ConfirmDialog";
+import CompareRestoreDialog from "../components/CompareRestoreDialog";
 import { api } from "../api";
 import type { ColumnDef, SynonymTarget } from "../types";
 
@@ -100,6 +101,8 @@ export default function Session3Form({
   const [mvConflict, setMvConflict] = useState<{ fqn: string; owner: string | null } | null>(null);
   // Guard the destructive "redraft" (overwrites existing YAML). See ConfirmDialog below.
   const [confirmRedraftOpen, setConfirmRedraftOpen] = useState(false);
+  // Side-by-side compare before committing a YAML restore.
+  const [compareMvOpen, setCompareMvOpen] = useState(false);
 
   // Session 2 vocabulary
   const vocabTerms = useMemo(
@@ -1190,7 +1193,7 @@ export default function Session3Form({
               <Button
                 variant="outlined"
                 startIcon={<RestoreIcon />}
-                onClick={handleRestoreMvYaml}
+                onClick={() => setCompareMvOpen(true)}
                 disabled={mvDrafting}
               >
                 Restore previous version
@@ -1347,6 +1350,18 @@ export default function Session3Form({
         confirmLabel="Redraft"
         onConfirm={() => { setConfirmRedraftOpen(false); handleDraftMvYaml(); }}
         onCancel={() => setConfirmRedraftOpen(false)}
+      />
+
+      <CompareRestoreDialog
+        open={compareMvOpen}
+        title="Compare metric view YAML versions"
+        rows={[{
+          label: "Metric View YAML",
+          current: data.metric_view_yaml || "",
+          previous: data.metric_view_yaml_previous || "",
+        }]}
+        onConfirm={() => { setCompareMvOpen(false); handleRestoreMvYaml(); }}
+        onCancel={() => setCompareMvOpen(false)}
       />
     </Box>
   );
