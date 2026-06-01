@@ -13,8 +13,19 @@ import AddIcon from "@mui/icons-material/Add";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import LockIcon from "@mui/icons-material/Lock";
 import MenuBookIcon from "@mui/icons-material/MenuBook";
+import RestoreIcon from "@mui/icons-material/Restore";
 import ExpandableTextField from "../components/ExpandableTextField";
+import ConfirmDialog from "../components/ConfirmDialog";
 import { api, SqlSnippet, ExampleQuery, UcJoin, BenchmarkQuestion } from "../api";
+
+// The Session 5 plan fields that a regeneration overwrites. Order doesn't
+// matter; this is the set we snapshot into `plan_previous` (for restore) and
+// re-apply on restore.
+const PLAN_SCALAR_FIELDS = ["plan_general_instructions", "plan_narrative"] as const;
+const PLAN_ARRAY_FIELDS = [
+  "plan_sample_questions", "plan_sql_filters", "plan_sql_dimensions",
+  "plan_sql_measures", "plan_example_queries", "plan_joins",
+] as const;
 
 interface Props {
   data: Record<string, any>;
@@ -40,6 +51,8 @@ export default function Session5Form({
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string>("");
   const [generateWarnings, setGenerateWarnings] = useState<string[]>([]);
+  // Guard the destructive "regenerate" (overwrites the existing plan).
+  const [confirmRegenOpen, setConfirmRegenOpen] = useState(false);
   const [pushing, setPushing] = useState(false);
   const [pushResult, setPushResult] = useState<string>("");
   const [pushError, setPushError] = useState<string>("");
@@ -85,13 +98,34 @@ export default function Session5Form({
       .catch((err) => setWarehouseLoadError(err.message || "Failed to load warehouses"));
   }, []);
 
+  // Snapshot the current plan fields so a regeneration can be undone. Returns
+  // a plain object stored in `plan_previous` (a regular session-5 column, so it
+  // rides the normal save/load cycle).
+  const snapshotPlan = (): Record<string, any> => {
+    const snap: Record<string, any> = {};
+    for (const f of PLAN_SCALAR_FIELDS) snap[f] = data[f] || "";
+    for (const f of PLAN_ARRAY_FIELDS) snap[f] = data[f] || [];
+    return snap;
+  };
+
+  // True if there's a plan worth backing up / confirming before overwrite.
+  const planExists = (src: Record<string, any>): boolean => !!(
+    src.plan_general_instructions ||
+    (src.plan_sample_questions || []).length ||
+    (src.plan_sql_measures || []).length
+  );
+
   const handleGenerate = async () => {
     if (!engagementId) return;
+    // Snapshot BEFORE the call so the prior plan can be restored. `data` is
+    // stable across the await.
+    const prior = snapshotPlan();
     setGenerating(true);
     setGenerateError("");
     setGenerateWarnings([]);
     try {
       const plan = await api.generatePlan(engagementId, data.plan_warehouse_id || "");
+      if (planExists(prior)) onChange("plan_previous", prior);
       onChange("plan_general_instructions", plan.general_instructions);
       onChange("plan_sample_questions", plan.sample_questions);
       onChange("plan_sql_filters", plan.sql_filters);
@@ -105,6 +139,22 @@ export default function Session5Form({
       setGenerateError(err.message || "Generate failed");
     }
     setGenerating(false);
+  };
+
+  // Regenerate is destructive. Confirm first if a plan already exists.
+  const requestGenerate = () => {
+    if (planExists(data)) setConfirmRegenOpen(true);
+    else handleGenerate();
+  };
+
+  // Swap current plan <-> plan_previous so Restore is a reversible toggle.
+  const handleRestorePlan = () => {
+    const prev = data.plan_previous;
+    if (!prev || typeof prev !== "object") return;
+    const cur = snapshotPlan();
+    for (const f of PLAN_SCALAR_FIELDS) onChange(f, prev[f] || "");
+    for (const f of PLAN_ARRAY_FIELDS) onChange(f, prev[f] || []);
+    onChange("plan_previous", cur);
   };
 
   // Joins handlers (analyst-editable; auto-detected UC FK rows are source="uc_foreign_key"
@@ -317,11 +367,18 @@ export default function Session5Form({
             section below before pushing.
           </Typography>
           {!readOnly && (
-            <Button variant="contained" color="primary" onClick={handleGenerate} disabled={generating}
-              startIcon={generating ? <CircularProgress size={18} /> : <AutoAwesomeIcon />}
-              sx={{ mb: 2 }}>
-              {generating ? "Generating..." : hasPlan ? "Regenerate Plan" : "Generate Plan"}
-            </Button>
+            <Stack direction="row" spacing={1} sx={{ mb: 2, flexWrap: "wrap" }}>
+              <Button variant="contained" color="primary" onClick={requestGenerate} disabled={generating}
+                startIcon={generating ? <CircularProgress size={18} /> : <AutoAwesomeIcon />}>
+                {generating ? "Generating..." : hasPlan ? "Regenerate Plan" : "Generate Plan"}
+              </Button>
+              {data.plan_previous && planExists(data.plan_previous) && (
+                <Button variant="outlined" onClick={handleRestorePlan} disabled={generating}
+                  startIcon={<RestoreIcon />}>
+                  Restore previous plan
+                </Button>
+              )}
+            </Stack>
           )}
           {generateError && (
             <Alert severity="error" sx={{ mb: 2, whiteSpace: "pre-wrap" }}>
@@ -805,6 +862,19 @@ export default function Session5Form({
           )}
         </AccordionDetails>
       </Accordion>
+
+      <ConfirmDialog
+        open={confirmRegenOpen}
+        title="Regenerate the plan?"
+        message={
+          "This replaces the current plan (instructions, sample questions, filters, " +
+          "dimensions, measures, example queries, joins) with a fresh AI draft.\n\n" +
+          "Your current plan is saved first, so you can use \"Restore previous plan\" to get it back."
+        }
+        confirmLabel="Regenerate"
+        onConfirm={() => { setConfirmRegenOpen(false); handleGenerate(); }}
+        onCancel={() => setConfirmRegenOpen(false)}
+      />
     </Box>
   );
 }

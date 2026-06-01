@@ -128,6 +128,8 @@ export interface Session3Data {
   data_gaps: DataGap[];
   scope_boundaries: ScopeBoundary[];
   metric_view_yaml: string;
+  /** Backup of the prior YAML, written before an AI redraft so it can be restored. */
+  metric_view_yaml_previous?: string;
 }
 
 /* Session 4: COE Review */
@@ -151,6 +153,9 @@ export interface Session4Data {
 export interface Session5Data {
   genie_space_id: string;
   genie_space_config: string;
+  /** Backup snapshot of the plan_* fields, written immediately before a plan
+   *  regeneration so the analyst can restore the prior version. */
+  plan_previous?: Record<string, any>;
 }
 
 /* Session 6: Prototype Review */

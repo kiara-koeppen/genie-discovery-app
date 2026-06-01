@@ -11,10 +11,12 @@ import TableChartIcon from "@mui/icons-material/TableChart";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
+import RestoreIcon from "@mui/icons-material/Restore";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
 import UCColumnPicker from "../components/UCColumnPicker";
 import DataSourcesPanel from "../components/DataSourcesPanel";
+import ConfirmDialog from "../components/ConfirmDialog";
 import { api } from "../api";
 import type { ColumnDef, SynonymTarget } from "../types";
 
@@ -96,6 +98,8 @@ export default function Session3Form({
   const [mvSuccess, setMvSuccess] = useState<string>("");
   const [mvWarnings, setMvWarnings] = useState<string[]>([]);
   const [mvConflict, setMvConflict] = useState<{ fqn: string; owner: string | null } | null>(null);
+  // Guard the destructive "redraft" (overwrites existing YAML). See ConfirmDialog below.
+  const [confirmRedraftOpen, setConfirmRedraftOpen] = useState(false);
 
   // Session 2 vocabulary
   const vocabTerms = useMemo(
@@ -326,12 +330,17 @@ export default function Session3Form({
 
   const handleDraftMvYaml = async () => {
     if (!engagementId) return;
+    // Snapshot the current YAML BEFORE the call so the analyst can restore it
+    // if the AI redraft isn't what they wanted. `data` doesn't change during
+    // the await, so capturing it here is safe.
+    const prevYaml = (data.metric_view_yaml || "").trim();
     setMvDrafting(true);
     setMvError("");
     setMvSuccess("");
     setMvWarnings([]);
     try {
       const res = await api.draftMetricViewYaml(engagementId, mvWarehouseId);
+      if (prevYaml) onChange("metric_view_yaml_previous", data.metric_view_yaml);
       onChange("metric_view_yaml", res.yaml);
       if (res.suggested_name && !mvName) setMvName(res.suggested_name);
       if (res.warnings && res.warnings.length > 0) setMvWarnings(res.warnings);
@@ -340,6 +349,22 @@ export default function Session3Form({
     } finally {
       setMvDrafting(false);
     }
+  };
+
+  // Redraft is destructive (overwrites the current YAML). If there's existing
+  // YAML, confirm first; otherwise (first draft) just run it.
+  const requestDraftMvYaml = () => {
+    if ((data.metric_view_yaml || "").trim()) setConfirmRedraftOpen(true);
+    else handleDraftMvYaml();
+  };
+
+  // Swap current <-> previous so Restore is a reversible toggle (undo/redo).
+  const handleRestoreMvYaml = () => {
+    const prev = data.metric_view_yaml_previous || "";
+    if (!prev) return;
+    const cur = data.metric_view_yaml || "";
+    onChange("metric_view_yaml", prev);
+    onChange("metric_view_yaml_previous", cur);
   };
 
   const submitCreateMv = async (overwrite: boolean) => {
@@ -1156,11 +1181,21 @@ export default function Session3Form({
             <Button
               variant="contained"
               startIcon={mvDrafting ? <CircularProgress size={16} /> : <AutoAwesomeIcon />}
-              onClick={handleDraftMvYaml}
+              onClick={requestDraftMvYaml}
               disabled={readOnly || !mvReady || mvDrafting || !engagementId}
             >
               {data.metric_view_yaml ? "Redraft YAML with AI" : "Generate YAML with AI"}
             </Button>
+            {data.metric_view_yaml_previous && !readOnly && (
+              <Button
+                variant="outlined"
+                startIcon={<RestoreIcon />}
+                onClick={handleRestoreMvYaml}
+                disabled={mvDrafting}
+              >
+                Restore previous version
+              </Button>
+            )}
             <Typography variant="caption" color="text.secondary" sx={{ alignSelf: "center" }}>
               Uses Sessions 1-3 as context. Always review before creating.
             </Typography>
@@ -1301,6 +1336,18 @@ export default function Session3Form({
           </Button>
         </DialogActions>
       </Dialog>
+
+      <ConfirmDialog
+        open={confirmRedraftOpen}
+        title="Redraft the metric view YAML?"
+        message={
+          "This replaces your current YAML with a fresh AI draft.\n\n" +
+          "Your current version is saved first, so you can use \"Restore previous version\" to get it back."
+        }
+        confirmLabel="Redraft"
+        onConfirm={() => { setConfirmRedraftOpen(false); handleDraftMvYaml(); }}
+        onCancel={() => setConfirmRedraftOpen(false)}
+      />
     </Box>
   );
 }

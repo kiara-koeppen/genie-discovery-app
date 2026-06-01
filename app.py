@@ -56,14 +56,14 @@ SESSION_COLS = {
     2: ["question_bank", "vocabulary_metrics"],
     3: ["term_classifications", "sql_expressions", "text_instructions",
         "data_gaps", "scope_boundaries", "global_filter",
-        "metric_view_yaml", "metric_view_fqn"],
+        "metric_view_yaml", "metric_view_yaml_previous", "metric_view_fqn"],
     4: ["analyst_commentary", "auto_summary", "data_plan", "benchmark_questions",
         "brief_unacknowledged_gaps",
         "coe_approval_status", "coe_approval_notes", "coe_reviewer_email"],
     5: ["genie_space_id", "genie_space_config",
         "plan_general_instructions", "plan_sample_questions", "plan_narrative",
         "plan_sql_filters", "plan_sql_dimensions", "plan_sql_measures",
-        "plan_example_queries", "plan_joins",
+        "plan_example_queries", "plan_joins", "plan_previous",
         "plan_warehouse_id", "genie_space_url", "genie_space_pushed_at"],
     6: ["prototype_results", "fixes_log", "benchmarks", "phrasing_notes"],
 }
@@ -74,7 +74,7 @@ SESSION_COLS = {
 # treat it as JSON.
 SCALAR_COLS = {
     "global_filter",
-    "metric_view_yaml", "metric_view_fqn", "auto_summary",
+    "metric_view_yaml", "metric_view_yaml_previous", "metric_view_fqn", "auto_summary",
     "coe_approval_status", "coe_approval_notes", "coe_reviewer_email",
     "genie_space_id", "genie_space_config",
     "plan_general_instructions", "plan_narrative", "plan_warehouse_id",
@@ -83,7 +83,12 @@ SCALAR_COLS = {
 
 # Columns whose JSON shape is an object (not an array). Used to pick the
 # right empty-default and the right fallback when parse fails.
-OBJECT_COLS = {"analyst_commentary"}
+#
+# `plan_previous` is a backup snapshot of the Session 5 plan_* fields, written
+# by the frontend immediately before a plan regeneration so the analyst can
+# restore the prior version. It rides the normal save/load cycle (it's a
+# regular SESSION_COLS[5] column), so nothing special-cases it.
+OBJECT_COLS = {"analyst_commentary", "plan_previous"}
 
 
 def _default_section_value(col):
