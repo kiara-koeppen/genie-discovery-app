@@ -21,6 +21,7 @@ export const SESSION_LABELS: Record<number, string> = {
   4: "4: COE Review",
   5: "5: Configure Space",
   6: "6: Prototype Review",
+  7: "7: Production Review",
 };
 
 export const SESSION_SECTIONS: Record<number, SectionEntry[]> = {
@@ -65,5 +66,10 @@ export const SESSION_SECTIONS: Record<number, SectionEntry[]> = {
     { id: "section-6-fixes", label: "Fixes Log" },
     { id: "section-6-new-benchmarks", label: "New Benchmarks Captured" },
     { id: "section-6-phrasing", label: "Phrasing & Entity Matching Notes" },
+  ],
+  7: [
+    { id: "section-7-readiness", label: "Production Readiness Checklist" },
+    { id: "section-7-access", label: "Space Access Review" },
+    { id: "section-7-signoff", label: "Production Sign-off" },
   ],
 };

@@ -23,6 +23,7 @@ export interface SessionData {
   "4": Session4Data;
   "5": Session5Data;
   "6": Session6Data;
+  "7": Session7Data;
 }
 
 /* Session 1: Business Context Discovery */
@@ -193,6 +194,24 @@ export interface Session6Data {
   fixes_log: FixEntry[];
   benchmarks: Benchmark[];
   phrasing_notes: PhrasingNote[];
+}
+
+/* Session 7: Production Review */
+export interface ProductionChecklistItem {
+  label: string;
+  done: boolean;
+  notes: string;
+}
+
+export interface Session7Data {
+  production_checklist: ProductionChecklistItem[];
+  /** Free-text notes on who SHOULD have access, for reconciliation against
+   *  the live Genie space ACL. */
+  prod_access_notes: string;
+  /** COE production sign-off (recorded only — does not gate anything). */
+  prod_approval_status: string;
+  prod_approval_notes: string;
+  prod_reviewer_email: string;
 }
 
 /* Editable table column config */

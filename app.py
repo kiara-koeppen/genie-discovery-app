@@ -66,7 +66,13 @@ SESSION_COLS = {
         "plan_example_queries", "plan_joins", "plan_previous",
         "plan_warehouse_id", "genie_space_url", "genie_space_pushed_at"],
     6: ["prototype_results", "fixes_log", "benchmarks", "phrasing_notes"],
+    7: ["production_checklist", "prod_access_notes",
+        "prod_approval_status", "prod_approval_notes", "prod_reviewer_email"],
 }
+
+# The highest session number. Used so save_session's "last session ->
+# status=complete" logic isn't hardcoded to a magic number.
+LAST_SESSION = max(SESSION_COLS)
 
 # Columns that store plain strings (not JSON-encoded structured data).
 # `analyst_commentary` was here historically but is now a JSON object
@@ -79,6 +85,8 @@ SCALAR_COLS = {
     "genie_space_id", "genie_space_config",
     "plan_general_instructions", "plan_narrative", "plan_warehouse_id",
     "genie_space_url", "genie_space_pushed_at",
+    "prod_access_notes", "prod_approval_status", "prod_approval_notes",
+    "prod_reviewer_email",
 }
 
 # Columns whose JSON shape is an object (not an array). Used to pick the
@@ -1278,11 +1286,15 @@ def save_session(eid, session_num, data):
             default = {} if col in OBJECT_COLS else []
             params[col] = json.dumps(data.get(col, default))
 
-    if session_num < 6:
+    if session_num < LAST_SESSION:
         set_parts.append(f"current_session = GREATEST(current_session, {session_num + 1})")
         set_parts.append("status = 'in_progress'")
     else:
-        set_parts.append("current_session = 6")
+        # Saving the final session (Production Review) marks the engagement
+        # complete. This moved from session 6 -> 7 when the production-review
+        # tab was added; completion now means the production sign-off step was
+        # reached, which matches the COE workflow.
+        set_parts.append(f"current_session = {LAST_SESSION}")
         set_parts.append("status = 'complete'")
 
     set_parts.append("updated_at = :ts")
@@ -1339,6 +1351,11 @@ def save_session_5(eid):
 @app.route("/api/engagements/<eid>/sessions/6", methods=["PUT"])
 def save_session_6(eid):
     return _save_session_response(eid, 6)
+
+
+@app.route("/api/engagements/<eid>/sessions/7", methods=["PUT"])
+def save_session_7(eid):
+    return _save_session_response(eid, 7)
 
 
 # ---------------------------------------------------------------------------
@@ -1863,6 +1880,98 @@ def coe_approve(eid):
         {"eid": eid, "status": status, "notes": notes, "reviewer": reviewer, "ts": ts},
     )
     return jsonify({"success": True, "updated_at": ts})
+
+
+@app.route("/api/engagements/<eid>/prod-approve", methods=["PUT"])
+def prod_approve(eid):
+    """Record the COE production sign-off (Session 7). Same server-side group
+    enforcement as coe_approve: only COE members can set it. This is a recorded
+    sign-off only -- it does NOT gate any other action (push, completion, etc.).
+
+    Writes prod_* directly (and bumps updated_at) like coe_approve; the client
+    refreshes its optimistic-lock token from the returned updated_at so the next
+    autosave doesn't 409.
+    """
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "reauth_required"}), 401
+    if not _user_is_coe_member(user_w):
+        return jsonify({
+            "error": f"Only members of the '{COE_GROUP}' group can sign off engagements.",
+        }), 403
+    data = request.json or {}
+    status = data.get("status", "")
+    notes = data.get("notes", "")
+    reviewer = get_current_user()
+    ts = now_ts()
+    sql_run(
+        f"UPDATE {TABLE} SET "
+        f"prod_approval_status = :status, prod_approval_notes = :notes, "
+        f"prod_reviewer_email = :reviewer, updated_at = :ts "
+        f"WHERE engagement_id = :eid",
+        {"eid": eid, "status": status, "notes": notes, "reviewer": reviewer, "ts": ts},
+    )
+    return jsonify({"success": True, "updated_at": ts})
+
+
+@app.route("/api/engagements/<eid>/space-access", methods=["GET"])
+def space_access(eid):
+    """Best-effort read of who currently has access to the engagement's pushed
+    Genie space (Session 7 "Space Access Review").
+
+    IMPORTANT: the REST permissions object-type for Genie spaces is not
+    documented in our verified sources, so this is intentionally best-effort:
+    we attempt the standard permissions API under OBO and, on ANY failure,
+    return {available: false} with a reason. The UI never presents fabricated
+    access data -- it falls back to a "manage sharing in Databricks" deep link.
+    Confirm/adjust the endpoint during smoke testing; if it works, keep it.
+    """
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "reauth_required"}), 401
+
+    rows = sql_exec(
+        f"SELECT genie_space_id, genie_space_url FROM {TABLE} WHERE engagement_id = :eid",
+        {"eid": eid},
+    )
+    if not rows:
+        return jsonify({"error": "Engagement not found"}), 404
+    space_id = (rows[0].get("genie_space_id") or "").strip()
+    space_url = (rows[0].get("genie_space_url") or "").strip()
+    if not space_id:
+        return jsonify({
+            "available": False,
+            "reason": "No Genie space has been pushed for this engagement yet.",
+            "space_url": "",
+        })
+
+    # Convention-following attempt at the permissions API. Wrapped so a wrong
+    # object-type or any error degrades gracefully instead of breaking the tab.
+    try:
+        resp = _genie_api_call(user_w, "GET", f"/api/2.0/permissions/genie/{space_id}")
+        acl = resp.get("access_control_list", []) if isinstance(resp, dict) else []
+        entries = []
+        for a in acl:
+            principal = (
+                a.get("user_name") or a.get("group_name")
+                or a.get("service_principal_name") or "unknown"
+            )
+            perms = a.get("all_permissions", []) or []
+            levels = [p.get("permission_level") for p in perms if p.get("permission_level")]
+            entries.append({"principal": principal, "levels": levels})
+        return jsonify({
+            "available": True,
+            "space_url": space_url,
+            "access": entries,
+        })
+    except Exception as e:
+        print(f"[space-access] permissions read failed for {space_id}: {e}", flush=True)
+        return jsonify({
+            "available": False,
+            "reason": "Live access list couldn't be read from this workspace. "
+                      "Use the link to manage sharing directly in Databricks.",
+            "space_url": space_url,
+        })
 
 
 @app.route("/api/engagements/<eid>/benchmarks/bo-approved", methods=["PATCH"])

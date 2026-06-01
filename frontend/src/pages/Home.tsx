@@ -14,7 +14,7 @@ import { api } from "../api";
 
 const SESSION_LABELS = [
   "Business Context", "Questions & Vocabulary", "Technical Design",
-  "COE Review", "Configure Space", "Prototype Review",
+  "COE Review", "Configure Space", "Prototype Review", "Production Review",
 ];
 
 const STATUS_COLORS: Record<string, "default" | "warning" | "success"> = {

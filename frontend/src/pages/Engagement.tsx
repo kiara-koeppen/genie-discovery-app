@@ -21,6 +21,7 @@ import Session3Form from "../sessions/Session3Form";
 import Session4Form from "../sessions/Session4Form";
 import Session5Form from "../sessions/Session5Form";
 import Session6Form from "../sessions/Session6Form";
+import Session7Form from "../sessions/Session7Form";
 import PreworkUploadModal from "../components/PreworkUploadModal";
 import SectionToc from "../components/SectionToc";
 
@@ -31,6 +32,7 @@ const SESSION_LABELS = [
   "4: COE Review",
   "5: Configure Space",
   "6: Prototype Review",
+  "7: Production Review",
 ];
 
 const AUTOSAVE_DELAY_MS = 2000;
@@ -107,6 +109,7 @@ export default function Engagement({ readOnly = false }: Props) {
         4: s["4"] || {},
         5: s["5"] || {},
         6: s["6"] || {},
+        7: s["7"] || {},
       });
       // Reset the SN URL autosave skip flag BEFORE setMeta. The
       // useEffect-on-meta-change pattern's "skip first run" only fires once
@@ -509,9 +512,9 @@ export default function Engagement({ readOnly = false }: Props) {
           currentSession={tab}
           onSessionChange={(idx) => setTab(idx)}
           visibleSessions={
-            isBoOnly ? [0, 1, 3] : [0, 1, 2, 3, 4, 5]
+            isBoOnly ? [0, 1, 3] : [0, 1, 2, 3, 4, 5, 6]
           }
-          lockedSessions={isApproved ? [] : [4, 5]}
+          lockedSessions={isApproved ? [] : [4, 5, 6]}
         />
 
         <Box sx={{ flex: 1, minWidth: 0 }}>
@@ -522,8 +525,8 @@ export default function Engagement({ readOnly = false }: Props) {
                 // BO users only see S1, S2, S4. S3, S5, S6 are hidden entirely
                 // (not just locked) so they don't see technical-design / configure-
                 // space / prototype-review surfaces.
-                if (isBoOnly && (i === 2 || i === 4 || i === 5)) return null;
-                const locked = (i === 4 || i === 5) && !isApproved;
+                if (isBoOnly && (i === 2 || i === 4 || i === 5 || i === 6)) return null;
+                const locked = (i === 4 || i === 5 || i === 6) && !isApproved;
                 return (
                   <Tab
                     key={i}
@@ -591,6 +594,15 @@ export default function Engagement({ readOnly = false }: Props) {
           />
         )}
         {tab === 5 && <Session6Form {...sessionProps(6)} />}
+        {tab === 6 && (
+          <Session7Form
+            {...sessionProps(7)}
+            engagementId={id}
+            isCoeMember={isCoeMember}
+            session5Data={sessionDrafts[5]}
+            onApproved={(ts) => { updatedAtRef.current = ts; }}
+          />
+        )}
       </Box>
 
           {/* Save Button — BOs only see it on S1+S2 (the only sections they can write).
