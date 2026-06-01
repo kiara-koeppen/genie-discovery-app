@@ -591,7 +591,10 @@ export default function Engagement({ readOnly = false }: Props) {
             engagementId={id}
             isCoeMember={isCoeMember}
             session5Data={sessionDrafts[5]}
-            onApproved={(ts) => { updatedAtRef.current = ts; }}
+            onApproved={(ts, engStatus) => {
+              updatedAtRef.current = ts;
+              if (engStatus) setData((prev: any) => (prev ? { ...prev, status: engStatus } : prev));
+            }}
           />
         )}
       </Box>

@@ -23,8 +23,9 @@ interface Props {
    *  link to the right space. */
   session5Data?: Record<string, any>;
   /** Called after a successful sign-off so the parent can refresh its
-   *  optimistic-lock token (updatedAtRef) and avoid 409s on autosave. */
-  onApproved?: (updatedAt: string) => void;
+   *  optimistic-lock token (updatedAtRef) and update the engagement status
+   *  chip immediately (approved => complete). */
+  onApproved?: (updatedAt: string, engagementStatus?: string) => void;
 }
 
 // Seeded when the checklist is empty. The analyst can edit text inline; toggling
@@ -94,8 +95,11 @@ export default function Session7Form({
     try {
       const res = await api.prodApprove(engagementId, { status, notes: signoffNotes });
       // Refresh the parent's lock token BEFORE the onChange cascade triggers an
-      // autosave, otherwise the next save 409s.
-      if (res.updated_at) onApproved?.(res.updated_at);
+      // autosave, otherwise the next save 409s. Also push the new engagement
+      // status so the top-level chip flips to "complete" without a reload.
+      if (res.updated_at) {
+        onApproved?.(res.updated_at, res.engagement_status || (status === "approved" ? "complete" : "in_progress"));
+      }
       onChange("prod_approval_status", status);
       onChange("prod_approval_notes", signoffNotes);
     } catch (e: any) {

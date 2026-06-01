@@ -1336,16 +1336,13 @@ def save_session(eid, session_num, data):
             default = {} if col in OBJECT_COLS else []
             params[col] = json.dumps(data.get(col, default))
 
-    if session_num < LAST_SESSION:
-        set_parts.append(f"current_session = GREATEST(current_session, {session_num + 1})")
-        set_parts.append("status = 'in_progress'")
-    else:
-        # Saving the final session (Production Review) marks the engagement
-        # complete. This moved from session 6 -> 7 when the production-review
-        # tab was added; completion now means the production sign-off step was
-        # reached, which matches the COE workflow.
-        set_parts.append(f"current_session = {LAST_SESSION}")
-        set_parts.append("status = 'complete'")
+    # Advance the progress pointer (capped at the final session). Completion is
+    # owned exclusively by the Session 7 production sign-off (see prod_approve):
+    # saving any session NEVER marks the engagement complete, and never
+    # downgrades one the COE has already signed off.
+    next_session = min(session_num + 1, LAST_SESSION)
+    set_parts.append(f"current_session = GREATEST(current_session, {next_session})")
+    set_parts.append("status = CASE WHEN status = 'complete' THEN 'complete' ELSE 'in_progress' END")
 
     set_parts.append("updated_at = :ts")
     set_sql = ", ".join(set_parts)
@@ -1953,15 +1950,20 @@ def prod_approve(eid):
     status = data.get("status", "")
     notes = data.get("notes", "")
     reviewer = get_current_user()
+    # Engagement completion is owned by this sign-off: the engagement only shows
+    # 'complete' once Section 7 is approved. Anything else (changes_requested,
+    # pending) holds it at 'in_progress'.
+    eng_status = "complete" if status == "approved" else "in_progress"
     ts = now_ts()
     sql_run(
         f"UPDATE {TABLE} SET "
         f"prod_approval_status = :status, prod_approval_notes = :notes, "
-        f"prod_reviewer_email = :reviewer, updated_at = :ts "
+        f"prod_reviewer_email = :reviewer, status = :eng_status, updated_at = :ts "
         f"WHERE engagement_id = :eid",
-        {"eid": eid, "status": status, "notes": notes, "reviewer": reviewer, "ts": ts},
+        {"eid": eid, "status": status, "notes": notes, "reviewer": reviewer,
+         "eng_status": eng_status, "ts": ts},
     )
-    return jsonify({"success": True, "updated_at": ts})
+    return jsonify({"success": True, "updated_at": ts, "engagement_status": eng_status})
 
 
 @app.route("/api/engagements/<eid>/space-access", methods=["GET"])

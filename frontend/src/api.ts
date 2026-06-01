@@ -241,10 +241,10 @@ export const api = {
   /** Production sign-off (Session 7). COE-only, enforced server-side.
    *  Returns updated_at so the caller can refresh its optimistic-lock token. */
   prodApprove: (id: string, data: { status: string; notes: string }) =>
-    json<{ success: boolean; updated_at?: string }>(`/engagements/${id}/prod-approve`, {
-      method: "PUT",
-      body: JSON.stringify(data),
-    }),
+    json<{ success: boolean; updated_at?: string; engagement_status?: string }>(
+      `/engagements/${id}/prod-approve`,
+      { method: "PUT", body: JSON.stringify(data) },
+    ),
 
   /** Best-effort "who has access" to the pushed Genie space (Session 7).
    *  available=false when no space is pushed or the permissions read fails;
