@@ -249,23 +249,14 @@ export default function Engagement({ readOnly = false }: Props) {
     snUrlSaveTimer.current = setTimeout(async () => {
       setSaveStatus("saving");
       try {
-        const res = await api.updateEngagement(
-          id,
-          { ...meta, status: data?.status || "in_progress" },
-          updatedAtRef.current,
-        );
-        if (res.updated_at) updatedAtRef.current = res.updated_at;
+        // Dedicated lightweight endpoint: no optimistic lock, so it never races
+        // the session autosave or reverts the typed URL on a stale token.
+        await api.saveServiceNowUrl(id, meta.servicenow_ticket_url);
         setData((prev: any) => (prev ? { ...prev, servicenow_ticket_url: meta.servicenow_ticket_url } : prev));
         setSaveStatus("saved");
       } catch (err: any) {
         setSaveStatus("error");
-        const msg = err?.message || "unknown";
-        if (msg.toLowerCase().includes("updated by another user")) {
-          setToast("This engagement was updated elsewhere. Reloading...");
-          await load();
-        } else {
-          setToast(`Error saving ServiceNow link: ${msg}`);
-        }
+        setToast(`Error saving ServiceNow link: ${err?.message || "unknown"}`);
       }
     }, AUTOSAVE_DELAY_MS);
     return () => {

@@ -827,6 +827,9 @@ def _bo_can_access(method, sub_path):
         return True
     if method == "PATCH" and sub_path == "/benchmarks/bo-approved":
         return True
+    # ServiceNow URL lives in the Session 1 view BOs can edit.
+    if method == "PATCH" and sub_path == "/servicenow-url":
+        return True
     # Pre-work Excel upload: BOs can upload their own filled-in template and
     # apply it to S1/S2 (the only sessions they have edit rights to anyway).
     if method == "POST" and sub_path in ("/parse-prework", "/apply-prework"):
@@ -1180,7 +1183,6 @@ def update_engagement(eid):
         f"genie_space_name = :space_name, business_owner_name = :bo_name, "
         f"business_owner_email = :bo_email, analyst_name = :a_name, "
         f"analyst_email = :a_email, servicenow_ticket_url = :sn_url, "
-        f"current_session = :session_num, "
         f"status = :status, updated_at = :ts "
         f"WHERE engagement_id = :eid",
         {
@@ -1191,12 +1193,31 @@ def update_engagement(eid):
             "a_name": (data.get("analyst_name") or "").strip(),
             "a_email": (data.get("analyst_email") or "").strip(),
             "sn_url": (data.get("servicenow_ticket_url") or "").strip(),
-            "session_num": str(data.get("current_session", 1)),
             "status": data.get("status", "draft"),
             "ts": ts,
         },
     )
     return jsonify({"success": True, "updated_at": _read_updated_at(eid)})
+
+
+@app.route("/api/engagements/<eid>/servicenow-url", methods=["PATCH"])
+def patch_servicenow_url(eid):
+    """Update ONLY servicenow_ticket_url.
+
+    Lightweight side-field write, modeled on the BO-Approved PATCH: it lives
+    OUTSIDE the optimistic lock and does NOT bump updated_at, so it can never
+    race/409 the analyst's session autosave (which would otherwise reload and
+    silently revert the typed URL). It also doesn't touch current_session, so
+    saving the URL never regresses engagement progress. Existence/auth is
+    handled by the before_request gate.
+    """
+    data = request.json or {}
+    url = (data.get("servicenow_ticket_url") or "").strip()
+    sql_run(
+        f"UPDATE {TABLE} SET servicenow_ticket_url = :u WHERE engagement_id = :eid",
+        {"eid": eid, "u": url},
+    )
+    return jsonify({"success": True})
 
 
 @app.route("/api/engagements/<eid>", methods=["DELETE"])

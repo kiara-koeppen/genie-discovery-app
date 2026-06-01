@@ -207,6 +207,14 @@ export const api = {
   deleteEngagement: (id: string) =>
     json<{ success: boolean }>(`/engagements/${id}`, { method: "DELETE" }),
 
+  /** Save ONLY the ServiceNow URL. Lightweight write outside the optimistic
+   *  lock (no If-Match), so it never races the session autosave or reverts. */
+  saveServiceNowUrl: (id: string, url: string) =>
+    json<{ success: boolean }>(`/engagements/${id}/servicenow-url`, {
+      method: "PATCH",
+      body: JSON.stringify({ servicenow_ticket_url: url }),
+    }),
+
   /** Save a session. If `ifMatch` is provided (the engagement's last-known
    * updated_at), the server returns 409 if the row has been changed by
    * another user since. Returns the new updated_at on success. */
