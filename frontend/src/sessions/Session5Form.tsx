@@ -3,8 +3,9 @@ import {
   Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert,
   TextField, Button, Chip, Paper, Divider, ToggleButton, ToggleButtonGroup,
   Link, List, ListItem, IconButton, CircularProgress, MenuItem, Select,
-  Table, TableBody, TableCell, TableHead, TableRow, Stack,
+  Table, TableBody, TableCell, TableHead, TableRow, Stack, Checkbox, FormControlLabel,
 } from "@mui/material";
+import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import RocketLaunchIcon from "@mui/icons-material/RocketLaunch";
@@ -56,6 +57,34 @@ export default function Session5Form({
   const [confirmRegenOpen, setConfirmRegenOpen] = useState(false);
   // Side-by-side compare before committing a plan restore.
   const [comparePlanOpen, setComparePlanOpen] = useState(false);
+
+  // --- Acknowledgments gate (unlocks Prototype Review) ---------------------
+  const ack = (data.acknowledgments || {}) as Record<string, any>;
+  const ackAccepted = !!ack.accepted_at;
+  const [ackBoxes, setAckBoxes] = useState({
+    reviewed_ai: !!ack.reviewed_ai,
+    no_share: !!ack.no_share,
+    best_practices: !!ack.best_practices,
+  });
+  const [accepting, setAccepting] = useState(false);
+  const [ackError, setAckError] = useState("");
+  const allChecked = ackBoxes.reviewed_ai && ackBoxes.no_share && ackBoxes.best_practices;
+
+  const handleAccept = async () => {
+    if (!engagementId || !allChecked) return;
+    setAccepting(true);
+    setAckError("");
+    try {
+      const res = await api.acknowledge(engagementId, ackBoxes);
+      // Persist into the draft so the parent's gate (which reads
+      // sessionDrafts[5].acknowledgments.accepted_at) unlocks Prototype Review.
+      onChange("acknowledgments", res.acknowledgments);
+    } catch (e: any) {
+      setAckError(e.message || String(e));
+    } finally {
+      setAccepting(false);
+    }
+  };
   const [pushing, setPushing] = useState(false);
   const [pushResult, setPushResult] = useState<string>("");
   const [pushError, setPushError] = useState<string>("");
@@ -862,6 +891,65 @@ export default function Session5Form({
                 </Link>
               </Box>
             </Paper>
+          )}
+        </AccordionDetails>
+      </Accordion>
+
+      {/* Acknowledgments — required to unlock Prototype Review (Session 6) */}
+      <Accordion id="section-5-acknowledgments" defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="h6">Acknowledgments</Typography>
+            {ackAccepted
+              ? <Chip icon={<CheckCircleIcon />} label="Accepted" color="success" size="small" />
+              : <Chip icon={<LockIcon sx={{ fontSize: 14 }} />} label="Required to continue" size="small" color="warning" />}
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Before Prototype Review unlocks, confirm you understand your responsibilities
+            for this space.
+          </Typography>
+
+          {ackAccepted ? (
+            <Alert severity="success" icon={<CheckCircleIcon />}>
+              Accepted by <strong>{ack.accepted_by || "unknown"}</strong>
+              {ack.accepted_at ? ` on ${ack.accepted_at}` : ""}.
+            </Alert>
+          ) : (
+            <Box>
+              <FormControlLabel
+                control={<Checkbox checked={ackBoxes.reviewed_ai} disabled={readOnly}
+                  onChange={(e) => setAckBoxes((p) => ({ ...p, reviewed_ai: e.target.checked }))} />}
+                label="I have reviewed the AI-generated configuration and verified it before pushing."
+              />
+              <FormControlLabel
+                control={<Checkbox checked={ackBoxes.no_share} disabled={readOnly}
+                  onChange={(e) => setAckBoxes((p) => ({ ...p, no_share: e.target.checked }))} />}
+                label="I will not share this Genie space with end users until it has received final production sign-off."
+              />
+              <FormControlLabel
+                control={<Checkbox checked={ackBoxes.best_practices} disabled={readOnly}
+                  onChange={(e) => setAckBoxes((p) => ({ ...p, best_practices: e.target.checked }))} />}
+                label="I have read and will follow the Databricks Genie best practices."
+              />
+              {ackError && <Alert severity="error" sx={{ my: 1 }}>{ackError}</Alert>}
+              <Box sx={{ mt: 2 }}>
+                <Button
+                  variant="contained"
+                  disabled={!allChecked || accepting || readOnly}
+                  startIcon={accepting ? <CircularProgress size={16} /> : <CheckCircleIcon />}
+                  onClick={handleAccept}
+                >
+                  I accept
+                </Button>
+                {!allChecked && (
+                  <Typography variant="caption" color="text.secondary" sx={{ ml: 2 }}>
+                    Check all three to continue.
+                  </Typography>
+                )}
+              </Box>
+            </Box>
           )}
         </AccordionDetails>
       </Accordion>

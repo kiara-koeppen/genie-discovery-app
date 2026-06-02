@@ -60,6 +60,7 @@ export const SESSION_SECTIONS: Record<number, SectionEntry[]> = {
     { id: "section-5-examples", label: "Example SQL Queries" },
     { id: "section-5-benchmarks", label: "Benchmark Questions" },
     { id: "section-5-push", label: "Push to Genie Space" },
+    { id: "section-5-acknowledgments", label: "Acknowledgments" },
   ],
   6: [
     { id: "section-6-scorecard", label: "Prototype Review Scorecard" },

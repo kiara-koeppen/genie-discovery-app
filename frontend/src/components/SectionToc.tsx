@@ -133,7 +133,7 @@ export default function SectionToc({
                 }}
               >
                 {isLocked ? (
-                  <Tooltip title="Requires COE approval">
+                  <Tooltip title="Locked until earlier steps are complete">
                     <LockIcon sx={{ fontSize: 14 }} />
                   </Tooltip>
                 ) : null}

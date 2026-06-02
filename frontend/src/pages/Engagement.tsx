@@ -369,6 +369,9 @@ export default function Engagement({ readOnly = false }: Props) {
   // COE approval gating
   const coeApprovalStatus = sessionDrafts[4]?.coe_approval_status || "";
   const isApproved = coeApprovalStatus === "approved";
+  // Section 5 acknowledgments must be accepted before Prototype Review (S6) and
+  // Production Review (S7) unlock. accepted_at is set only when all boxes checked.
+  const ackDone = !!sessionDrafts[5]?.acknowledgments?.accepted_at;
 
   const renderSaveIndicator = () => {
     if (readOnly) return null;
@@ -505,7 +508,7 @@ export default function Engagement({ readOnly = false }: Props) {
           visibleSessions={
             isBoOnly ? [0, 1, 3] : [0, 1, 2, 3, 4, 5, 6]
           }
-          lockedSessions={isApproved ? [] : [4, 5, 6]}
+          lockedSessions={!isApproved ? [4, 5, 6] : (!ackDone ? [5, 6] : [])}
         />
 
         <Box sx={{ flex: 1, minWidth: 0 }}>
@@ -517,14 +520,21 @@ export default function Engagement({ readOnly = false }: Props) {
                 // (not just locked) so they don't see technical-design / configure-
                 // space / prototype-review surfaces.
                 if (isBoOnly && (i === 2 || i === 4 || i === 5 || i === 6)) return null;
-                const locked = (i === 4 || i === 5 || i === 6) && !isApproved;
+                // S5 unlocks on COE approval; S6/S7 additionally require the
+                // Section 5 acknowledgments to be accepted.
+                const needsApproval = (i === 4 || i === 5 || i === 6) && !isApproved;
+                const needsAck = (i === 5 || i === 6) && isApproved && !ackDone;
+                const locked = needsApproval || needsAck;
+                const lockReason = needsApproval
+                  ? "Requires COE approval"
+                  : "Complete the acknowledgments in Configure Space";
                 return (
                   <Tab
                     key={i}
                     value={i}
                     label={
                       locked ? (
-                        <Tooltip title="Requires COE approval">
+                        <Tooltip title={lockReason}>
                           <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, opacity: 0.5 }}>
                             <LockIcon sx={{ fontSize: 14 }} />
                             {label}

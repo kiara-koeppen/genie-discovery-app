@@ -64,7 +64,8 @@ SESSION_COLS = {
         "plan_general_instructions", "plan_sample_questions", "plan_narrative",
         "plan_sql_filters", "plan_sql_dimensions", "plan_sql_measures",
         "plan_example_queries", "plan_joins", "plan_previous",
-        "plan_warehouse_id", "genie_space_url", "genie_space_pushed_at"],
+        "plan_warehouse_id", "genie_space_url", "genie_space_pushed_at",
+        "acknowledgments"],
     6: ["prototype_results", "fixes_log", "benchmarks", "phrasing_notes"],
     7: ["production_checklist", "prod_access_notes",
         "prod_approval_status", "prod_approval_notes", "prod_reviewer_email"],
@@ -96,7 +97,7 @@ SCALAR_COLS = {
 # by the frontend immediately before a plan regeneration so the analyst can
 # restore the prior version. It rides the normal save/load cycle (it's a
 # regular SESSION_COLS[5] column), so nothing special-cases it.
-OBJECT_COLS = {"analyst_commentary", "plan_previous"}
+OBJECT_COLS = {"analyst_commentary", "plan_previous", "acknowledgments"}
 
 
 def _default_section_value(col):
@@ -967,35 +968,6 @@ def api_user_role():
         "coe_group_name": COE_GROUP,
         "bo_group_name": BO_GROUP,
     })
-
-
-@app.route("/api/groups", methods=["GET"])
-def list_groups():
-    """Best-effort list of workspace group display names, for the Session 7
-    "intended access" picker. Like space-access, this is wrapped: SCIM group
-    listing may require admin / a scope the app's OBO token doesn't carry, so on
-    ANY failure we return {available: false} and the UI falls back to free-text.
-
-    This is for DOCUMENTING intended recipients only — the app cannot perform
-    the actual share (that needs the access-management scope, which Databricks
-    Apps can't grant to OBO tokens).
-    """
-    user_w = _user_workspace_client()
-    if not user_w:
-        return jsonify({"error": "reauth_required"}), 401
-    try:
-        resp = _genie_api_call(
-            user_w, "GET",
-            "/api/2.0/preview/scim/v2/Groups?attributes=displayName&count=500",
-        )
-        names = sorted(
-            g.get("displayName") for g in (resp.get("Resources") or [])
-            if g.get("displayName")
-        )
-        return jsonify({"available": True, "groups": names})
-    except Exception as e:
-        print(f"[groups] list failed: {e}", flush=True)
-        return jsonify({"available": False, "reason": str(e)[:200], "groups": []})
 
 
 # ---------------------------------------------------------------------------
@@ -1966,6 +1938,40 @@ def prod_approve(eid):
     return jsonify({"success": True, "updated_at": ts, "engagement_status": eng_status})
 
 
+@app.route("/api/engagements/<eid>/acknowledge", methods=["POST"])
+def acknowledge(eid):
+    """Record the analyst's Section 5 acknowledgments before Prototype Review
+    unlocks: that they reviewed the AI-generated config, won't share the space
+    until final sign-off, and will follow Genie best practices.
+
+    Lock-free side-write (like bo_approved / servicenow-url): does NOT bump
+    updated_at, so it can't race the session autosave. Server-stamps the
+    accepting user + timestamp for accountability. All three boxes must be
+    checked to count as accepted.
+    """
+    user_w = _user_workspace_client()
+    if not user_w:
+        return jsonify({"error": "reauth_required"}), 401
+    data = request.json or {}
+    reviewed_ai = bool(data.get("reviewed_ai"))
+    no_share = bool(data.get("no_share"))
+    best_practices = bool(data.get("best_practices"))
+    ack = {
+        "reviewed_ai": reviewed_ai,
+        "no_share": no_share,
+        "best_practices": best_practices,
+        # accepted_at is only set when ALL boxes are checked — that's what the
+        # frontend gate keys off to unlock Prototype Review.
+        "accepted_by": get_current_user() if (reviewed_ai and no_share and best_practices) else "",
+        "accepted_at": now_ts() if (reviewed_ai and no_share and best_practices) else "",
+    }
+    sql_run(
+        f"UPDATE {TABLE} SET acknowledgments = :ack WHERE engagement_id = :eid",
+        {"eid": eid, "ack": json.dumps(ack)},
+    )
+    return jsonify({"success": True, "acknowledgments": ack})
+
+
 @app.route("/api/engagements/<eid>/space-access", methods=["GET"])
 def space_access(eid):
     """Best-effort read of who currently has access to the engagement's pushed
@@ -2020,8 +2026,10 @@ def space_access(eid):
         print(f"[space-access] permissions read failed for {space_id}: {e}", flush=True)
         return jsonify({
             "available": False,
-            "reason": "Live access list couldn't be read from this workspace. "
-                      "Use the link to manage sharing directly in Databricks.",
+            "reason": "By design, this app can't read a Genie space's access list "
+                      "on your behalf (Databricks Apps can't be granted the "
+                      "access-management scope). Use the link to view and manage "
+                      "who has access directly in Databricks.",
             "space_url": space_url,
         })
 

@@ -246,6 +246,18 @@ export const api = {
       { method: "PUT", body: JSON.stringify(data) },
     ),
 
+  /** Record Section 5 acknowledgments (reviewed AI / won't share early /
+   *  follow best practices). Lock-free; server stamps accepted_by + accepted_at
+   *  (only when all three are true). Returns the stored acknowledgments object. */
+  acknowledge: (
+    id: string,
+    items: { reviewed_ai: boolean; no_share: boolean; best_practices: boolean },
+  ) =>
+    json<{ success: boolean; acknowledgments: Record<string, any> }>(
+      `/engagements/${id}/acknowledge`,
+      { method: "POST", body: JSON.stringify(items) },
+    ),
+
   /** Best-effort "who has access" to the pushed Genie space (Session 7).
    *  available=false when no space is pushed or the permissions read fails;
    *  the UI falls back to the space_url for managing sharing in Databricks. */

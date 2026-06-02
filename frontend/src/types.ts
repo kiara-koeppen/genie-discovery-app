@@ -157,6 +157,16 @@ export interface Session5Data {
   /** Backup snapshot of the plan_* fields, written immediately before a plan
    *  regeneration so the analyst can restore the prior version. */
   plan_previous?: Record<string, any>;
+  /** Section 5 acknowledgments gate (reviewed AI / won't share early / follow
+   *  best practices). accepted_at is set only when all three are checked, and
+   *  is what unlocks Prototype Review. */
+  acknowledgments?: {
+    reviewed_ai?: boolean;
+    no_share?: boolean;
+    best_practices?: boolean;
+    accepted_by?: string;
+    accepted_at?: string;
+  };
 }
 
 /* Session 6: Prototype Review */

@@ -228,8 +228,7 @@ export default function Session7Form({
 
               {access && !access.available && (
                 <Alert severity="info">
-                  {access.reason || "Live access list isn't available here."}{" "}
-                  Use “Manage sharing in Databricks” to view and adjust who has access.
+                  {access.reason || "Access list is managed directly in Databricks."}
                 </Alert>
               )}
             </Box>
