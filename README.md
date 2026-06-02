@@ -1,6 +1,6 @@
 # Genie Space Discovery App
 
-A structured workbook that guides an analyst + business owner pair through the full discovery needed to configure a Databricks Genie Space — from first conversation about pain points all the way through to a pushed, prototyped, benchmarked space. Workspace-portable: one `app.yaml` edit deploys it into any Databricks workspace.
+A structured workbook that guides an analyst + business owner pair through the full discovery needed to configure a Databricks Genie Space — from first conversation about pain points all the way through to a pushed, prototyped, benchmarked space and a COE production sign-off. Workspace-portable: one `app.yaml` edit deploys it into any Databricks workspace.
 
 ---
 
@@ -12,7 +12,7 @@ This is **not an official Databricks product or supported solution**. It is a pe
 
 ## What this app does
 
-The app is a 6-session workbook. Each session is a form backed by a Delta table so engagements persist across days/weeks. Below is the full capability surface, including the non-obvious behaviors that took iteration to get right.
+The app is a 7-session workbook. Each session is a form backed by a Delta table so engagements persist across days/weeks. Below is the full capability surface, including the non-obvious behaviors that took iteration to get right.
 
 ### Session 1 — Business Context (Analyst + BO)
 - Capture pain points, existing reports, business context Q&A.
@@ -58,6 +58,7 @@ S3 is data-sources-first: pick the tables and metric views the space will use *b
   - Click "Draft YAML" and the app produces a Databricks-spec metric view YAML grounded in the actual UC column schemas of the source tables (DESCRIBE-driven, no hallucinated columns).
   - The YAML honors the global filter, detected PK/FK joins, and the analyst's Session 3 SQL expressions.
   - "Create Metric View" deploys it to UC under your OBO token (respects your grants, not the app SP's). If the FQN already exists the app returns ownership info rather than overwriting blindly. Created MVs auto-appear in the Existing Metric Views section above so the analyst can immediately check them.
+  - **Redraft safety.** When YAML already exists, "Redraft YAML with AI" first asks for confirmation, then snapshots the current YAML before overwriting. A "Restore previous version" button opens a **side-by-side compare** (current vs. previous) so the analyst can see exactly what they'd revert to before committing — or keep the current version. The backup rides the normal save cycle, so it survives reloads.
 
 ### Session 4 — COE Review + Benchmarks (COE group)
 - **Readiness Brief** — async LLM call (via the background-job runner, see *Cross-cutting design choices*) that synthesizes Sessions 1–3 + Data Plan into a citation-backed brief with coverage analysis and a gaps section. Auto-fires on first visit if S1–S3 has any content; gated on having at least one S1 response, S2 question, or S3 SQL expression so a brand-new empty engagement doesn't trigger an LLM call.
@@ -71,8 +72,8 @@ S3 is data-sources-first: pick the tables and metric views the space will use *b
   - **Two-step SQL → summary flow** — the Measurement Summary is generated *from* the SQL in a second call, so the explanation always matches what the SQL actually does. A refresh button re-derives the summary from the current SQL.
   - **Run SQL inline** — per-row ▶ button and a Run All button execute each benchmark's SQL under the user's OBO token on a warehouse they pick. The runner polls for cold-warehouse startup (50s wait + 1.5s polling, 2-min outer deadline with auto-cancel). Results render in a small table right under the row; the sample result persists even when "Show Expected SQL" is toggled off.
   - SQL is always wrapped in `SELECT * FROM (...) __bm LIMIT N` so an inner `LIMIT` or `ORDER BY` doesn't break the run.
-  - **BO approval checkbox** per benchmark — marks the row as validated and unlocks its use as a style exemplar in Session 5 (see below). Toggling this is the only mutation a BO-group user can perform on Session 4; the click is optimistic (UI flips immediately) and persists via a dedicated PATCH endpoint that lives outside the engagement's optimistic-lock so a BO clicking the checkbox can't 409 the analyst's autosave.
-- **COE approval gating** — Sessions 5 & 6 are locked until a COE group member approves the engagement. Non-members can view but not approve; membership is checked under OBO so the app can't be tricked with a shared SP.
+  - **BO approval checkbox** per benchmark — marks the row as validated and unlocks its use as a style exemplar in Session 5 (see below). **Intentionally not gatekept** — any authenticated user (analyst, COE, or BO) can toggle it. The click is optimistic (UI flips immediately) and persists via a dedicated PATCH endpoint that lives outside the engagement's optimistic-lock so the click can't 409 the analyst's autosave.
+- **COE approval gating** — Session 5 (Configure Space) is locked until a COE group member approves the engagement; Sessions 6 (Prototype Review) and 7 (Production Review) additionally require the analyst to accept the Session 5 acknowledgments (see Session 5). Non-members can view but not approve; membership is checked under OBO so the app can't be tricked with a shared SP.
 
 ### Session 5 — Configure Genie Space (Analyst, gated)
 This is where discovery becomes a real Genie Space configuration.
@@ -97,20 +98,31 @@ This is where discovery becomes a real Genie Space configuration.
    - **`column_configs`** — auto-built from Session 3's Classify Terms routing. Column-kind synonyms land in `column_configs.synonyms`; value-kind synonyms land in `column_configs.description` with `enable_entity_matching=true`. Cross-cutting (general-space) synonyms flow through `general_instructions` via the S5 LLM plan.
    - Push honors the engagement's optimistic lock (`If-Match: <updated_at>`). If another writer has bumped the engagement since the page loaded, push returns 409 with a clear "refresh before pushing" message instead of silently overwriting the live space with stale data.
 
+**Regenerate safety.** "Regenerate Plan" overwrites the entire plan. When a plan already exists it first asks for confirmation, then snapshots the prior plan before overwriting. "Restore previous plan" opens a **side-by-side compare** (current vs. previous, field by field) so the analyst can review before reverting — or keep current. The backup rides the normal save cycle and survives reloads.
+
+**Acknowledgments (required to unlock Prototype Review).** Before Sessions 6 and 7 unlock, the analyst must accept three attestations in Configure Space: (1) they reviewed the AI-generated configuration before pushing, (2) they will not share the space with end users until final production sign-off, and (3) they have read and will follow Databricks Genie best practices. All three boxes must be checked, then "I accept" records the accepting user + timestamp via a lock-free endpoint (server-stamped, so it can't be spoofed and can't race the autosave). This is the procedural control for "don't share early" — Genie has no "build but can't share" permission, so the app can't enforce it technically; the attestation creates an auditable record instead.
+
 ### Session 6 — Prototype Review (Analyst + BO, gated)
 - Run through the benchmark questions against the live space.
 - Scorecard, fixes log, phrasing notes for the BO to iterate on.
 
+### Session 7 — Production Review (Analyst + COE, gated)
+The final checkpoint before a space is treated as live. Three sections:
+- **Production Readiness Checklist** — seeded items (gold tables in place, benchmarks passing, data plan finalized, space pushed, end-user access confirmed) with per-item notes.
+- **Space Access Review** — a deep link to manage sharing in Databricks plus a free-text "intended access" field for documenting who *should* have access. A best-effort live access-list read is attempted, but Databricks Apps can't be granted the `access-management` scope, so by design this falls back to the Databricks sharing UI rather than showing a live ACL.
+- **Production Sign-off** — COE-only, server-enforced (mirrors the Session 4 COE gate). **Engagement completion is owned by this sign-off:** an engagement only shows `complete` once Section 7 is approved; saving any session (including Section 7) never marks it complete, and "Request changes" holds it at `in_progress`.
+
 ### Cross-cutting design choices
 
 - **Group-based access model.** Three roles, evaluated on every request under OBO:
-  - **Analyst (default).** Any authenticated app user can read all engagements and edit Sessions 1–6 except Session 4 COE approval. No email gating — discovery is a team activity.
-  - **COE group member** (`COE_GROUP_NAME`). Same as analyst, plus the right to approve/reject Session 4. Sessions 5 & 6 are locked behind COE approval.
-  - **BO group member** (`BO_GROUP_NAME`, optional). Tightly restricted: can read all engagements, edit Sessions 1 & 2, view Session 4, and toggle the BO Approved checkbox on benchmarks. Cannot edit S3/S5/S6 or trigger any AI button. The restriction is enforced in two layers: (1) the frontend hides tabs and AI controls; (2) a server-side `before_request` hook on `/api/engagements/<eid>/*` whitelists exactly those operations and 403s everything else, so a BO who bypasses the UI gets nothing.
+  - **Analyst (default).** Any authenticated app user can read all engagements and edit Sessions 1–7 except the Session 4 COE approval and Session 7 production sign-off (COE-only). No email gating — discovery is a team activity.
+  - **COE group member** (`COE_GROUP_NAME`). Same as analyst, plus the right to approve/reject Session 4 and to record the Session 7 production sign-off. Session 5 is locked behind COE approval; Sessions 6 & 7 additionally require the Session 5 acknowledgments to be accepted. Engagement completion (`status = complete`) happens only on the Session 7 sign-off.
+  - **BO group member** (`BO_GROUP_NAME`, optional). Tightly restricted: can read all engagements, edit Sessions 1 & 2, view Session 4, and toggle the BO Approved checkbox on benchmarks (which is open to everyone) and the ServiceNow URL. Cannot edit S3/S5/S6/S7 or trigger any AI button, and Session 7 is hidden entirely. The restriction is enforced in two layers: (1) the frontend hides tabs and AI controls; (2) a server-side `before_request` hook on `/api/engagements/<eid>/*` whitelists exactly those operations and 403s everything else, so a BO who bypasses the UI gets nothing.
   - COE wins over BO if a user is in both groups.
 - **Async job runner for long LLM calls.** Databricks Apps' gateway has a ~60s timeout on synchronous HTTP, but the readiness brief, generate-plan, draft-MV-YAML, and draft-benchmark-SQL flows can each take 60–180s wall-clock. Every long LLM call is dispatched as a background job (`POST /api/jobs/start` with `task_type=...`); the frontend polls `/api/jobs/<job_id>` every 2s until the job reaches `done` or `failed`. State is persisted in a Delta table (`discovery_jobs`) with token-usage tracking in `discovery_llm_usage`.
 - **Per-task LLM tunables.** Each task type has its own `max_tokens` (matched to expected output size) and model selection — precision-critical tasks (plan generation, MV YAML) use the strongest model; quick refinements (summary regeneration) use a faster, cheaper model. Prompt-length capped per task to avoid overruns. Failed LLM calls retry once with exponential backoff before surfacing the error.
-- **Optimistic-lock with auto-retry on saves.** Every engagement mutation carries an `If-Match: <updated_at>` header. On 409 (stale token), the frontend silently fetches fresh `updated_at`, retries once. Only on a second 409 does it fall back to a "reloading…" toast. The dedicated BO-Approved PATCH endpoint intentionally lives **outside** this lock so BO clicks never conflict with analyst autosaves.
+- **Optimistic-lock with auto-retry on saves.** Every engagement *session* mutation carries an `If-Match: <updated_at>` header. On 409 (stale token), the frontend silently fetches fresh `updated_at`, retries once. Only on a second 409 does it fall back to a "reloading…" toast.
+- **Lock-free side-writes for lightweight side fields.** A few small, independent fields are written through dedicated endpoints that live **outside** the optimistic lock and don't bump `updated_at`, so they can never race or revert the analyst's session autosave: the **BO-Approved** checkbox, the **ServiceNow URL** (a stale-token race here used to silently revert the typed URL — fixed by moving it off the lock), the **production sign-off** (`/prod-approve`), and the **Section 5 acknowledgments** (`/acknowledge`). The sign-off and acknowledge endpoints server-stamp the acting user + timestamp for accountability.
 - **`sql_exec` distinguishes cold-warehouse from genuine empty results.** A SQL statement that doesn't reach a successful terminal state within the wait window raises `SqlTransientError` → HTTP 503, so the frontend can prompt the user to retry instead of misinterpreting a cold start as a 404.
 - **OBO-first auth.** Anything that touches customer data — UC listings, warehouse picking, DESCRIBE, SHOW CREATE TABLE, SQL execution, Genie push — runs under the user's forwarded access token (`X-Forwarded-Access-Token`). The app's service principal only owns the engagement Delta table and LLM calls. This prevents the app from becoming a permissions-laundering vector.
 - **`/api/warehouses` is OBO-only.** Users only see warehouses they actually have access to. If their token is missing the `sql` scope (incremental-consent drift), the endpoint returns 403 with `reauth_required: true` instead of silently falling back to the SP.
@@ -133,8 +145,12 @@ The app runs as a service principal but deliberately routes most data-plane call
 | UC picker: list catalogs / schemas / tables / columns (Session 3) | **OBO** | Each `/api/uc/*` endpoint calls `user_w.catalogs.list()` / `.schemas.list()` / `.tables.list()` / `.tables.get()`. The SP is never a fallback — if the user can't see it, the picker is empty. |
 | `DESCRIBE TABLE` / `SHOW CREATE TABLE` (schema grounding, live MV fetch) | **OBO** | Runs via the user's chosen warehouse; inherits the user's UC SELECT/USE CATALOG grants. |
 | `tables.get()` for PK/FK constraints (Session 5 joins seeding) | **OBO** | UC metadata API. Needs the `catalog.tables:read` user scope (see Step 2b). |
-| List engagements / read / write / delete engagement (Sessions 1–6) | **App SP for DB, OBO for authz** | The SP writes to the `discovery` Delta table, but every `/api/engagements/<eid>` request is gated by a before-request hook that evaluates the caller's group membership (COE / BO / analyst) and applies the appropriate scope (full edit / S1–S2 + BO-Approved checkbox only / read-only on certain sections). Cross-user tampering is blocked at the API layer. |
+| List engagements / read / write / delete engagement (Sessions 1–7) | **App SP for DB, OBO for authz** | The SP writes to the `discovery` Delta table, but every `/api/engagements/<eid>` request is gated by a before-request hook that evaluates the caller's group membership (COE / BO / analyst) and applies the appropriate scope (full edit / S1–S2 + BO-Approved checkbox only / read-only on certain sections). Cross-user tampering is blocked at the API layer. |
 | COE approval (Session 4 "Approve/Request Changes") | **OBO** | `/api/engagements/<eid>/coe-approve` rejects with 403 unless the caller is a live COE group member (not just hidden in the UI). |
+| Production sign-off (Session 7) | **OBO** | `/api/engagements/<eid>/prod-approve` is COE-only (same live-membership check). Owns engagement completion: approved → `complete`. Lock-free, server-stamps reviewer + timestamp. |
+| Section 5 acknowledgments ("I accept") | **OBO** | `/api/engagements/<eid>/acknowledge` server-stamps the accepting user + timestamp (only when all three boxes are checked). Lock-free side-write. |
+| ServiceNow URL autosave | **App SP for DB, OBO for authz** | `/api/engagements/<eid>/servicenow-url` writes only that column, lock-free (doesn't bump `updated_at` or touch progress), so it never races the session autosave. |
+| Space access list (Session 7) | **OBO** | `/api/engagements/<eid>/space-access` attempts a best-effort read but Databricks Apps lack the `access-management` scope, so it returns "manage in Databricks" by design. |
 | Execute benchmark SQL (Session 4 "Run" button) | **OBO** | User's query, user's warehouse, user's data grants. The app never runs arbitrary user-authored SQL under the SP. |
 | Create / update / patch Genie Spaces (Session 5 "Push") | **OBO** | Uses the Genie REST API on the user's behalf so their `CAN MANAGE` on the space governs whether the push succeeds. The SP does not manage Genie spaces. |
 | Create/replace UC Metric Views (Session 3 "Create MV") | **OBO** | User's grants govern whether they can create the view and whether it overwrites an existing one they don't own. |
@@ -151,7 +167,7 @@ Practical upshot: if a user can't see a table in the SQL editor, they can't pull
 Frontend (React + Vite + MUI)    Backend (Flask)             Storage / Services
 -------------------------        -------------------         ---------------------
 React SPA                  -->   REST API             -->    Unity Catalog (Delta)
-  - 6 session forms                - CRUD + auth              `discovery` table
+  - 7 session forms                - CRUD + auth              `discovery` table
   - UC pickers                     - OBO passthrough       -->Warehouse (SQL exec)
   - Benchmark runner               - Prompt builders       -->Model Serving (LLM)
   - Join editor                    - Genie REST proxy      -->Genie REST API
@@ -190,8 +206,9 @@ genie-discovery-app/
         Session2Form.tsx
         Session3Form.tsx         # Data Sources + Classify Terms + Routing Summary + SQL Expressions + MV builder
         Session4Form.tsx         # Read-only Data Plan + benchmark runner (draft N+10, run inline, BO approve)
-        Session5Form.tsx         # Generate Plan + editable preview + joins + push to Genie
+        Session5Form.tsx         # Generate Plan + editable preview + joins + push + acknowledgments gate
         Session6Form.tsx
+        Session7Form.tsx         # Production Review: readiness checklist + access review + COE sign-off
         sectionConfig.ts         # Single source of truth for section IDs + labels in the floating nav
       components/
         EditableTable.tsx
@@ -200,6 +217,8 @@ genie-discovery-app/
         UCColumnPicker.tsx
         DataSourcesPanel.tsx     # S3 top-of-page: tables/MVs picker, broad-scan MV discovery, notes
         PreworkUploadModal.tsx   # BO Excel upload → parse preview → atomic apply to S1+S2
+        ConfirmDialog.tsx        # Reusable confirm modal (guards destructive regenerate/overwrite)
+        CompareRestoreDialog.tsx # Side-by-side current-vs-previous compare before a restore
         SectionToc.tsx           # Floating section nav (sessions rail + in-this-session sub-rail)
   static/                        # Vite build output (gitignored)
 ```
@@ -381,7 +400,7 @@ The app auto-creates the engagement table and adds any missing Delta columns on 
 
 Functional today:
 
-- All 6 session forms with autosave + popup text editing + bounded auto-retry on stale-token 409
+- All 7 session forms with autosave + popup text editing + bounded auto-retry on stale-token 409
 - Floating section nav (sessions rail + in-this-session sub-rail) on every engagement page
 - Pre-work Excel upload (BO template download + atomic apply to S1+S2 under optimistic lock)
 - Group-based access: default analyst access, COE-restricted approval, optional BO-restricted view (S1/S2 + BO-Approved checkbox only)
@@ -394,7 +413,10 @@ Functional today:
 - Readiness Brief (Session 4): citation-backed, gap analysis, gated on having S1–S3 content before auto-firing
 - LLM-drafted metric view YAML (schema-grounded, Databricks-spec) + UC create flow (returns updated_at so post-create autosave doesn't 409)
 - Benchmarks: N+10 draft-and-rank, schema-grounded SQL, dialect-aware prompt, inline SQL runner with cold-warehouse polling, two-step summary, Run All, BO approval (optimistic UI + dedicated PATCH endpoint outside the optimistic lock)
-- COE gating on Sessions 5 & 6 (OBO-verified group membership)
+- COE gating: Session 5 unlocks on COE approval; Sessions 6 & 7 also require the Session 5 acknowledgments (OBO-verified group membership)
+- Session 5 acknowledgments gate (reviewed AI / won't share early / follow best practices) — server-stamped "I accept" unlocks Prototype Review + Production Review
+- Regenerate safety on the metric view YAML (S3) and the plan (S5): confirm-before-overwrite, prior version backed up, side-by-side compare before restore
+- Session 7 Production Review: readiness checklist, space access review (with the documented access-management-scope limitation), and COE production sign-off. Engagement completion (`status = complete`) is owned solely by this sign-off
 - Generate Plan (Session 5): schema-grounded, MV-aware, benchmark-style-aware, strips benchmark overlaps, surfaces warnings
 - Joins: UC PK/FK auto-seeded + analyst-editable manual joins, regenerate preserves manual rows
 - Push to Genie Space: create-new and update-existing via REST API, OBO-authed, full instruction surface serialized (instructions + sample questions + SQL snippets + example queries + joins + `column_configs`); benchmarks land in the Benchmarks tab. Push honors If-Match optimistic lock — refuses to push stale data.
