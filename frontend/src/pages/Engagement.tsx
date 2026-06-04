@@ -3,9 +3,10 @@ import { useParams, useNavigate } from "react-router-dom";
 import {
   Box, Typography, Tabs, Tab, Button, CircularProgress, Alert, Snackbar,
   Chip, IconButton, Paper, Tooltip, Dialog, DialogTitle, DialogContent,
-  DialogActions, TextField, Stack, Link,
+  DialogActions, TextField, Stack, Link, InputAdornment,
 } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import LinkIcon from "@mui/icons-material/Link";
 import LockIcon from "@mui/icons-material/Lock";
 import EditIcon from "@mui/icons-material/Edit";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
@@ -114,11 +115,6 @@ export default function Engagement({ readOnly = false }: Props) {
         6: s["6"] || {},
         7: s["7"] || {},
       });
-      // Reset the SN URL autosave skip flag BEFORE setMeta. The
-      // useEffect-on-meta-change pattern's "skip first run" only fires once
-      // at component mount; without this, hydrating meta from the load
-      // would trip the effect and queue a no-op autosave.
-      snUrlInitialLoad.current = true;
       setMeta({
         genie_space_name: String(eng.genie_space_name || ""),
         business_owner_name: String(eng.business_owner_name || ""),
@@ -231,41 +227,9 @@ export default function Engagement({ readOnly = false }: Props) {
     }));
   };
 
-  // --- ServiceNow URL: edited inline in Section 1, autosaved separately ---
-  // Lives in `meta` like the rest of the engagement metadata, but has its own
-  // autosave path because it's not part of the dialog flow.
-  const snUrlSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const snUrlInitialLoad = useRef(true);
-
-  const updateServiceNowUrl = useCallback((value: string) => {
-    setMeta((prev) => ({ ...prev, servicenow_ticket_url: value }));
-  }, []);
-
-  useEffect(() => {
-    if (readOnly || !id) return;
-    if (snUrlInitialLoad.current) {
-      snUrlInitialLoad.current = false;
-      return;
-    }
-    setSaveStatus("dirty");
-    if (snUrlSaveTimer.current) clearTimeout(snUrlSaveTimer.current);
-    snUrlSaveTimer.current = setTimeout(async () => {
-      setSaveStatus("saving");
-      try {
-        // Dedicated lightweight endpoint: no optimistic lock, so it never races
-        // the session autosave or reverts the typed URL on a stale token.
-        await api.saveServiceNowUrl(id, meta.servicenow_ticket_url);
-        setData((prev: any) => (prev ? { ...prev, servicenow_ticket_url: meta.servicenow_ticket_url } : prev));
-        setSaveStatus("saved");
-      } catch (err: any) {
-        setSaveStatus("error");
-        setToast(`Error saving ServiceNow link: ${err?.message || "unknown"}`);
-      }
-    }, AUTOSAVE_DELAY_MS);
-    return () => {
-      if (snUrlSaveTimer.current) clearTimeout(snUrlSaveTimer.current);
-    };
-  }, [meta.servicenow_ticket_url, readOnly, id]); // eslint-disable-line react-hooks/exhaustive-deps
+  // ServiceNow URL is now edited in the "Edit Engagement Info" dialog (saved
+  // with the rest of the metadata via update_engagement), not inline in
+  // Session 1. It still renders as the clickable link under the title.
 
   // --- Engagement metadata edit dialog ---
   const [editOpen, setEditOpen] = useState(false);
@@ -318,7 +282,18 @@ export default function Engagement({ readOnly = false }: Props) {
   }, [draftMeta.genie_space_name, editOpen, id, meta.genie_space_name]);
 
   const draftNameValid = !!draftMeta.genie_space_name.trim() && nameAvailable !== false;
-  const canSaveMeta = draftNameValid && !savingMeta;
+  // ServiceNow URL is optional, but if present must be a valid http(s) URL.
+  const snUrlValid = (() => {
+    const s = draftMeta.servicenow_ticket_url.trim();
+    if (!s) return true;
+    try {
+      const u = new URL(s);
+      return u.protocol === "http:" || u.protocol === "https:";
+    } catch {
+      return false;
+    }
+  })();
+  const canSaveMeta = draftNameValid && snUrlValid && !savingMeta;
 
   const saveMeta = async () => {
     if (!id || !canSaveMeta) return;
@@ -372,6 +347,22 @@ export default function Engagement({ readOnly = false }: Props) {
   // COE approval gating
   const coeApprovalStatus = sessionDrafts[4]?.coe_approval_status || "";
   const isApproved = coeApprovalStatus === "approved";
+
+  // Top-of-page status chip. Reflects the engagement's real position in the
+  // COE flow. Active review states take precedence over the raw lifecycle, so a
+  // stale "complete" can never mask "Changes Requested"/"Ready for COE Review".
+  // Two distinct approval milestones: Section 4 COE approval -> "COE Approved"
+  // (navy), and the Section 7 production sign-off -> "Production Approved"
+  // (green, status === "complete"). S7 takes precedence over S4 once signed off.
+  const topStatusChip = (): { label: string; color: "success" | "info" | "warning" | "error" | "primary" | "default" } => {
+    if (coeApprovalStatus === "changes_requested") return { label: "Changes Requested", color: "error" };
+    if (coeApprovalStatus === "ready_for_review") return { label: "Ready for COE Review", color: "info" };
+    if (data.status === "complete") return { label: "Production Approved", color: "success" };
+    if (coeApprovalStatus === "approved") return { label: "COE Approved", color: "primary" };
+    if (data.status === "in_progress") return { label: "In Progress", color: "warning" };
+    return { label: String(data.status || "draft").replace("_", " "), color: "default" };
+  };
+  const topStatus = topStatusChip();
   // Section 5 acknowledgments must be accepted before Prototype Review (S6) and
   // Production Review (S7) unlock. accepted_at is set only when all boxes checked.
   const ackDone = !!sessionDrafts[5]?.acknowledgments?.accepted_at;
@@ -456,9 +447,10 @@ export default function Engagement({ readOnly = false }: Props) {
           <Chip icon={<LockIcon />} label="Read-Only View" color="info" size="small" />
         )}
         <Chip
-          label={String(data.status).replace("_", " ")}
+          label={topStatus.label}
           size="small"
-          color={data.status === "complete" ? "success" : data.status === "in_progress" ? "warning" : "default"}
+          color={topStatus.color}
+          sx={{ textTransform: "capitalize" }}
         />
       </Box>
 
@@ -580,13 +572,7 @@ export default function Engagement({ readOnly = false }: Props) {
 
           {/* Session Content */}
           <Box sx={{ mb: 3 }}>
-        {tab === 0 && (
-          <Session1Form
-            {...sessionProps(1)}
-            serviceNowUrl={meta.servicenow_ticket_url}
-            onServiceNowUrlChange={updateServiceNowUrl}
-          />
-        )}
+        {tab === 0 && <Session1Form {...sessionProps(1)} />}
         {tab === 1 && <Session2Form {...sessionProps(2)} />}
         {tab === 2 && (
           <Session3Form
@@ -729,6 +715,28 @@ export default function Engagement({ readOnly = false }: Props) {
                 type="email"
               />
             </Stack>
+
+            <TextField
+              label="ServiceNow Ticket URL"
+              value={draftMeta.servicenow_ticket_url}
+              onChange={(e) => updateDraftMeta("servicenow_ticket_url", e.target.value)}
+              placeholder="https://yourorg.service-now.com/..."
+              fullWidth
+              size="small"
+              error={!snUrlValid}
+              helperText={
+                !snUrlValid
+                  ? "Enter a valid http(s) URL or leave blank"
+                  : "Optional. Shown as a clickable link under the engagement title."
+              }
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <LinkIcon fontSize="small" />
+                  </InputAdornment>
+                ),
+              }}
+            />
           </Stack>
         </DialogContent>
         <DialogActions>

@@ -53,3 +53,19 @@ env:
   # chat-completion-compatible served model.
   - name: LLM_ENDPOINT_NAME
     value: "databricks-claude-haiku-4-5"
+
+  # Optional. Microsoft Teams Incoming Webhook URL. When an analyst marks an
+  # engagement "Ready for COE Review" in Session 4, the app posts an Adaptive
+  # Card to this webhook's channel (that's how the COE group gets notified —
+  # everyone in the channel sees it). If unset/empty, the notification is
+  # silently skipped and the status flip still works.
+  #
+  # To create the URL: in the target Teams channel, open the "Workflows" app >
+  # "Post to a channel when a webhook request is received" template > finish,
+  # then copy the generated HTTPS URL. (Legacy O365 "Incoming Webhook"
+  # connector URLs also work but are being retired by Microsoft.)
+  #
+  # Recommended: store the URL in a Databricks secret and reference it here via
+  # valueFrom instead of pasting it in plaintext.
+  - name: TEAMS_COE_WEBHOOK_URL
+    value: ""

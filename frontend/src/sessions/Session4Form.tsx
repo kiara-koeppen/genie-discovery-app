@@ -15,6 +15,8 @@ import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import LockIcon from "@mui/icons-material/Lock";
+import SendIcon from "@mui/icons-material/Send";
+import HourglassTopIcon from "@mui/icons-material/HourglassTop";
 import ReactMarkdown from "react-markdown";
 import EditableTable from "../components/EditableTable";
 import ExpandableTextField from "../components/ExpandableTextField";
@@ -572,12 +574,31 @@ export default function Session4Form({
     }
   };
 
+  // Analyst action: flip status to 'ready_for_review' and notify the COE
+  // (Teams notification fires server-side, best-effort). Mirrors the new
+  // status into the session-4 draft so the next autosave stays consistent —
+  // the backend write is lock-free and doesn't bump updated_at.
+  const [requestingReview, setRequestingReview] = useState(false);
+  const handleRequestReview = async () => {
+    if (!engagementId) return;
+    setRequestingReview(true);
+    try {
+      await api.requestReview(engagementId);
+      onChange("coe_approval_status", "ready_for_review");
+    } catch {
+      // best-effort; status chip simply won't advance on failure
+    }
+    setRequestingReview(false);
+  };
+
   const statusChip = () => {
     switch (approvalStatus) {
       case "approved":
         return <Chip icon={<CheckCircleIcon />} label="Approved" color="success" />;
       case "changes_requested":
         return <Chip icon={<ErrorIcon />} label="Changes Requested" color="warning" />;
+      case "ready_for_review":
+        return <Chip icon={<HourglassTopIcon />} label="Ready for COE Review" color="info" />;
       default:
         return <Chip icon={<PendingIcon />} label="Pending Review" color="default" />;
     }
@@ -606,6 +627,47 @@ export default function Session4Form({
         <Alert severity="warning" sx={{ mb: 2 }}>
           <strong>COE Feedback:</strong> {data.coe_approval_notes}
         </Alert>
+      )}
+
+      {/* Analyst submit-for-review control. Available to anyone who can edit S4
+          (not BO-only, not read-only). Hidden once the COE has approved. */}
+      {!readOnly && !isBoOnly && approvalStatus !== "approved" && (
+        <Box sx={{ mb: 2 }}>
+          {approvalStatus === "ready_for_review" ? (
+            <Alert
+              severity="info"
+              action={
+                <Button
+                  color="inherit"
+                  size="small"
+                  startIcon={<SendIcon />}
+                  disabled={requestingReview}
+                  onClick={handleRequestReview}
+                >
+                  Notify COE again
+                </Button>
+              }
+            >
+              Marked <strong>Ready for COE Review</strong>. The COE has been notified.
+            </Alert>
+          ) : (
+            <Stack direction="row" alignItems="center" spacing={2}>
+              <Button
+                variant="contained"
+                startIcon={<SendIcon />}
+                disabled={requestingReview}
+                onClick={handleRequestReview}
+              >
+                {requestingReview ? "Submitting…" : "Mark Ready for COE Review"}
+              </Button>
+              <Typography variant="body2" color="text.secondary">
+                {approvalStatus === "changes_requested"
+                  ? "Addressed the feedback? Re-submit to notify the COE."
+                  : "Done with Sessions 1-3? Submit to notify the COE that this is ready to review."}
+              </Typography>
+            </Stack>
+          )}
+        </Box>
       )}
 
       {/* Data Plan -- read-only mirror of what was picked in S3's Data Sources panel.

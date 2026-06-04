@@ -47,6 +47,14 @@ LLM_ENDPOINT = os.getenv("LLM_ENDPOINT_NAME") or "databricks-claude-haiku-4-5"
 # they still fail fast.
 LLM_HTTP_TIMEOUT_SECONDS = int(os.getenv("LLM_HTTP_TIMEOUT_SECONDS") or "600")
 
+# Optional. Microsoft Teams Incoming Webhook URL (Power Automate "Workflows"
+# style, or a legacy O365 connector). When an analyst marks an engagement
+# "Ready for COE Review", the app posts an Adaptive Card to this webhook's
+# channel — which is how the COE group gets notified (everyone in that Teams
+# channel sees it). If unset/empty, the notification is silently skipped and
+# the status flip still succeeds. Best-effort only; never blocks the workflow.
+TEAMS_COE_WEBHOOK_URL = (os.getenv("TEAMS_COE_WEBHOOK_URL") or "").strip()
+
 w = WorkspaceClient()
 llm_w = WorkspaceClient(config=Config(http_timeout_seconds=LLM_HTTP_TIMEOUT_SECONDS))
 
@@ -990,7 +998,7 @@ def list_engagements():
         rows = sql_exec(
             f"SELECT engagement_id, genie_space_name, business_owner_name, "
             f"business_owner_email, analyst_name, analyst_email, "
-            f"current_session, status, created_at, updated_at "
+            f"current_session, status, coe_approval_status, created_at, updated_at "
             f"FROM {TABLE} WHERE {not_deleted} ORDER BY updated_at DESC"
         )
     except SqlTransientError:
@@ -1193,6 +1201,109 @@ def patch_servicenow_url(eid):
         {"eid": eid, "u": url},
     )
     return jsonify({"success": True})
+
+
+def _notify_teams_review_ready(eng, eid, analyst_email):
+    """Post an Adaptive Card to the COE Teams channel when an engagement is
+    marked Ready for COE Review. Best-effort: any failure (unset webhook,
+    network error, bad response) is swallowed so it never blocks the status
+    flip. Targets a channel webhook, so the whole COE group sees it.
+    """
+    if not TEAMS_COE_WEBHOOK_URL:
+        return  # Feature not configured — silently skip.
+    try:
+        space_name = (eng.get("genie_space_name") or "Untitled Space") if eng else "Untitled Space"
+        sn_url = (eng.get("servicenow_ticket_url") or "") if eng else ""
+        # Deep link back to Section 4 of this engagement, derived from the
+        # incoming request's host so we don't need a hardcoded app URL.
+        try:
+            base = request.host_url.rstrip("/")
+        except Exception:
+            base = ""
+        eng_link = f"{base}/engagements/{eid}" if base else ""
+
+        facts = [
+            {"title": "Engagement", "value": space_name},
+            {"title": "Marked ready by", "value": analyst_email or "an analyst"},
+        ]
+        if sn_url:
+            facts.append({"title": "ServiceNow", "value": f"[Open ticket]({sn_url})"})
+
+        body = [
+            {
+                "type": "TextBlock",
+                "size": "Medium",
+                "weight": "Bolder",
+                "text": "🔔 Ready for COE Review",
+            },
+            {
+                "type": "TextBlock",
+                "text": f"**{space_name}** has been marked ready for Center of Excellence review.",
+                "wrap": True,
+            },
+            {"type": "FactSet", "facts": facts},
+        ]
+        actions = []
+        if eng_link:
+            actions.append({
+                "type": "Action.OpenUrl",
+                "title": "Open in Genie Discovery",
+                "url": eng_link,
+            })
+
+        card = {
+            "type": "AdaptiveCard",
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "version": "1.4",
+            "body": body,
+        }
+        if actions:
+            card["actions"] = actions
+
+        payload = {
+            "type": "message",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": card,
+                }
+            ],
+        }
+        requests.post(TEAMS_COE_WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as e:  # noqa: BLE001 — notification must never break the flip
+        print(f"[teams] review-ready notification failed (non-fatal): {e}")
+
+
+@app.route("/api/engagements/<eid>/request-review", methods=["PUT"])
+def request_coe_review(eid):
+    """Analyst action: mark an engagement 'Ready for COE Review'.
+
+    Unlike coe-approve (COE-only), this is open to analysts — it only sets the
+    status to 'ready_for_review', never to 'approved'/'changes_requested'
+    (those stay COE-gated). BO-only users are blocked by the before_request
+    gate since this path is NOT in _bo_can_access.
+
+    Lightweight side-write modeled on the ServiceNow-URL PATCH: it lives
+    OUTSIDE the optimistic lock and does NOT bump updated_at, so it can't
+    race/409 the analyst's in-flight Session 4 autosave. The client mirrors
+    the new value into its session-4 draft so the next autosave stays
+    consistent. Fires the Teams notification best-effort on success.
+    """
+    eng, err = _authorize_engagement(eid)
+    if err:
+        return err
+    # Marking ready re-enters the review flow, so a previously-completed
+    # (Section 7 signed-off) engagement is no longer complete: roll status back
+    # to 'in_progress' so it doesn't read as Complete on the home list. status
+    # gates nothing; this keeps display consistent across surfaces.
+    sql_run(
+        f"UPDATE {TABLE} SET coe_approval_status = 'ready_for_review', "
+        f"status = 'in_progress' "
+        f"WHERE engagement_id = :eid",
+        {"eid": eid},
+    )
+    _notify_teams_review_ready(eng, eid, get_current_user())
+    return jsonify({"success": True, "status": "ready_for_review"})
 
 
 @app.route("/api/engagements/<eid>", methods=["DELETE"])
@@ -2041,10 +2152,15 @@ def coe_approve(eid):
     notes = data.get("notes", "")
     reviewer = get_current_user()
     ts = now_ts()
+    # When the COE requests changes, the engagement re-enters the review flow:
+    # roll a previously-completed (Section 7 signed-off) engagement back to
+    # 'in_progress' so it no longer reads as Complete anywhere (top chip, home
+    # list). status gates nothing, so this is purely for consistent display.
+    extra_set = ", status = 'in_progress'" if status == "changes_requested" else ""
     sql_run(
         f"UPDATE {TABLE} SET "
         f"coe_approval_status = :status, coe_approval_notes = :notes, "
-        f"coe_reviewer_email = :reviewer, updated_at = :ts "
+        f"coe_reviewer_email = :reviewer, updated_at = :ts{extra_set} "
         f"WHERE engagement_id = :eid",
         {"eid": eid, "status": status, "notes": notes, "reviewer": reviewer, "ts": ts},
     )

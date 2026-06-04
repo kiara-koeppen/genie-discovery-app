@@ -17,11 +17,21 @@ const SESSION_LABELS = [
   "COE Review", "Configure Space", "Prototype Review", "Production Review",
 ];
 
-const STATUS_COLORS: Record<string, "default" | "warning" | "success"> = {
-  draft: "default",
-  in_progress: "warning",
-  complete: "success",
-};
+// Status chip for an engagement card. Mirrors the engagement-page top chip
+// exactly. Active COE review states take precedence over the raw lifecycle so a
+// stale "complete" can't mask them. Two approval milestones: Section 4 COE
+// approval -> "COE Approved" (navy), Section 7 production sign-off ->
+// "Production Approved" (green, status === "complete"); S7 wins over S4.
+function engagementStatusChip(
+  e: Record<string, string>,
+): { label: string; color: "default" | "warning" | "success" | "info" | "error" | "primary" } {
+  if (e.coe_approval_status === "changes_requested") return { label: "Changes Requested", color: "error" };
+  if (e.coe_approval_status === "ready_for_review") return { label: "Ready for COE Review", color: "info" };
+  if (e.status === "complete") return { label: "Production Approved", color: "success" };
+  if (e.coe_approval_status === "approved") return { label: "COE Approved", color: "primary" };
+  if (e.status === "in_progress") return { label: "In Progress", color: "warning" };
+  return { label: e.status?.replace("_", " ") || "draft", color: "default" };
+}
 
 export default function Home() {
   const nav = useNavigate();
@@ -192,11 +202,17 @@ export default function Home() {
                     Analyst: {e.analyst_name || "TBD"}
                   </Typography>
                   <Box sx={{ mt: 1, display: "flex", gap: 1, flexWrap: "wrap" }}>
-                    <Chip
-                      label={e.status?.replace("_", " ") || "draft"}
-                      size="small"
-                      color={STATUS_COLORS[e.status] || "default"}
-                    />
+                    {(() => {
+                      const s = engagementStatusChip(e);
+                      return (
+                        <Chip
+                          label={s.label}
+                          size="small"
+                          color={s.color}
+                          sx={{ textTransform: "capitalize" }}
+                        />
+                      );
+                    })()}
                     <Chip
                       label={`Session ${e.current_session || 1}: ${SESSION_LABELS[Number(e.current_session || 1) - 1] || ""}`}
                       size="small"

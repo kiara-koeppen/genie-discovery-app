@@ -238,6 +238,14 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  /** Analyst action: mark an engagement "Ready for COE Review". Open to
+   *  analysts (NOT BO-only users); only sets status to 'ready_for_review'.
+   *  Lock-free side-write — no If-Match, never bumps updated_at. */
+  requestReview: (id: string) =>
+    json<{ success: boolean; status: string }>(`/engagements/${id}/request-review`, {
+      method: "PUT",
+    }),
+
   /** Production sign-off (Session 7). COE-only, enforced server-side.
    *  Returns updated_at so the caller can refresh its optimistic-lock token. */
   prodApprove: (id: string, data: { status: string; notes: string }) =>
