@@ -319,6 +319,34 @@ export const api = {
     return body as { success: boolean; updated_at: string; applied: string[] };
   },
 
+  /** Export selected S1/S2 sections to a populated .xlsx and trigger a browser
+   *  download. Read-only on the server (no mutation, no lock). The exported
+   *  file matches the template shape and is re-uploadable via parsePrework. */
+  exportPrework: async (
+    id: string,
+    sections: string[],
+    data: Record<string, Record<string, string>[]>,
+  ) => {
+    const res = await fetch(`${BASE}/engagements/${id}/export-prework`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sections, data }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({} as any));
+      throw new Error(body.error || `${res.status} ${res.statusText}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "genie-discovery-export.xlsx";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+
   draftBenchmarks: (
     id: string,
     count?: number,

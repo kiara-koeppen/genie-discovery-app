@@ -833,7 +833,10 @@ def _bo_can_access(method, sub_path):
         return True
     # Pre-work Excel upload: BOs can upload their own filled-in template and
     # apply it to S1/S2 (the only sessions they have edit rights to anyway).
-    if method == "POST" and sub_path in ("/parse-prework", "/apply-prework"):
+    # Export is read-only and covers the same S1/S2 data they can already see.
+    if method == "POST" and sub_path in (
+        "/parse-prework", "/apply-prework", "/export-prework"
+    ):
         return True
     return False
 
@@ -1589,6 +1592,101 @@ def _build_prework_template():
     return buf
 
 
+def _build_prework_export(selected_keys, data):
+    """Build a pre-work .xlsx populated with the engagement's current S1/S2 data.
+
+    Mirrors the blank template's sheet names, headers, and `_meta` version so an
+    exported file can be edited and re-uploaded through parse/apply-prework
+    (full round-trip). Only the sheets whose key is in `selected_keys` are
+    included; `data` is {section_key: [row_dict, ...]} already normalized to the
+    section's `row_keys` by the caller.
+
+    Differs from _build_prework_template: rows are filled from `data`, the S1
+    business-context prompts are NOT auto-seeded (they come in via the data
+    rows), and the Key Terms example rows are NOT seeded.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    # Preserve the canonical sheet order; include only the selected sheets.
+    sheets = [s for s in _PREWORK_SHEETS if s["key"] in selected_keys]
+
+    wb = Workbook()
+    ws_inst = wb.active
+    ws_inst.title = "Instructions"
+    ws_inst.column_dimensions["A"].width = 110
+    ws_inst["A1"] = "Genie Discovery — Engagement Export"
+    ws_inst["A1"].font = Font(bold=True, size=14)
+    ws_inst["A3"] = ("Exported from the discovery app with this engagement's "
+                     "current answers. You can edit it and load it back via "
+                     "'Upload Pre-Work' to apply changes to Sessions 1 & 2. "
+                     "Don't rename sheets or column headers.")
+    ws_inst["A3"].alignment = Alignment(wrap_text=True, vertical="top")
+    ws_inst.row_dimensions[3].height = 45
+    for i, sheet in enumerate(sheets):
+        ws_inst[f"A{5+i}"] = f"  • {sheet['name']}: {sheet['instruction']}"
+        ws_inst[f"A{5+i}"].alignment = Alignment(wrap_text=True, vertical="top")
+        ws_inst.row_dimensions[5 + i].height = 45
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFF")
+    instruction_font = Font(italic=True, color="555555")
+
+    for sheet in sheets:
+        ws = wb.create_sheet(sheet["name"])
+        n_cols = len(sheet["headers"])
+        # Row 1: instruction banner spanning all columns
+        ws.cell(row=1, column=1, value=sheet["instruction"]).font = instruction_font
+        if n_cols > 1:
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+        ws.row_dimensions[1].height = 45
+        ws.cell(row=1, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+        # Row 2: header
+        for col_idx, header in enumerate(sheet["headers"], start=1):
+            cell = ws.cell(row=2, column=col_idx, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            ws.column_dimensions[get_column_letter(col_idx)].width = 40
+
+        # Rows 3+: the engagement's current data for this section.
+        rows = data.get(sheet["key"], []) or []
+        for r_offset, row in enumerate(rows):
+            r_idx = 3 + r_offset
+            for col_idx, rk in enumerate(sheet["row_keys"], start=1):
+                cell = ws.cell(row=r_idx, column=col_idx, value=row.get(rk, ""))
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[r_idx].height = 30
+
+        # Keep the frequency dropdown so edited rows stay valid on re-upload.
+        if sheet["key"] == "existing_reports":
+            dv = DataValidation(
+                type="list",
+                formula1='"' + ",".join(_PREWORK_FREQ_OPTIONS) + '"',
+                allow_blank=True,
+            )
+            ws.add_data_validation(dv)
+            dv.add("C3:C200")
+
+    # Hidden metadata sheet — same version key the parser reads, so the export
+    # re-uploads cleanly. `kind=export` distinguishes it from a blank template.
+    meta = wb.create_sheet("_meta")
+    meta["A1"] = "template_version"
+    meta["B1"] = PREWORK_TEMPLATE_VERSION
+    meta["A2"] = "generated_at"
+    meta["B2"] = now_ts()
+    meta["A3"] = "kind"
+    meta["B3"] = "export"
+    meta.sheet_state = "hidden"
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
 def _parse_prework_xlsx(file_bytes):
     """Parse a filled-in pre-work workbook.
 
@@ -1864,6 +1962,58 @@ def apply_prework(eid):
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
     return jsonify({"success": True, "updated_at": ts, "applied": sorted(sections_set)})
+
+
+@app.route("/api/engagements/<eid>/export-prework", methods=["POST"])
+def export_prework(eid):
+    """Export selected S1/S2 sections to a .xlsx populated with current data.
+
+    Body: { sections: [section_key, ...], data: {section_key: [row_dict, ...]} }
+    The client posts the data it currently holds (WYSIWYG with the open forms).
+    Read-only: builds and streams the workbook; no DB mutation, so no optimistic
+    lock. The file matches the template shape and is re-uploadable via
+    parse/apply-prework.
+    """
+    payload = request.get_json(silent=True) or {}
+    sections = payload.get("sections") or []
+    data = payload.get("data") or {}
+    if not isinstance(sections, list) or not isinstance(data, dict):
+        return jsonify({"error": "Body must be {sections: [...], data: {...}}"}), 400
+
+    valid_keys = {s["key"] for s in _PREWORK_SHEETS}
+    sections_set = {s for s in sections if s in valid_keys}
+    if not sections_set:
+        return jsonify({"error": "No valid sections selected to export."}), 400
+
+    # Same defensive normalization as apply-prework: keep only recognized row
+    # keys per section, coerce to trimmed strings, drop fully-empty rows.
+    normalized = {}
+    for s_cfg in _PREWORK_SHEETS:
+        k = s_cfg["key"]
+        if k not in sections_set:
+            continue
+        rows = data.get(k) or []
+        if not isinstance(rows, list):
+            return jsonify({"error": f"data.{k} must be a list."}), 400
+        normalized[k] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            clean = {rk: str(r.get(rk) or "").strip() for rk in s_cfg["row_keys"]}
+            if any(clean.values()):
+                normalized[k].append(clean)
+
+    try:
+        buf = _build_prework_export(sections_set, normalized)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to build export: {e}"}), 500
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="genie-discovery-export.xlsx",
+    )
 
 
 # ---------------------------------------------------------------------------
