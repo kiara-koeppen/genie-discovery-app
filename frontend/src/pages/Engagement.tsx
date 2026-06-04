@@ -14,6 +14,7 @@ import CloudSyncIcon from "@mui/icons-material/CloudSync";
 import CloudOffIcon from "@mui/icons-material/CloudOff";
 import UploadFileIcon from "@mui/icons-material/UploadFile";
 import DownloadIcon from "@mui/icons-material/Download";
+import SaveAltIcon from "@mui/icons-material/SaveAlt";
 import { api } from "../api";
 import Session1Form from "../sessions/Session1Form";
 import Session2Form from "../sessions/Session2Form";
@@ -23,6 +24,7 @@ import Session5Form from "../sessions/Session5Form";
 import Session6Form from "../sessions/Session6Form";
 import Session7Form from "../sessions/Session7Form";
 import PreworkUploadModal from "../components/PreworkUploadModal";
+import PreworkExportModal from "../components/PreworkExportModal";
 import SectionToc from "../components/SectionToc";
 
 const SESSION_LABELS = [
@@ -77,6 +79,7 @@ export default function Engagement({ readOnly = false }: Props) {
   const isBoOnly = isBoMember && !isCoeMember;
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [preworkOpen, setPreworkOpen] = useState(false);
+  const [preworkExportOpen, setPreworkExportOpen] = useState(false);
   const autosaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const skipNextAutosave = useRef(true);
   // Last-known updated_at for the engagement, used as an If-Match optimistic-
@@ -436,6 +439,17 @@ export default function Engagement({ readOnly = false }: Props) {
                 Upload Pre-Work
               </Button>
             </Tooltip>
+            <Tooltip title="Export Sessions 1 & 2 data to Excel (choose which sections)">
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={<SaveAltIcon />}
+                onClick={() => setPreworkExportOpen(true)}
+                sx={{ mr: 0.5 }}
+              >
+                Export
+              </Button>
+            </Tooltip>
           </>
         )}
         {readOnly && (
@@ -470,6 +484,21 @@ export default function Engagement({ readOnly = false }: Props) {
             // sets skipNextAutosave so this won't trip the autosave timer.
             load();
           }}
+        />
+      )}
+
+      {id && (
+        <PreworkExportModal
+          open={preworkExportOpen}
+          engagementId={id}
+          currentData={{
+            business_context: (sessionDrafts[1]?.business_context as Record<string, string>[]) || [],
+            pain_points: (sessionDrafts[1]?.pain_points as Record<string, string>[]) || [],
+            existing_reports: (sessionDrafts[1]?.existing_reports as Record<string, string>[]) || [],
+            question_bank: (sessionDrafts[2]?.question_bank as Record<string, string>[]) || [],
+            vocabulary_metrics: (sessionDrafts[2]?.vocabulary_metrics as Record<string, string>[]) || [],
+          }}
+          onClose={() => setPreworkExportOpen(false)}
         />
       )}
 
