@@ -124,6 +124,18 @@ export default function Session3Form({
     [vocabTerms, typeMap],
   );
 
+  // Data Sources the analyst chose at the top of S3 (lives on S4's data_plan).
+  // Used to restrict the SQL Expressions table picker so they don't hunt the
+  // full catalog tree (#8). Includes tables + metric views that are in scope.
+  const dataSourceFqns = useMemo(
+    () =>
+      (session4Data?.data_plan || [])
+        .filter((d: any) => d.include_in_space === "Yes")
+        .map((d: any) => (d.table_or_view || "").trim())
+        .filter((t: string) => t && t.split(".").length === 3),
+    [session4Data],
+  );
+
   // Derive unique tables from sql_expressions
   const selectedTables = useMemo(() => {
     const tables = new Set<string>();
@@ -1027,11 +1039,19 @@ export default function Session3Form({
             <code> COUNT(1) FILTER (WHERE …)</code>, depending on how the metric reads.
             You don't have to rewrite it as a SELECT.
           </Typography>
+          {dataSourceFqns.length > 0 && (
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+              The Table picker is limited to your {dataSourceFqns.length} chosen
+              Data Source{dataSourceFqns.length === 1 ? "" : "s"}. Pick
+              <em> Browse all catalogs…</em> in the dropdown if you need another table.
+            </Typography>
+          )}
           <EditableTable
             columns={SQL_EXPR_COLS}
             rows={data.sql_expressions || []}
             onChange={(rows) => onChange("sql_expressions", rows)}
             readOnly={readOnly}
+            restrictTables={dataSourceFqns}
           />
         </AccordionDetails>
       </Accordion>

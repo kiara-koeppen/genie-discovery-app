@@ -16,6 +16,9 @@ interface Props {
   rows: Record<string, string>[];
   onChange: (rows: Record<string, string>[]) => void;
   readOnly?: boolean;
+  /** When set, `uc_table` columns restrict their picker to these FQNs (the
+   *  engagement's chosen Data Sources) so the analyst doesn't hunt. */
+  restrictTables?: string[];
 }
 
 interface ExpandedCell {
@@ -25,7 +28,7 @@ interface ExpandedCell {
   value: string;
 }
 
-export default function EditableTable({ columns, rows, onChange, readOnly }: Props) {
+export default function EditableTable({ columns, rows, onChange, readOnly, restrictTables }: Props) {
   const [expanded, setExpanded] = useState<ExpandedCell | null>(null);
   const [expandedDraft, setExpandedDraft] = useState("");
 
@@ -80,6 +83,7 @@ export default function EditableTable({ columns, rows, onChange, readOnly }: Pro
                       value={row[c.key] || ""}
                       onChange={(v) => update(idx, c.key, v)}
                       readOnly={readOnly}
+                      restrictTo={restrictTables}
                     />
                   ) : c.type === "uc_column" ? (
                     <UCColumnPicker
