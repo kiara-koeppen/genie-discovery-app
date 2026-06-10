@@ -32,7 +32,7 @@ const SESSION_LABELS = [
   "1: Business Context",
   "2: Questions & Vocabulary",
   "3: Technical Design",
-  "4: Design, Review, & Approval",
+  "4: Design Review & Approval",
   "5: Configure Space",
   "6: Prototype Review",
   "7: Production Review",

@@ -97,6 +97,7 @@ export default function Session3Form({
 }: Props) {
   const [joins, setJoins] = useState<{ table: string; keys: string }[]>([]);
   const [metricViews, setMetricViews] = useState<string[]>([]);
+  const [showRowFilterDdl, setShowRowFilterDdl] = useState(false);
 
   // Metric View builder state
   const [mvCatalogs, setMvCatalogs] = useState<string[]>([]);
@@ -148,6 +149,52 @@ export default function Session3Form({
         .filter((t: string) => t && t.split(".").length === 3),
     [session4Data],
   );
+
+  // Build a starter UC row-filter DDL from the global filter + in-scope tables.
+  // This is the HARD-enforcement path (enforced on every query, any tool). It's
+  // a review-before-run template: column types are guessed (STRING) and every
+  // table is assumed to carry the referenced columns.
+  const rowFilterDdl = useMemo(() => {
+    const predicate = (data.global_filter || "").trim();
+    if (!predicate || dataSourceFqns.length === 0) return "";
+    // Extract candidate column names: identifiers that aren't SQL keywords and
+    // aren't inside string literals.
+    const KEYWORDS = new Set([
+      "and", "or", "not", "in", "is", "null", "like", "ilike", "rlike", "between",
+      "true", "false", "case", "when", "then", "else", "end", "cast", "as",
+      "current_date", "current_timestamp", "interval", "date", "timestamp",
+    ]);
+    const noStrings = predicate.replace(/'[^']*'/g, " ");
+    const cols = Array.from(
+      new Set(
+        (noStrings.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [])
+          .filter((t: string) => !KEYWORDS.has(t.toLowerCase()))
+          .filter((t: string) => !/^\d/.test(t)),
+      ),
+    );
+    if (cols.length === 0) return "";
+    // Define the function in the first data source's catalog.schema.
+    const [cat, sch] = dataSourceFqns[0].split(".");
+    const fnFqn = `\`${cat}\`.\`${sch}\`.genie_global_filter`;
+    const params = cols.map((c) => `${c} STRING`).join(", ");
+    const onCols = cols.join(", ");
+    const alters = dataSourceFqns
+      .map((fqn: string) => {
+        const [c, s, t] = fqn.split(".");
+        return `ALTER TABLE \`${c}\`.\`${s}\`.\`${t}\` SET ROW FILTER ${fnFqn} ON (${onCols});`;
+      })
+      .join("\n");
+    return [
+      "-- Hard enforcement (optional): a UC row filter is applied to EVERY query",
+      "-- against these tables, from any tool, per user. Review column names + types",
+      "-- (guessed STRING below) and confirm each table has these columns. Run as a",
+      "-- table owner. Docs: Row filters and column masks.",
+      `CREATE OR REPLACE FUNCTION ${fnFqn}(${params})`,
+      "  RETURN " + predicate + ";",
+      "",
+      alters,
+    ].join("\n");
+  }, [data.global_filter, dataSourceFqns]);
 
   // Derive unique tables from sql_expressions
   const selectedTables = useMemo(() => {
@@ -1006,12 +1053,19 @@ export default function Session3Form({
         </AccordionSummary>
         <AccordionDetails>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            A SQL boolean expression applied to every metric. Use for row-level
-            exclusions that apply across the board — e.g., excluding test rows,
-            voided records, or out-of-scope categories. This becomes the metric
-            view's top-level <code>filter:</code> and is included in the generate-plan prompt.
-            Leave blank if none apply.
+            A SQL boolean expression applied across the board — e.g., excluding
+            test rows, voided records, or out-of-scope categories. It becomes the
+            metric view's top-level <code>filter:</code> (hard) AND, when you generate
+            the plan in Session 5, a mandatory instruction + a filter on every example
+            query so Genie applies it to <strong>raw-table queries too</strong>, not just
+            the metric view. Leave blank if none apply.
           </Typography>
+          <Alert severity="info" sx={{ mb: 2 }}>
+            Instruction-level enforcement is best-effort — Genie usually honors it but
+            can miss it on novel questions. For <strong>guaranteed</strong> enforcement on
+            every query (any tool, per user), apply it as a Unity Catalog row filter on the
+            source tables. Use the generated DDL below as a starting point.
+          </Alert>
           <TextField
             fullWidth
             multiline
@@ -1022,6 +1076,44 @@ export default function Session3Form({
             disabled={readOnly}
             sx={{ "& .MuiInputBase-input": { fontFamily: "monospace", fontSize: 13 } }}
           />
+          {(data.global_filter || "").trim() && dataSourceFqns.length > 0 && (
+            <Box sx={{ mt: 2 }}>
+              <Button
+                size="small"
+                variant="text"
+                onClick={() => setShowRowFilterDdl((v) => !v)}
+              >
+                {showRowFilterDdl ? "Hide" : "Show"} hard-enforcement DDL (UC row filter)
+              </Button>
+              {showRowFilterDdl && (
+                <Box sx={{ mt: 1 }}>
+                  <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 0.5 }}>
+                    <Button
+                      size="small"
+                      onClick={() => navigator.clipboard?.writeText(rowFilterDdl)}
+                    >
+                      Copy DDL
+                    </Button>
+                  </Box>
+                  <Box
+                    component="pre"
+                    sx={{
+                      bgcolor: "grey.50", border: "1px solid", borderColor: "divider",
+                      borderRadius: 1, p: 1.5, fontSize: 12, fontFamily: "monospace",
+                      overflowX: "auto", whiteSpace: "pre", m: 0,
+                    }}
+                  >
+                    {rowFilterDdl}
+                  </Box>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+                    Review before running: confirm the column list and types, and that every
+                    table actually has those columns. Run as a table owner. This changes the
+                    tables for ALL consumers, not just this Genie space.
+                  </Typography>
+                </Box>
+              )}
+            </Box>
+          )}
         </AccordionDetails>
       </Accordion>
 

@@ -141,7 +141,7 @@ export default function PreworkExportModal({
         </Stack>
 
         <Typography variant="overline" color="text.secondary">
-          Session 4 — Design, Review, & Approval
+          Session 4 — Design Review & Approval
         </Typography>
         <Stack sx={{ pl: 0.5 }}>
           {renderSection({ key: BENCHMARKS_KEY, label: "Benchmarks" })}
