@@ -33,6 +33,19 @@ const TEXT_INSTR_COLS: ColumnDef[] = [
   { key: "instruction", label: "Instruction", type: "textarea" },
 ];
 
+// #7: analyst-authored example SQL queries (surfaced verbatim in the Genie space).
+const EXAMPLE_QUERY_COLS: ColumnDef[] = [
+  { key: "question", label: "Question", type: "textarea" },
+  { key: "sql", label: "Example SQL", type: "textarea" },
+  { key: "usage_guidance", label: "Usage Guidance (optional)", type: "textarea" },
+];
+
+// #2: clarifying / disambiguation questions Genie should ask on ambiguous terms.
+const CLARIFYING_COLS: ColumnDef[] = [
+  { key: "trigger", label: "When the user asks about…" },
+  { key: "clarification", label: "Genie should ask…", type: "textarea" },
+];
+
 const GAP_COLS: ColumnDef[] = [
   { key: "business_question", label: "Business Question", type: "textarea" },
   { key: "data_available", label: "Data Available?", width: 130, type: "select", options: ["Yes", "No", "Partial"] },
@@ -1052,6 +1065,60 @@ export default function Session3Form({
             onChange={(rows) => onChange("sql_expressions", rows)}
             readOnly={readOnly}
             restrictTables={dataSourceFqns}
+          />
+        </AccordionDetails>
+      </Accordion>
+
+      {/* ---- Example Queries (#7) ---- */}
+      <Accordion id="section-3-example-queries" defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="h6">Example Queries</Typography>
+            {(data.example_queries || []).length > 0 && (
+              <Chip label={`${(data.example_queries || []).length}`} size="small" variant="outlined" />
+            )}
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            When you already know the SQL for an important question, define it here
+            instead of forcing it into a metric or synonym. These are surfaced to
+            Genie verbatim as example queries (not drafts) when you generate the
+            plan in Session 5. Use fully qualified <code>catalog.schema.table</code>{" "}
+            names — example queries are standalone.
+          </Typography>
+          <EditableTable
+            columns={EXAMPLE_QUERY_COLS}
+            rows={data.example_queries || []}
+            onChange={(rows) => onChange("example_queries", rows)}
+            readOnly={readOnly}
+          />
+        </AccordionDetails>
+      </Accordion>
+
+      {/* ---- Clarifying Questions (#2) ---- */}
+      <Accordion id="section-3-clarifying-questions" defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="h6">Clarifying Questions</Typography>
+            {(data.clarifying_questions || []).length > 0 && (
+              <Chip label={`${(data.clarifying_questions || []).length}`} size="small" variant="outlined" />
+            )}
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            For ambiguous terms, tell Genie to ask a follow-up before answering.
+            Example: when someone asks about <em>"service lines"</em>, Genie can ask
+            whether they mean <em>clinical</em> or <em>financial</em> service line.
+            These become clarification triggers in the space's instructions when you
+            generate the plan in Session 5.
+          </Typography>
+          <EditableTable
+            columns={CLARIFYING_COLS}
+            rows={data.clarifying_questions || []}
+            onChange={(rows) => onChange("clarifying_questions", rows)}
+            readOnly={readOnly}
           />
         </AccordionDetails>
       </Accordion>

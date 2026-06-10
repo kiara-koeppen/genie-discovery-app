@@ -126,6 +126,10 @@ export interface Session3Data {
   term_classifications: TermClassification[];
   sql_expressions: SqlExpression[];
   text_instructions: TextInstruction[];
+  /** #7: analyst-authored example SQL queries, surfaced verbatim in the space. */
+  example_queries?: { question: string; sql: string; usage_guidance?: string }[];
+  /** #2: disambiguation prompts Genie should ask on ambiguous terms. */
+  clarifying_questions?: { trigger: string; clarification: string }[];
   data_gaps: DataGap[];
   scope_boundaries: ScopeBoundary[];
   metric_view_yaml: string;

@@ -63,6 +63,7 @@ SESSION_COLS = {
     1: ["business_context", "pain_points", "existing_reports"],
     2: ["question_bank", "vocabulary_metrics"],
     3: ["term_classifications", "sql_expressions", "text_instructions",
+        "clarifying_questions", "example_queries",
         "data_gaps", "scope_boundaries", "global_filter",
         "metric_view_yaml", "metric_view_yaml_previous", "metric_view_fqn"],
     4: ["analyst_commentary", "auto_summary", "data_plan", "benchmark_questions",
@@ -3008,6 +3009,27 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
     lines.append("### Analyst Text Instructions (MUST be consolidated into one general_instructions)")
     for t in s3.get("text_instructions", []):
         lines.append(f"- **{t.get('title','')}**: {t.get('instruction','')}")
+    # Analyst-authored example queries (S3) — these are deliberate, reviewed
+    # examples to surface in the space, distinct from any the LLM drafts.
+    aeq = [e for e in s3.get("example_queries", []) if isinstance(e, dict)
+           and (e.get("sql") or "").strip()]
+    if aeq:
+        lines.append("### Analyst-Provided Example Queries (include these verbatim in example_queries, draft=false)")
+        for e in aeq:
+            q = (e.get("question") or "").strip() or "(no question text)"
+            sql = (e.get("sql") or "").strip()
+            guid = (e.get("usage_guidance") or "").strip()
+            lines.append(f"- Q: {q}\n  SQL: {sql}" + (f"\n  Guidance: {guid}" if guid else ""))
+    # Clarifying / disambiguation questions the analyst wants Genie to ask when a
+    # request is ambiguous (e.g. "service line" -> clinical vs financial).
+    cq = [c for c in s3.get("clarifying_questions", []) if isinstance(c, dict)
+          and (c.get("trigger") or "").strip()]
+    if cq:
+        lines.append("### Analyst Clarifying Questions (fold into general_instructions as disambiguation bullets)")
+        for c in cq:
+            trig = (c.get("trigger") or "").strip()
+            ask = (c.get("clarification") or "").strip()
+            lines.append(f"- When the user asks about \"{trig}\": {ask}")
     lines.append("### Data Gaps")
     for g in s3.get("data_gaps", []):
         lines.append(f"- {g.get('gap_description','')}")
@@ -3251,7 +3273,7 @@ Produce a JSON object with exactly these fields:
    - Scope: 1 bullet — what this space answers and who it's for.
    - Out-of-scope: 1-2 bullets — topics Genie should refuse or hand off.
    - Global response standards: date format, rounding, required columns, time-zone, default ordering.
-   - Clarification triggers: each as a single bullet using this exact pattern: "When <user_condition> AND <missing_info>, ask: <clarification_question>". Example: "When user asks about revenue AND no date range is specified, ask: which fiscal period (e.g. last quarter, YTD, or a custom range)?"
+   - Clarification triggers: each as a single bullet using this exact pattern: "When <user_condition> AND <missing_info>, ask: <clarification_question>". Example: "When user asks about revenue AND no date range is specified, ask: which fiscal period (e.g. last quarter, YTD, or a custom range)?" If the engagement context has an "Analyst Clarifying Questions" section, EVERY one of those MUST appear here as a clarification-trigger bullet (preserve the analyst's intent, e.g. "When user asks about 'service line', ask: clinical service line or financial service line?").
    - Summaries: optional 1-2 bullets prefixed with "Summary:" that constrain how Genie phrases its prose answers (e.g. "Summary: always show totals as a single sentence with the metric name, the number formatted with thousands separators, and the period."). Only TEXT instructions affect summaries — SQL expressions and example queries do not. Include this bucket only if the analyst commentary specifies a response style.
 
    Synonym routing (see <classified_synonyms> block above for the authoritative list):
@@ -3277,7 +3299,7 @@ IMPORTANT SQL qualification rule for snippets below: Genie infers the table from
 
 5. "sql_measures" (array): Reusable aggregate expressions (COUNT/SUM/AVG/etc). Same shape. Seed from the analyst's Session 3 SQL Expressions — classify each as filter/dimension/measure based on its SQL (aggregates → measure; WHERE-style predicates → filter; plain column exprs → dimension). Validate syntax and rewrite column references to use the short table prefix (e.g., rewrite `COUNT(CASE WHEN status = 'CANCELLED' THEN 1 END) * 100.0 / COUNT(*)` on table `my_catalog.my_schema.orders` to `COUNT(CASE WHEN orders.status = 'CANCELLED' THEN 1 END) * 100.0 / COUNT(orders.*)`).
 
-6. "example_queries" (array, 3-6 items): Full SQL examples for complex/common questions from the question bank. Each: {{"question": "...", "sql": "...", "draft": true, "usage_guidance": "..."}}. SQL MUST use fully qualified `catalog.schema.table` references because example queries are standalone. Only include questions where you can write reasonably confident SQL given the tables in scope — skip speculative ones. Always set "draft": true so analyst reviews.
+6. "example_queries" (array, 3-6 items): Full SQL examples for complex/common questions from the question bank. Each: {{"question": "...", "sql": "...", "draft": true, "usage_guidance": "..."}}. SQL MUST use fully qualified `catalog.schema.table` references because example queries are standalone. Only include questions where you can write reasonably confident SQL given the tables in scope — skip speculative ones. Set "draft": true for the ones YOU author so the analyst reviews. EXCEPTION: any query in the engagement context's "Analyst-Provided Example Queries" section MUST be included VERBATIM (do not rewrite the SQL) with "draft": false — the analyst already authored and vetted these. These analyst queries are IN ADDITION to the 3-6 you draft.
 
    Trusted Assets tip: for the 1-3 highest-value recurring questions (the ones a BO will ask repeatedly with different parameters), write the SQL using `:param_name` placeholders (e.g. `WHERE orders.region = :region`) and note this in usage_guidance. When Genie matches the exact parameterized template, the response is labeled "Trusted" — a major reliability signal. Only do this for questions where you can confidently parameterize; don't force it.
 

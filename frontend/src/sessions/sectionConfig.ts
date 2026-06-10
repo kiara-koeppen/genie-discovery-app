@@ -40,6 +40,8 @@ export const SESSION_SECTIONS: Record<number, SectionEntry[]> = {
     { id: "section-3-classify-terms", label: "Classify Terms" },
     { id: "section-3-global-filter", label: "Global Filter" },
     { id: "section-3-sql-expressions", label: "SQL Expressions" },
+    { id: "section-3-example-queries", label: "Example Queries" },
+    { id: "section-3-clarifying-questions", label: "Clarifying Questions" },
     { id: "section-3-text-instructions", label: "Text Instructions" },
     { id: "section-3-table-summary", label: "Table Summary" },
     { id: "section-3-data-gaps", label: "Data Gap Analysis" },
