@@ -989,6 +989,15 @@ export default function Session3Form({
             <strong> Global Filter</strong> above — not per row. Rows are auto-added when you classify
             a term as Metric above.
           </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            <strong>Aggregate or a WHERE clause?</strong> An aggregate
+            (e.g. <code>COUNT(1)</code>, <code>SUM(paid_amount)</code>) becomes a measure.
+            A bare condition / WHERE-clause fragment also works
+            (e.g. <code>initial_decision = 'DENIED'</code>): the generator will either
+            fold it into the metric view's filter or count the matching rows as
+            <code> COUNT(1) FILTER (WHERE …)</code>, depending on how the metric reads.
+            You don't have to rewrite it as a SELECT.
+          </Typography>
           <EditableTable
             columns={SQL_EXPR_COLS}
             rows={data.sql_expressions || []}

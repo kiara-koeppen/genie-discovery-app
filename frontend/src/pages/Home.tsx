@@ -14,7 +14,7 @@ import { api } from "../api";
 
 const SESSION_LABELS = [
   "Business Context", "Questions & Vocabulary", "Technical Design",
-  "COE Review", "Configure Space", "Prototype Review", "Production Review",
+  "Design, Review, & Approval", "Configure Space", "Prototype Review", "Production Review",
 ];
 
 // Status chip for an engagement card. Mirrors the engagement-page top chip
