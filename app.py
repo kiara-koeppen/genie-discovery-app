@@ -2999,6 +2999,16 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
     lines.append("")
 
     lines.append("## Session 3: Technical Design")
+    gf = (s3.get("global_filter") or "").strip()
+    if gf:
+        lines.append("### GLOBAL FILTER — applies to the WHOLE space (not just the metric view)")
+        lines.append(f"```\n{gf}\n```")
+        lines.append(
+            "The analyst requires this predicate on EVERY query in the space, against raw "
+            "tables AND the metric view. You MUST propagate it to all of: (a) a mandatory "
+            "general_instructions bullet, (b) every example_query's WHERE clause, and (c) a "
+            "named sql_filter. See the output rules for exact wording."
+        )
     lines.append("### SQL Expressions / Measures")
     for e in s3.get("sql_expressions", []):
         lines.append(
@@ -3272,6 +3282,7 @@ Produce a JSON object with exactly these fields:
 
    - Scope: 1 bullet — what this space answers and who it's for.
    - Out-of-scope: 1-2 bullets — topics Genie should refuse or hand off.
+   - GLOBAL FILTER: if the engagement context has a "GLOBAL FILTER" section, emit a mandatory bullet as the FIRST data-rule bullet, worded exactly like: "ALWAYS apply this filter to every query unless the user explicitly overrides it: <predicate>." Use the predicate verbatim. This is required — the analyst wants it enforced space-wide, not just in the metric view.
    - Global response standards: date format, rounding, required columns, time-zone, default ordering.
    - Clarification triggers: each as a single bullet using this exact pattern: "When <user_condition> AND <missing_info>, ask: <clarification_question>". Example: "When user asks about revenue AND no date range is specified, ask: which fiscal period (e.g. last quarter, YTD, or a custom range)?" If the engagement context has an "Analyst Clarifying Questions" section, EVERY one of those MUST appear here as a clarification-trigger bullet (preserve the analyst's intent, e.g. "When user asks about 'service line', ask: clinical service line or financial service line?").
    - Summaries: optional 1-2 bullets prefixed with "Summary:" that constrain how Genie phrases its prose answers (e.g. "Summary: always show totals as a single sentence with the metric name, the number formatted with thousands separators, and the period."). Only TEXT instructions affect summaries — SQL expressions and example queries do not. Include this bucket only if the analyst commentary specifies a response style.
@@ -3293,13 +3304,13 @@ Produce a JSON object with exactly these fields:
 
 IMPORTANT SQL qualification rule for snippets below: Genie infers the table from qualified column references in the SQL. Every column reference in snippet SQL MUST be prefixed with the SHORT table name (the last segment of the FQN). Example: for table `my_catalog.my_schema.orders`, write `orders.status`, NOT `status` and NOT `my_catalog.my_schema.orders.status`. The `table` field in each entry is metadata for the analyst UI and is NOT pushed to Genie.
 
-3. "sql_filters" (array): Reusable WHERE-clause expressions. Each: {{"name": "snake_case_id", "sql": "short_table.column = 'value'", "table": "catalog.schema.table", "display_name": "Friendly Name", "synonyms": ["..."], "description": "..."}}. Example: {{"name": "cancelled_orders", "sql": "orders.status = 'CANCELLED'", "table": "my_catalog.my_schema.orders", "display_name": "Cancelled Orders"}}
+3. "sql_filters" (array): Reusable WHERE-clause expressions. Each: {{"name": "snake_case_id", "sql": "short_table.column = 'value'", "table": "catalog.schema.table", "display_name": "Friendly Name", "synonyms": ["..."], "description": "..."}}. Example: {{"name": "cancelled_orders", "sql": "orders.status = 'CANCELLED'", "table": "my_catalog.my_schema.orders", "display_name": "Cancelled Orders"}}. If a GLOBAL FILTER was provided, also emit it here as a named filter (e.g. name "global_filter", display_name "Global Filter") with a description noting it applies to every query, qualifying its columns to the relevant table.
 
 4. "sql_dimensions" (array): Reusable grouping/SELECT column expressions. Same shape as sql_filters. Example: {{"name": "order_year", "sql": "YEAR(orders.created_at)", "table": "my_catalog.my_schema.orders", "display_name": "Order Year"}}
 
 5. "sql_measures" (array): Reusable aggregate expressions (COUNT/SUM/AVG/etc). Same shape. Seed from the analyst's Session 3 SQL Expressions — classify each as filter/dimension/measure based on its SQL (aggregates → measure; WHERE-style predicates → filter; plain column exprs → dimension). Validate syntax and rewrite column references to use the short table prefix (e.g., rewrite `COUNT(CASE WHEN status = 'CANCELLED' THEN 1 END) * 100.0 / COUNT(*)` on table `my_catalog.my_schema.orders` to `COUNT(CASE WHEN orders.status = 'CANCELLED' THEN 1 END) * 100.0 / COUNT(orders.*)`).
 
-6. "example_queries" (array, 3-6 items): Full SQL examples for complex/common questions from the question bank. Each: {{"question": "...", "sql": "...", "draft": true, "usage_guidance": "..."}}. SQL MUST use fully qualified `catalog.schema.table` references because example queries are standalone. Only include questions where you can write reasonably confident SQL given the tables in scope — skip speculative ones. Set "draft": true for the ones YOU author so the analyst reviews. EXCEPTION: any query in the engagement context's "Analyst-Provided Example Queries" section MUST be included VERBATIM (do not rewrite the SQL) with "draft": false — the analyst already authored and vetted these. These analyst queries are IN ADDITION to the 3-6 you draft.
+6. "example_queries" (array, 3-6 items): Full SQL examples for complex/common questions from the question bank. Each: {{"question": "...", "sql": "...", "draft": true, "usage_guidance": "..."}}. SQL MUST use fully qualified `catalog.schema.table` references because example queries are standalone. Only include questions where you can write reasonably confident SQL given the tables in scope — skip speculative ones. Set "draft": true for the ones YOU author so the analyst reviews. EXCEPTION: any query in the engagement context's "Analyst-Provided Example Queries" section MUST be included VERBATIM (do not rewrite the SQL) with "draft": false — the analyst already authored and vetted these. These analyst queries are IN ADDITION to the 3-6 you draft. If a GLOBAL FILTER was provided, every example query YOU author MUST include that predicate in its WHERE clause (combine with AND) so the examples model the filter; do not modify the verbatim analyst-provided queries.
 
    Trusted Assets tip: for the 1-3 highest-value recurring questions (the ones a BO will ask repeatedly with different parameters), write the SQL using `:param_name` placeholders (e.g. `WHERE orders.region = :region`) and note this in usage_guidance. When Genie matches the exact parameterized template, the response is labeled "Trusted" — a major reliability signal. Only do this for questions where you can confidently parameterize; don't force it.
 
