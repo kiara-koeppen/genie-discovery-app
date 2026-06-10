@@ -334,11 +334,19 @@ export const api = {
     id: string,
     sections: string[],
     data: Record<string, Record<string, string>[]>,
+    benchmarks?: BenchmarkQuestion[],
   ) => {
+    // Benchmarks (S4) are export-only and have a different shape; the backend
+    // reads them from data.benchmarks when "benchmarks" is in sections.
+    const body: { sections: string[]; data: Record<string, unknown> } = {
+      sections,
+      data: { ...data },
+    };
+    if (benchmarks) body.data.benchmarks = benchmarks;
     const res = await fetch(`${BASE}/engagements/${id}/export-prework`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sections, data }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({} as any));

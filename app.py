@@ -1703,7 +1703,51 @@ def _build_prework_template():
     return buf
 
 
-def _build_prework_export(selected_keys, data):
+# Export-only benchmark sheet. Benchmarks live in Session 4 and are NOT part of
+# the re-uploadable pre-work round-trip (they reference run results, bools, and
+# nested objects), so this sheet is deliberately kept out of _PREWORK_SHEETS.
+_BENCHMARK_EXPORT = {
+    "name": "S4 Benchmarks",
+    "headers": [
+        "Question", "Category", "Difficulty", "Expected SQL",
+        "Sample Result", "Measurement Summary (plain English)", "BO Approved",
+    ],
+    "row_keys": [
+        "question", "category", "difficulty", "expected_sql",
+        "sample_result", "notes", "bo_approved",
+    ],
+}
+
+
+def _format_sample_result(sr):
+    """Render a benchmark's sample_result object as readable plain text for a
+    spreadsheet cell. Returns '' when there's nothing to show."""
+    if not isinstance(sr, dict):
+        return ""
+    if sr.get("error"):
+        return f"ERROR: {sr['error']}"
+    cols = sr.get("columns") or []
+    rows = sr.get("rows") or []
+    if not cols and not rows:
+        return ""
+    lines = []
+    ran_at = sr.get("ran_at")
+    if ran_at:
+        lines.append(f"(ran {ran_at})")
+    if cols:
+        lines.append(" | ".join(str(c) for c in cols))
+    for r in rows[:25]:
+        if isinstance(r, (list, tuple)):
+            lines.append(" | ".join("" if v is None else str(v) for v in r))
+        else:
+            lines.append(str(r))
+    rc = sr.get("row_count")
+    if isinstance(rc, int) and (rc > 25 or sr.get("truncated")):
+        lines.append(f"... ({rc} rows total{', truncated' if sr.get('truncated') else ''})")
+    return "\n".join(lines)
+
+
+def _build_prework_export(selected_keys, data, benchmarks=None):
     """Build a pre-work .xlsx populated with the engagement's current S1/S2 data.
 
     Mirrors the blank template's sheet names, headers, and `_meta` version so an
@@ -1780,6 +1824,35 @@ def _build_prework_export(selected_keys, data):
             )
             ws.add_data_validation(dv)
             dv.add("C3:C200")
+
+    # Export-only Benchmarks sheet (S4). Not part of the re-upload round-trip;
+    # the parser ignores unknown sheets, so this is safe to include.
+    if benchmarks:
+        ws = wb.create_sheet(_BENCHMARK_EXPORT["name"])
+        ws.cell(
+            row=1, column=1,
+            value=("Benchmarks captured in Session 4. Export only — this sheet is not "
+                   "read back on upload."),
+        ).font = instruction_font
+        ws.merge_cells(start_row=1, start_column=1, end_row=1,
+                       end_column=len(_BENCHMARK_EXPORT["headers"]))
+        ws.row_dimensions[1].height = 30
+        ws.cell(row=1, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+        for col_idx, header in enumerate(_BENCHMARK_EXPORT["headers"], start=1):
+            cell = ws.cell(row=2, column=col_idx, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            # Wider columns for SQL and sample result
+            width = 60 if header in ("Expected SQL", "Sample Result") else 36
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+        for r_offset, b in enumerate(benchmarks):
+            r_idx = 3 + r_offset
+            for col_idx, rk in enumerate(_BENCHMARK_EXPORT["row_keys"], start=1):
+                val = b.get(rk, "")
+                cell = ws.cell(row=r_idx, column=col_idx, value=val)
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[r_idx].height = 60
 
     # Hidden metadata sheet — same version key the parser reads, so the export
     # re-uploads cleanly. `kind=export` distinguishes it from a blank template.
@@ -2093,7 +2166,8 @@ def export_prework(eid):
 
     valid_keys = {s["key"] for s in _PREWORK_SHEETS}
     sections_set = {s for s in sections if s in valid_keys}
-    if not sections_set:
+    want_benchmarks = "benchmarks" in sections
+    if not sections_set and not want_benchmarks:
         return jsonify({"error": "No valid sections selected to export."}), 400
 
     # Same defensive normalization as apply-prework: keep only recognized row
@@ -2114,8 +2188,34 @@ def export_prework(eid):
             if any(clean.values()):
                 normalized[k].append(clean)
 
+    # Benchmarks (S4) are export-only and have their own shape: flatten the
+    # nested sample_result to text, coerce bo_approved to Yes/No, keep the rest
+    # as trimmed strings. Drop rows with no question AND no SQL.
+    benchmark_rows = None
+    if want_benchmarks:
+        raw_bms = data.get("benchmarks") or []
+        if not isinstance(raw_bms, list):
+            return jsonify({"error": "data.benchmarks must be a list."}), 400
+        benchmark_rows = []
+        for b in raw_bms:
+            if not isinstance(b, dict):
+                continue
+            question = str(b.get("question") or "").strip()
+            sql = str(b.get("expected_sql") or "").strip()
+            if not question and not sql:
+                continue
+            benchmark_rows.append({
+                "question": question,
+                "category": str(b.get("category") or "").strip(),
+                "difficulty": str(b.get("difficulty") or "").strip(),
+                "expected_sql": sql,
+                "sample_result": _format_sample_result(b.get("sample_result")),
+                "notes": str(b.get("notes") or "").strip(),
+                "bo_approved": "Yes" if b.get("bo_approved") else "No",
+            })
+
     try:
-        buf = _build_prework_export(sections_set, normalized)
+        buf = _build_prework_export(sections_set, normalized, benchmarks=benchmark_rows)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": f"Failed to build export: {e}"}), 500

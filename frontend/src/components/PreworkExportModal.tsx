@@ -4,7 +4,7 @@ import {
   Box, Typography, Checkbox, FormControlLabel, Stack, Alert, Chip,
 } from "@mui/material";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
-import { api } from "../api";
+import { api, BenchmarkQuestion } from "../api";
 
 // Order and labels match the backend's _PREWORK_SHEETS (the only sections that
 // export to a clean tabular layout). Backend is authoritative; if you add a
@@ -17,23 +17,30 @@ const SECTION_LABELS: { key: string; label: string; session: number }[] = [
   { key: "vocabulary_metrics", label: "Key Terms & Metrics", session: 2 },
 ];
 
+// Export-only key for S4 benchmarks. Not in SECTION_LABELS because it isn't part
+// of the re-uploadable round-trip and carries a different data shape.
+const BENCHMARKS_KEY = "benchmarks";
+
 interface Props {
   open: boolean;
   engagementId: string;
   /** Current S1/S2 data, keyed by section. Rows are exported verbatim (WYSIWYG
    *  with the open forms). */
   currentData: Record<string, Record<string, string>[]>;
+  /** Current S4 benchmark rows (export-only). */
+  benchmarks?: BenchmarkQuestion[];
   onClose: () => void;
 }
 
 export default function PreworkExportModal({
-  open, engagementId, currentData, onClose,
+  open, engagementId, currentData, benchmarks = [], onClose,
 }: Props) {
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
     for (const s of SECTION_LABELS) c[s.key] = (currentData[s.key] || []).length;
+    c[BENCHMARKS_KEY] = benchmarks.length;
     return c;
-  }, [currentData]);
+  }, [currentData, benchmarks]);
 
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [exporting, setExporting] = useState(false);
@@ -46,20 +53,32 @@ export default function PreworkExportModal({
     if (!open) return;
     const init: Record<string, boolean> = {};
     for (const s of SECTION_LABELS) init[s.key] = counts[s.key] > 0;
+    init[BENCHMARKS_KEY] = counts[BENCHMARKS_KEY] > 0;
     setSelected(init);
     setError("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const chosen = SECTION_LABELS.filter((s) => selected[s.key]).map((s) => s.key);
+  const chosen = [
+    ...SECTION_LABELS.filter((s) => selected[s.key]).map((s) => s.key),
+    ...(selected[BENCHMARKS_KEY] ? [BENCHMARKS_KEY] : []),
+  ];
 
   const doExport = async () => {
     setExporting(true);
     setError("");
     try {
       const data: Record<string, Record<string, string>[]> = {};
-      for (const k of chosen) data[k] = currentData[k] || [];
-      await api.exportPrework(engagementId, chosen, data);
+      for (const k of chosen) {
+        if (k === BENCHMARKS_KEY) continue;
+        data[k] = currentData[k] || [];
+      }
+      await api.exportPrework(
+        engagementId,
+        chosen,
+        data,
+        selected[BENCHMARKS_KEY] ? benchmarks : undefined,
+      );
       onClose();
     } catch (e: any) {
       setError(e?.message || "Export failed");
@@ -102,9 +121,9 @@ export default function PreworkExportModal({
       <DialogTitle>Export to Excel</DialogTitle>
       <DialogContent dividers>
         <Typography variant="body2" sx={{ mb: 2 }}>
-          Choose which sections to export. The file matches the pre-work
-          template, so you can edit it and load it back via{" "}
-          <strong>Upload Pre-Work</strong>.
+          Choose which sections to export. Sessions 1 & 2 match the pre-work
+          template, so you can edit them and load them back via{" "}
+          <strong>Upload Pre-Work</strong>. Benchmarks are export-only.
         </Typography>
 
         <Typography variant="overline" color="text.secondary">
@@ -117,8 +136,15 @@ export default function PreworkExportModal({
         <Typography variant="overline" color="text.secondary">
           Session 2 — Questions & Vocabulary
         </Typography>
-        <Stack sx={{ pl: 0.5 }}>
+        <Stack sx={{ mb: 1.5, pl: 0.5 }}>
           {SECTION_LABELS.filter((s) => s.session === 2).map(renderSection)}
+        </Stack>
+
+        <Typography variant="overline" color="text.secondary">
+          Session 4 — Design, Review, & Approval
+        </Typography>
+        <Stack sx={{ pl: 0.5 }}>
+          {renderSection({ key: BENCHMARKS_KEY, label: "Benchmarks" })}
         </Stack>
 
         {error && (
