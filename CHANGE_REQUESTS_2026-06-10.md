@@ -56,6 +56,17 @@ Baseline at start: main @ f6fd85e, clean tree. Last kk_test bundle index-gPkGblZ
 
 ## Progress log (append as we go)
 - [x] Scratchpad + branch created (commit on feature/intermountain-2026-06-10)
+- [x] #6 + #4: MV YAML lint + live scratch create+drop validation; WHERE-clause routing
+- [x] #3: S4 title renamed to "Design, Review, & Approval" (labels only)
+- [x] #1: Benchmarks added to Export modal (export-only S4 sheet)
+- [x] #5: Type select in S2 vocab, seeds S3 classification
+- [x] #8: S3 SQL Expressions table picker restricted to chosen Data Sources
+- [x] #2 + #7: S3 Clarifying Questions + analyst Example Queries (feed plan gen)
+- [x] Built frontend (bundle index-B4qc5LOD.js), deployed to kk_test
+      (deployment 01f16514dc951c71ace98547ba881e17, App started successfully)
+- [x] Smoke green: live bundle matches; /api/engagements 200 (11); S3 new cols
+      auto-migrated; benchmark export round-trip produces valid S4 Benchmarks sheet
+- ALL 9 ITEMS COMPLETE. Customer (Intermountain) NOT redeployed — pending their go.
 
 ## Notes / constraints
 - Deploy via individual `databricks workspace import` (RAW). NEVER import-dir.
