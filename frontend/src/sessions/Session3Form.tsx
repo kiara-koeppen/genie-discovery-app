@@ -305,6 +305,35 @@ export default function Session3Form({
     }
   };
 
+  // Seed classifications from any Type set in Session 2. Runs only for terms
+  // that have an S2 `term_type` AND no existing S3 classification entry, so it
+  // never overrides a classification the analyst made (or cleared) here. Mirrors
+  // handleClassify so auto-rows (e.g. a Metric's SQL Expression row) get created.
+  useEffect(() => {
+    if (readOnly) return;
+    const existing = data.term_classifications || [];
+    const haveTerm = new Set(existing.map((c: any) => c.business_term));
+    const toSeed = vocabTerms.filter(
+      (v: any) => v.term_type && !haveTerm.has(v.business_term),
+    );
+    if (toSeed.length === 0) return;
+    const classifications = [...existing];
+    for (const v of toSeed) {
+      classifications.push({ business_term: v.business_term, types: [v.term_type] });
+    }
+    onChange("term_classifications", classifications);
+    const res = _reconcileAutoRows(
+      classifications,
+      data.sql_expressions || [],
+      data.text_instructions || [],
+    );
+    if (res.changed) {
+      onChange("sql_expressions", res.exprs);
+      onChange("text_instructions", res.instrs);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vocabTerms, readOnly]);
+
   // Load catalogs + warehouses once for the MV builder
   useEffect(() => {
     api.listCatalogs().then(setMvCatalogs).catch(() => setMvCatalogs([]));
