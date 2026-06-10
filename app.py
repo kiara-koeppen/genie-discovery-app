@@ -4506,9 +4506,21 @@ measures:
 </metric_view_yaml_spec>
 
 <rules>
-1. Classify each analyst SQL expression:
+1. Classify each analyst SQL expression by its SHAPE — analysts sometimes paste a
+   bare WHERE-clause predicate where a value expression is expected, so look at
+   what the SQL actually is, not just what it's labeled:
    - Aggregate function (COUNT/SUM/AVG/MAX/MIN/...) in the expression → `measures`
-   - No aggregate (plain column, CASE WHEN, DATE_TRUNC, etc.) → `dimensions`
+   - A bare boolean PREDICATE / WHERE-clause fragment (e.g. `status = 'CANCELLED'`,
+     `claim_type IN ('Professional','Facility')`, `receipt_date >= '2024-01-01'`) is
+     NOT a measure or dimension value. Handle it as ONE of:
+       (a) if it scopes the whole space → fold it into the top-level `filter:` (AND
+           it with any existing filter), OR
+       (b) if the analyst clearly wants to COUNT/measure the matching rows → wrap it
+           as a measure: `COUNT(1) FILTER (WHERE <predicate>)`.
+     Pick (a) when the metric_name reads like a scope/exclusion, (b) when it reads
+     like a count/rate of the matching subset. NEVER emit a bare predicate as a
+     dimension or measure `expr` — that produces a boolean column nobody asked for.
+   - No aggregate and not a predicate (plain column, CASE WHEN, DATE_TRUNC, etc.) → `dimensions`
 2. Rewrite column references to be UNQUALIFIED (no table prefix). The MV already knows its source. Turn `claims.initial_decision` into `initial_decision`. Only keep a prefix if the reference targets a JOINED table via the join's alias.
 3. Put business-term synonyms from the vocabulary into the matching dimension/measure `synonyms:` array. Do NOT emit them as an `instructions` key (that key does not exist).
 4. If the analyst supplied a `## Global Filter` section above, copy that SQL verbatim into the top-level `filter:` key — it is the authoritative filter. If a text instruction adds another data-level predicate (e.g., "exclude test claims" → `test_flag = 'N'`), AND the global filter, combine them with `AND`. Skip text instructions that aren't data filters — those belong on the Genie Space, not the MV.
@@ -4671,6 +4683,200 @@ def _validate_yaml_columns(yaml_text, schemas):
     return sorted(missing)
 
 
+# Aggregate functions that make an expression a valid `measure`. A measure expr
+# MUST contain at least one of these; a dimension expr must contain NONE.
+_AGG_FUNCS = {
+    "count", "sum", "avg", "mean", "min", "max", "median", "stddev", "stddev_pop",
+    "stddev_samp", "variance", "var_pop", "var_samp", "approx_count_distinct",
+    "approx_percentile", "percentile", "percentile_approx", "collect_list",
+    "collect_set", "first", "first_value", "last", "last_value", "any", "every",
+    "some", "bool_and", "bool_or", "corr", "covar_pop", "covar_samp", "skewness",
+    "kurtosis", "count_if", "max_by", "min_by", "grouping", "grouping_id",
+    "regr_count", "regr_avgx", "regr_avgy", "regr_slope", "regr_intercept",
+    "regr_r2", "regr_sxx", "regr_sxy", "regr_syy",
+}
+
+# Top-level keys the metric view YAML v1.1 spec allows. Anything else breaks the
+# CREATE ... WITH METRICS write.
+_MV_ALLOWED_TOP_KEYS = {
+    "version", "comment", "source", "filter", "joins", "dimensions",
+    "measures", "materialization",
+}
+
+
+def _expr_has_aggregate(expr):
+    """True if a SQL expression contains a call to a known aggregate function."""
+    import re
+    if not expr:
+        return False
+    # Strip string literals so a function-looking token inside a string doesn't count
+    cleaned = re.sub(r"'[^']*'", " ", str(expr))
+    for fn in _AGG_FUNCS:
+        if re.search(rf"\b{fn}\s*\(", cleaned, re.IGNORECASE):
+            return True
+    return False
+
+
+def _expr_looks_like_predicate(expr):
+    """True if an expr looks like a bare WHERE-clause predicate rather than a
+    value expression — i.e. a top-level comparison with no surrounding aggregate.
+    Used to catch the common analyst mistake of pasting a filter (`status = 'X'`)
+    where a measure/dimension value is expected (change request #4)."""
+    import re
+    if not expr:
+        return False
+    s = str(expr).strip()
+    if _expr_has_aggregate(s):
+        return False
+    # Remove string literals so operators inside strings don't trigger
+    cleaned = re.sub(r"'[^']*'", " ", s)
+    # Bare comparison / membership operators at the surface level
+    if re.search(r"(<=|>=|!=|<>|\s=\s|\s<\s|\s>\s)", cleaned):
+        return True
+    if re.search(r"\b(IN|LIKE|ILIKE|RLIKE|BETWEEN|IS\s+NULL|IS\s+NOT\s+NULL)\b",
+                 cleaned, re.IGNORECASE):
+        return True
+    return False
+
+
+def _lint_mv_yaml(yaml_text):
+    """Deterministic structural lint of a metric view YAML body.
+
+    Returns (hard_errors, warnings). hard_errors are issues that WILL break the
+    `CREATE OR REPLACE VIEW ... WITH METRICS` write (so we feed them to the LLM
+    auto-fix retry and block the push). warnings are likely-wrong-but-creatable
+    issues (e.g. a predicate where a value expression was expected — #4).
+
+    This catches the failure classes the column-existence check misses:
+    name-collisions (CONTAINS_AGGREGATE), measures without an aggregate,
+    dimensions WITH an aggregate, disallowed top-level keys, duplicate names,
+    and bare Y/N literals YAML parses as booleans.
+    """
+    hard, warn = [], []
+    try:
+        import yaml as pyyaml
+    except Exception:
+        return hard, warn
+    try:
+        doc = pyyaml.safe_load(yaml_text)
+    except Exception as e:
+        return [f"YAML does not parse: {e}"], warn
+    if not isinstance(doc, dict):
+        return ["YAML root is not a mapping (expected top-level keys like version/source/measures)."], warn
+
+    # Top-level key whitelist
+    for k in doc.keys():
+        if str(k) not in _MV_ALLOWED_TOP_KEYS:
+            hard.append(
+                f"Invalid top-level key `{k}`. Allowed keys: "
+                f"{', '.join(sorted(_MV_ALLOWED_TOP_KEYS))}. Rules that aren't a "
+                f"filter/dimension/measure belong on the Genie Space, not the metric view."
+            )
+    if not doc.get("source"):
+        hard.append("Missing required `source` (the base table as catalog.schema.table).")
+
+    seen_names = {}
+
+    def _check_member(member, kind):
+        if not isinstance(member, dict):
+            hard.append(f"Each {kind} entry must be a mapping with `name` and `expr`.")
+            return
+        name = (member.get("name") or "").strip()
+        expr = member.get("expr") or ""
+        if not name:
+            hard.append(f"A {kind} is missing its `name`.")
+        else:
+            if " " in name:
+                hard.append(f"{kind} name `{name}` contains a space — use snake_case.")
+            if name.lower() in seen_names:
+                hard.append(
+                    f"Duplicate name `{name}` (also used as a {seen_names[name.lower()]}). "
+                    f"Names must be unique across dimensions and measures."
+                )
+            seen_names[name.lower()] = kind
+        if not expr:
+            hard.append(f"{kind} `{name or '?'}` is missing its `expr`.")
+            return
+        # Name-collision: a measure/dimension name that also appears as a bare
+        # identifier inside its own expr triggers CONTAINS_AGGREGATE / resolution errors.
+        if name and name.lower() in _extract_bare_identifiers(expr):
+            hard.append(
+                f"{kind} `{name}` references a column named `{name}` in its own expr. "
+                f"Rename the {kind} (e.g. add a _pct/_count/_total suffix) so it doesn't "
+                f"collide with the column."
+            )
+        has_agg = _expr_has_aggregate(expr)
+        if kind == "measure" and not has_agg:
+            hard.append(
+                f"measure `{name}` has no aggregate function in its expr (`{expr}`). "
+                f"Measures must aggregate (COUNT/SUM/AVG/...). If this is a filter, move it "
+                f"to the top-level `filter:` key; if it's a row-level value, make it a dimension."
+            )
+        if kind == "dimension" and has_agg:
+            hard.append(
+                f"dimension `{name}` contains an aggregate function in its expr (`{expr}`). "
+                f"Dimensions must be row-level (non-aggregate). Move this to `measures`."
+            )
+        if kind == "dimension" and _expr_looks_like_predicate(expr):
+            warn.append(
+                f"dimension `{name}` looks like a filter predicate (`{expr}`), not a value. "
+                f"If it's meant to scope the data, move it to the top-level `filter:` key."
+            )
+
+    for m in (doc.get("measures") or []):
+        _check_member(m, "measure")
+    for d in (doc.get("dimensions") or []):
+        _check_member(d, "dimension")
+
+    # Bare Y/N booleans inside exprs/filter (YAML 1.1 parses them as booleans)
+    import re
+    def _bare_yn(expr):
+        cleaned = re.sub(r"'[^']*'", " ", str(expr or ""))
+        return bool(re.search(r"(=|<>|!=|\bIN\b)\s*[YN]\b", cleaned))
+    if _bare_yn(doc.get("filter")):
+        warn.append("filter references a bare Y/N — quote string literals ('Y'/'N').")
+
+    return hard, warn
+
+
+def _dryrun_create_mv(user_w, yaml_body, warehouse_id, catalog, schema):
+    """Live validation: create a throwaway metric view from the YAML, then DROP it.
+
+    This is the only way to GUARANTEE the YAML will write to UC — it uses the
+    exact same `CREATE OR REPLACE VIEW ... WITH METRICS` engine path. Returns a
+    dict: {ok: bool, error: str|None, skipped: str|None}. `skipped` is set (and
+    ok=True) when we couldn't run the dry-run for a non-syntax reason — most
+    importantly a CREATE permission denial in the scratch schema — so callers
+    can fall back to lint without treating it as a validation failure.
+    """
+    if not (user_w and warehouse_id and catalog and schema and yaml_body):
+        return {"ok": True, "error": None, "skipped": "missing warehouse/target"}
+    scratch = f"_gdv_validate_{_gen_hex_id()}"
+    fqn = f"`{catalog}`.`{schema}`.`{scratch}`"
+    delim = "$$" if "$$" not in yaml_body else "$MV_DRYRUN$"
+    create_stmt = (
+        f"CREATE OR REPLACE VIEW {fqn}\nWITH METRICS\nLANGUAGE YAML\nAS {delim}\n{yaml_body}\n{delim}"
+    )
+    try:
+        _sql_exec_obo(user_w, create_stmt, warehouse_id)
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        # A permission/authorization failure means we can't validate HERE, not
+        # that the YAML is wrong. Skip gracefully so lint stays authoritative.
+        if any(k in low for k in ("permission", "privilege", "not authorized",
+                                  "access denied", "requires", "insufficient")):
+            return {"ok": True, "error": None, "skipped": f"no create rights in {catalog}.{schema}"}
+        return {"ok": False, "error": msg, "skipped": None}
+    finally:
+        # Always try to clean up the scratch object.
+        try:
+            _sql_exec_obo(user_w, f"DROP VIEW IF EXISTS {fqn}", warehouse_id)
+        except Exception as drop_err:
+            print(f"[mv-dryrun] cleanup of {fqn} failed: {drop_err}", flush=True)
+    return {"ok": True, "error": None, "skipped": None}
+
+
 @app.route("/api/engagements/<eid>/mv-prompt-preview", methods=["GET"])
 def mv_prompt_preview(eid):
     """Debug: return the fully-assembled MV YAML prompt for this engagement."""
@@ -4722,6 +4928,20 @@ def _task_draft_mv_yaml(payload):
     )
 
 
+def _mv_issue_list(yaml_text, schemas):
+    """Combine the column-existence check and the structural lint into one list
+    of hard, must-fix problems with a metric view YAML. Returns (issues, warnings)."""
+    missing = _validate_yaml_columns(yaml_text, schemas)
+    hard, warn = _lint_mv_yaml(yaml_text)
+    issues = list(hard)
+    if missing:
+        issues.append(
+            f"References column(s) that don't exist in the source table(s): "
+            f"{', '.join(missing)}. Use only real columns or drop that field."
+        )
+    return issues, warn
+
+
 def _do_draft_mv_yaml_inner(eng, user_w, warehouse_id):
     prompt = _build_mv_yaml_prompt(eng, user_w, warehouse_id)
     result = _call_llm(prompt, label="mv-yaml")
@@ -4730,58 +4950,111 @@ def _do_draft_mv_yaml_inner(eng, user_w, warehouse_id):
     source_table = str(result.get("source_table", "")).strip()
     suggested_name = str(result.get("suggested_name", "")).strip()
 
-    # Post-draft sanity check: verify every bare column reference exists.
-    # If any are missing, retry once with a targeted correction prompt.
     schemas = _collect_engagement_schemas(eng, user_w, warehouse_id)
-    missing = _validate_yaml_columns(yaml_text, schemas)
     warnings = []
-    if missing:
-        print(f"[draft-mv-yaml] validation found missing columns: {missing}", flush=True)
-        schema_lines = []
-        for fqn, cols in schemas.items():
-            if cols:
-                schema_lines.append(f"- `{fqn}`: {', '.join(c for c, _ in cols)}")
-        fix_prompt = f"""You drafted this metric view YAML, but it references columns that don't exist in the underlying tables.
+
+    schema_lines = []
+    for fqn, cols in schemas.items():
+        if cols:
+            schema_lines.append(f"- `{fqn}`: {', '.join(c for c, _ in cols)}")
+    schema_block = "\n".join(schema_lines) or "(schema unavailable)"
+
+    def _fix_once(bad_yaml, problems, label):
+        """Ask the LLM to repair the YAML given a concrete problem list. Returns
+        the repaired (yaml, source_table, suggested_name) or None on failure."""
+        fix_prompt = f"""You drafted this Databricks Unity Catalog metric view YAML, but it has problems that will prevent it from being created.
 
 <your_yaml>
-{yaml_text}
+{bad_yaml}
 </your_yaml>
 
-<missing_columns>
-{', '.join(missing)}
-</missing_columns>
+<problems_to_fix>
+{chr(10).join(f'- {p}' for p in problems)}
+</problems_to_fix>
 
 <authoritative_schema>
-{chr(10).join(schema_lines)}
+{schema_block}
 </authoritative_schema>
 
-Rewrite the YAML so every bare column reference in any `expr`, `filter`, or join `on` clause is a column that actually exists in the authoritative schema above. If a missing column represents a concept that cannot be expressed with real columns, DROP that dimension/measure entirely rather than inventing a column. Keep every other rule from the original task (snake_case name fields, no name-column collisions, quoted string literals, only allowed top-level keys).
+Rewrite the YAML so EVERY problem above is resolved. Rules to honor:
+- Measures MUST contain an aggregate (COUNT/SUM/AVG/...). Dimensions MUST be row-level (no aggregate). A bare WHERE-style predicate belongs in the top-level `filter:` key, never as a measure/dimension expr.
+- No measure/dimension `name` may equal a column referenced in its own expr (add a _pct/_count/_total suffix).
+- Names are unique across all dimensions and measures; snake_case, no spaces.
+- Only allowed top-level keys: version, comment, source, filter, joins, dimensions, measures, materialization.
+- Every bare column reference must be a real column from the authoritative schema. Drop a field rather than invent a column.
+- Quote string literals ('Y'/'N'/'DENIED').
 
 Return JSON with exactly: {{"yaml": "...", "source_table": "...", "suggested_name": "..."}}. No markdown fences."""
         try:
-            result2 = _call_llm(fix_prompt, label="mv-yaml-fix")
-            yaml_text2 = _strip_yaml_fences(str(result2.get("yaml", "")))
-            missing2 = _validate_yaml_columns(yaml_text2, schemas)
-            if yaml_text2 and len(missing2) < len(missing):
-                yaml_text = yaml_text2
-                source_table = str(result2.get("source_table", source_table)).strip() or source_table
-                suggested_name = str(result2.get("suggested_name", suggested_name)).strip() or suggested_name
-                if missing2:
+            r2 = _call_llm(fix_prompt, label=label)
+            return (
+                _strip_yaml_fences(str(r2.get("yaml", ""))),
+                str(r2.get("source_table", "")).strip(),
+                str(r2.get("suggested_name", "")).strip(),
+            )
+        except Exception as e:
+            print(f"[draft-mv-yaml] {label} failed: {e}", flush=True)
+            return None
+
+    # Pass 1: deterministic checks (column existence + structural lint).
+    issues, lint_warn = _mv_issue_list(yaml_text, schemas)
+    if issues:
+        print(f"[draft-mv-yaml] structural/column issues: {issues}", flush=True)
+        fixed = _fix_once(yaml_text, issues, "mv-yaml-fix")
+        if fixed and fixed[0]:
+            new_issues, new_warn = _mv_issue_list(fixed[0], schemas)
+            if len(new_issues) < len(issues):
+                yaml_text = fixed[0]
+                source_table = fixed[1] or source_table
+                suggested_name = fixed[2] or suggested_name
+                issues, lint_warn = new_issues, new_warn
+        if issues:
+            warnings.append(
+                "Structural issues remain — review before creating: " + "; ".join(issues)
+            )
+    warnings.extend(lint_warn)
+
+    # Pass 2: LIVE validation — actually create the metric view (scratch name)
+    # and drop it, so we KNOW it writes. Uses the source table's catalog.schema
+    # as the scratch location; skips gracefully if the user lacks CREATE there.
+    src_for_scratch = source_table or ((schemas and next(iter(schemas))) or "")
+    parts = src_for_scratch.split(".") if src_for_scratch else []
+    if not issues and len(parts) == 3 and warehouse_id:
+        dry = _dryrun_create_mv(user_w, yaml_text, warehouse_id, parts[0], parts[1])
+        if dry.get("skipped"):
+            print(f"[draft-mv-yaml] dry-run skipped: {dry['skipped']}", flush=True)
+        elif not dry.get("ok"):
+            spark_err = dry.get("error") or "unknown error"
+            print(f"[draft-mv-yaml] dry-run create FAILED: {spark_err}", flush=True)
+            fixed = _fix_once(
+                yaml_text,
+                [f"When Databricks tried to create this metric view it failed with: {spark_err}"],
+                "mv-yaml-dryrun-fix",
+            )
+            if fixed and fixed[0]:
+                # Only accept the retry if it ALSO passes deterministic checks.
+                retry_issues, _ = _mv_issue_list(fixed[0], schemas)
+                if not retry_issues:
+                    dry2 = _dryrun_create_mv(user_w, fixed[0], warehouse_id, parts[0], parts[1])
+                    if dry2.get("ok"):
+                        yaml_text = fixed[0]
+                        source_table = fixed[1] or source_table
+                        suggested_name = fixed[2] or suggested_name
+                    else:
+                        warnings.append(
+                            f"The metric view still fails to create: {dry2.get('error') or spark_err}. "
+                            f"Review/edit the YAML before creating."
+                        )
+                else:
                     warnings.append(
-                        f"Retry still has {len(missing2)} unresolved column(s): {', '.join(missing2)}. "
-                        f"Review the YAML before creating."
+                        f"The metric view failed a live create check ({spark_err}) and the auto-fix "
+                        f"still has issues. Review the YAML before creating."
                     )
             else:
                 warnings.append(
-                    f"Columns referenced in YAML that don't exist in the source table: "
-                    f"{', '.join(missing)}. Fix these before creating the metric view."
+                    f"The metric view failed a live create check: {spark_err}. "
+                    f"Review/edit the YAML before creating."
                 )
-        except Exception as e:
-            print(f"[draft-mv-yaml] retry failed: {e}", flush=True)
-            warnings.append(
-                f"Columns referenced in YAML that don't exist in the source table: "
-                f"{', '.join(missing)}. Fix these before creating the metric view."
-            )
 
     return {
         "yaml": yaml_text,
@@ -4875,24 +5148,35 @@ def create_metric_view(eid):
             "owner": owner,
         }), 409
 
-    # Re-run the column validator against the YAML the user is about to push.
-    # The draft step already validates + retries, but the user may have hand-
-    # edited the YAML since. Block the push if we can still prove a column is
-    # hallucinated — much better UX than letting Spark error at CREATE time.
+    # Re-validate the YAML the user is about to push. The draft step already
+    # validates + retries, but the user may have hand-edited the YAML since.
+    # Block the push if we can prove it's broken — much better UX than letting
+    # Spark error at CREATE time. Two layers: (1) deterministic column + lint
+    # checks, (2) a live scratch create+drop in the TARGET schema, which is the
+    # definitive "will this write to UC" test.
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if rows:
         eng_for_schema = parse_row(rows[0])
         schemas = _collect_engagement_schemas(eng_for_schema, user_w, warehouse_id)
-        missing = _validate_yaml_columns(yaml_body, schemas)
-        if missing:
+        issues, _warn = _mv_issue_list(yaml_body, schemas)
+        if issues:
             return jsonify({
                 "error": (
-                    f"YAML references column(s) that don't exist in the source "
-                    f"table(s): {', '.join(missing)}. Fix the YAML or re-draft, "
-                    f"then try again."
+                    "The metric view YAML has problems that would fail at create: "
+                    + "; ".join(issues) + ". Fix the YAML or re-draft, then try again."
                 ),
-                "missing_columns": missing,
+                "issues": issues,
             }), 400
+
+    # Live dry-run in the real target schema. If it can't create here, surface
+    # the exact Spark error instead of a half-applied write. (Skips only on a
+    # CREATE-permission denial, which the real create below will surface anyway.)
+    dry = _dryrun_create_mv(user_w, yaml_body, warehouse_id, catalog_name, schema_name)
+    if not dry.get("ok"):
+        return jsonify({
+            "error": f"The metric view failed to create: {dry.get('error')}. Fix the YAML and retry.",
+            "dryrun_error": dry.get("error"),
+        }), 400
 
     # YAML may contain $$ — escape using a unique delimiter if collision
     delim = "$$"

@@ -47,6 +47,16 @@ Baseline at start: main @ f6fd85e, clean tree. Last kk_test bundle index-gPkGblZ
    are chosen at top of S3, filter the catalog/schema/table pickers below to
    only those sources so users don't hunt. Additive UX.
 
+## DECISIONS (2026-06-10)
+- #6 validation = **scratch create + drop** (create throwaway MV in target schema
+  via OBO, capture success/exact Spark error, DROP it). Plus deterministic
+  structural lint at draft. Auto-fix retry feeds errors back to LLM.
+- Sequencing = **all nine in order**, committing each item on branch
+  feature/intermountain-2026-06-10. Power is flickering -> commit frequently.
+
+## Progress log (append as we go)
+- [x] Scratchpad + branch created (commit on feature/intermountain-2026-06-10)
+
 ## Notes / constraints
 - Deploy via individual `databricks workspace import` (RAW). NEVER import-dir.
 - Keep schema changes additive (new cols). Preserve optimistic-lock contract.
