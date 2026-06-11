@@ -22,6 +22,7 @@ The app is a 7-session workbook. Each session is a form backed by a Delta table 
 ### Session 2 — Questions & Vocabulary (Analyst + BO)
 - Build the question bank (what does the BO actually want to ask?).
 - Define vocabulary terms and their data meaning (synonyms, definitions).
+- Optional **Type** column (Metric / Synonym / Filter / Date Logic) — set it here if you already know how a term should be classified; it seeds the Session 3 classification for that term (you can still refine it in S3, where a term can have multiple types).
 
 ### Pre-work Excel upload (optional shortcut for S1 + S2)
 
@@ -50,18 +51,21 @@ S3 is data-sources-first: pick the tables and metric views the space will use *b
     - *"A value in a column"* — pushes to `column_configs.description` and enables Entity Matching on the column (Genie's column_configs schema has no value-aliases field; description + entity-matching toggle is the supported mechanism).
     - *"A general space term"* — auto-populates the Text Instructions section; lands in the space's General Instructions at push.
 - **Synonym Routing Summary** — a read-only panel that previews exactly what will be pushed where. Marks any incomplete routing (no column picked, FQN missing the column segment, table not in the Data Plan, value-kind missing a column value, no synonyms in S2 vocab) with a per-row `Won't push: <reason>` chip, excludes them from the "N column / N value / N general" counts, and shows an "X of Y will push at Session 5" banner with an alert listing the gaps to fix. No more silent drops at push time.
-- **SQL Expressions** — reusable filter / dimension / measure snippets tied to UC tables. Pick a table via the inline cascade; the synonyms column auto-fills from the matching S2 vocabulary row when the term was classified as Metric.
+- **SQL Expressions** — reusable filter / dimension / measure snippets tied to UC tables. Pick a table via the inline cascade (the picker is **scoped to the Data Sources you chose above** so you don't hunt the whole catalog tree — a "Browse all catalogs…" escape hatch is there if you need a table outside the plan). The synonyms column auto-fills from the matching S2 vocabulary row when the term was classified as Metric. A bare **WHERE-clause predicate** (e.g. `claim_type = 'Facility'`) is accepted, not just aggregates — the generator folds it into the metric view `filter:` or wraps it as `COUNT(1) FILTER (WHERE …)` instead of misclassifying it.
+- **Example Queries** — when the analyst already knows the SQL for an important question, they define it directly here (instead of forcing it into a metric/synonym). These are surfaced to Genie **verbatim** as example queries at plan time.
+- **Clarifying Questions** — disambiguation prompts for ambiguous terms (e.g. "service line" → ask "clinical or financial?"). These become clarification-trigger bullets in the space's general instructions at plan time.
 - **Text Instructions** — analyst guidance that can't be expressed as SQL. Rows are auto-seeded by Classify Terms.
 - **Data Gaps** — concepts the BO asked about that have no data home yet.
 - **Scope Boundaries** — explicit "we are / are not covering X."
-- **Global Filter** — a space-wide WHERE clause (e.g., `voided_flag = 'N'`) that flows through to the metric view YAML and plan.
+- **Global Filter** — a space-wide WHERE clause (e.g., `voided_flag = 'N'`). It flows to the metric view `filter:` (hard) **and**, at plan time, into a mandatory general-instructions bullet + every example query so Genie applies it to raw-table queries too (instruction-level, best-effort). For *guaranteed* enforcement on every query the panel also generates a ready-to-review **UC row-filter DDL** (`CREATE FUNCTION` + `ALTER TABLE … SET ROW FILTER`) for the in-scope tables — the only mechanism Databricks enforces on every Genie query.
 - **Optional Metric View builder** —
-  - Click "Draft YAML" and the app produces a Databricks-spec metric view YAML grounded in the actual UC column schemas of the source tables (DESCRIBE-driven, no hallucinated columns).
+  - Click "Draft YAML" and the app produces a Databricks-spec metric view YAML grounded in the actual UC column schemas of the source tables (DESCRIBE-driven, no hallucinated columns), plus **sampled distinct values for low-cardinality columns** so the model maps a value like "Medicare" to the column that actually holds it.
   - The YAML honors the global filter, detected PK/FK joins, and the analyst's Session 3 SQL expressions.
-  - "Create Metric View" deploys it to UC under your OBO token (respects your grants, not the app SP's). If the FQN already exists the app returns ownership info rather than overwriting blindly. Created MVs auto-appear in the Existing Metric Views section above so the analyst can immediately check them.
+  - **Validated three ways before you ever hit Create**, so it doesn't hand you YAML that errors on upload: (1) a deterministic structural lint (measure-without-aggregate, dimension-with-aggregate, name collisions, bad keys, predicate-shaped exprs); (2) a per-expression **`LIMIT 0` SELECT compile-check** against the source (needs only SELECT, so it never skips); (3) a live **scratch create-and-drop** when CREATE rights allow. Problems feed an auto-fix retry loop.
+  - "Create Metric View" deploys it to UC under your OBO token (respects your grants, not the app SP's), and **gates the write** behind a real create-into-the-target dry-run — a bad column is blocked with a precise Spark error instead of a half-written view. If the FQN already exists the app returns ownership info rather than overwriting blindly. Created MVs auto-appear in the Existing Metric Views section above.
   - **Redraft safety.** When YAML already exists, "Redraft YAML with AI" first asks for confirmation, then snapshots the current YAML before overwriting. A "Restore previous version" button opens a **side-by-side compare** (current vs. previous) so the analyst can see exactly what they'd revert to before committing — or keep the current version. The backup rides the normal save cycle, so it survives reloads.
 
-### Session 4 — COE Review + Benchmarks (COE group)
+### Session 4 — Design Review & Approval + Benchmarks (COE group)
 - **Readiness Brief** — async LLM call (via the background-job runner, see *Cross-cutting design choices*) that synthesizes Sessions 1–3 + Data Plan into a citation-backed brief with coverage analysis and a gaps section. Auto-fires on first visit if S1–S3 has any content; gated on having at least one S1 response, S2 question, or S3 SQL expression so a brand-new empty engagement doesn't trigger an LLM call.
 - **Analyst commentary** — per-gap responses preserved across regenerations via fuzzy-match.
 - **Data Plan (read-only)** — the consolidated list of tables and metric views the space will use. **Edits happen in Session 3's Data Sources panel**, not here. S4 shows the plan with a banner pointing back to S3 so analysts don't try to add/remove things in the wrong place. A row per table/view with include=Yes/No and notes; notes flow into column descriptions or `column_configs` at push.
@@ -72,6 +76,8 @@ S3 is data-sources-first: pick the tables and metric views the space will use *b
   - **Draft All Expected SQL** — generates SQL for each question, schema-grounded from live UC DESCRIBE so column names can't be hallucinated. Includes an explicit Databricks SQL dialect-notes block (integer DATE_ADD, ADD_MONTHS, DATEDIFF(end, start), DOUBLE division) so the LLM doesn't emit Postgres syntax.
   - **Two-step SQL → summary flow** — the Measurement Summary is generated *from* the SQL in a second call, so the explanation always matches what the SQL actually does. A refresh button re-derives the summary from the current SQL.
   - **Run SQL inline** — per-row ▶ button and a Run All button execute each benchmark's SQL under the user's OBO token on a warehouse they pick. The runner polls for cold-warehouse startup (50s wait + 1.5s polling, 2-min outer deadline with auto-cancel). Results render in a small table right under the row; the sample result persists even when "Show Expected SQL" is toggled off.
+  - **Empty-result guard.** A benchmark query that runs cleanly but returns **0 rows** is a strong signal the SQL is semantically wrong (e.g. a filter on the wrong column). Instead of a green "Validated" check, the row shows an amber **"Ran · 0 rows — check"** chip telling the analyst to verify columns/filters before approving.
+  - **Export to Excel.** Benchmarks are an export-only sheet in the engagement's Export modal (question, expected SQL, sample result, the plain-English measurement summary, category/difficulty/BO-approved).
   - SQL is always wrapped in `SELECT * FROM (...) __bm LIMIT N` so an inner `LIMIT` or `ORDER BY` doesn't break the run.
   - **BO approval checkbox** per benchmark — marks the row as validated and unlocks its use as a style exemplar in Session 5 (see below). **Intentionally not gatekept** — any authenticated user (analyst, COE, or BO) can toggle it. The click is optimistic (UI flips immediately) and persists via a dedicated PATCH endpoint that lives outside the engagement's optimistic-lock so the click can't 409 the analyst's autosave.
 - **Analyst "Mark Ready for COE Review"** — when an analyst has finished Sessions 1–3, a button at the top of Session 4 flips the engagement to a `ready_for_review` state (signalling the COE it's their turn). It's available to analysts (not BO-only users) on a `pending` or `changes_requested` engagement, and after a changes-requested round it doubles as "re-submit". This only sets the review state — it can never set `approved`/`changes_requested` (those stay COE-only). Lock-free write via `PUT /request-review`, so it can't race the analyst's Session 4 autosave. Optionally fires a **Microsoft Teams** notification (see *Cross-cutting design choices*).
@@ -85,7 +91,7 @@ This is where discovery becomes a real Genie Space configuration.
 1. **Grounds the LLM in real UC schemas.** Before calling the model, it runs `DESCRIBE TABLE` under your OBO token on every in-scope raw table from Session 4 and injects the actual column lists into the prompt with a strict "do not invent columns" rule.
 2. **Reads the live Metric View definition from UC.** For every MV in the data plan it runs `SHOW CREATE TABLE` under your OBO token. The LLM sees the real, current measures / dimensions / calcs / filters and is told **not to duplicate** any of them in `sql_measures` / `sql_dimensions` / `sql_filters`. Falls back to Session 3's stored YAML only if the UC fetch fails.
 3. **Uses BO-approved benchmark SQL as style exemplars.** Any Session 4 benchmark with `bo_approved=true` flows into a gold-standard queries block. The LLM is told to mirror the style and structure (column qualification, date-arithmetic, grouping patterns) but *not* to copy the queries verbatim — benchmarks remain acceptance tests.
-4. **Keeps benchmark questions out of the plan.** Sample questions and example queries that overlap with benchmarks (token-Jaccard ≥ 0.8) are stripped post-hoc; the count of strips is surfaced as a warning so the analyst sees what happened.
+4. **Keeps benchmark answers out of the plan.** *Example queries* that overlap a benchmark (token-Jaccard ≥ 0.8) are stripped post-hoc, because an example query carries the answer SQL and would leak the acceptance test. **Sample questions are NOT stripped** — they're display-only prompts (no answer), and stripping them used to empty the space's suggested-questions list whenever benchmarks were drawn from the question bank. (Both the plan-generation and the push paths apply this consistently.)
 5. **Produces the plan** per Databricks best practices:
    - `general_instructions` — one consolidated bullet list, 15 bullets max. Scope, jargon→data mappings, formatting rules, clarification triggers. No metric restatements, no table semantics (those live in UC).
    - `sample_questions` — 5–8 reworded questions from the bank.
@@ -123,6 +129,9 @@ The final checkpoint before a space is treated as live. Three sections:
   - COE wins over BO if a user is in both groups.
 - **Async job runner for long LLM calls.** Databricks Apps' gateway has a ~60s timeout on synchronous HTTP, but the readiness brief, generate-plan, draft-MV-YAML, and draft-benchmark-SQL flows can each take 60–180s wall-clock. Every long LLM call is dispatched as a background job (`POST /api/jobs/start` with `task_type=...`); the frontend polls `/api/jobs/<job_id>` every 2s until the job reaches `done` or `failed`. State is persisted in a Delta table (`discovery_jobs`) with token-usage tracking in `discovery_llm_usage`.
 - **Per-task LLM tunables.** Each task type has its own `max_tokens` (matched to expected output size) and model selection — precision-critical tasks (plan generation, MV YAML) use the strongest model; quick refinements (summary regeneration) use a faster, cheaper model. Prompt-length capped per task to avoid overruns. Failed LLM calls retry once with exponential backoff before surfacing the error.
+- **Robust JSON parsing (don't let a good answer get thrown away).** `_call_llm` tolerates prose wrapped around the JSON and extracts the first balanced object/array. If a response is **truncated at `max_tokens`** (the model's `finish_reason == "length"`, which yields invalid JSON), it automatically **retries once with a doubled token budget** instead of failing the whole feature. Token budgets were right-sized so the common case fits in one call (e.g. benchmark drafting, plan generation).
+- **Value-grounded prompting.** Beyond column *names + types*, the benchmark-SQL, plan, and MV-YAML prompts also get **sampled distinct values for low-cardinality string columns** (one SELECT per table, best-effort, OBO/SELECT-only). This stops the model from guessing which column holds a category value (e.g. writing `plan_type IN ('Medicare','Commercial')` when those live in `line_of_business`).
+- **Push-to-Genie preflight.** Before building the serialized space, the push verifies every in-scope data-plan table still resolves under the user's grants. A dropped/renamed table returns a clear, actionable 400 ("these tables no longer exist — remove them from the data plan") instead of a confusing raw Genie `PERMISSION_DENIED` error.
 - **Optimistic-lock with auto-retry on saves.** Every engagement *session* mutation carries an `If-Match: <updated_at>` header. On 409 (stale token), the frontend silently fetches fresh `updated_at`, retries once. Only on a second 409 does it fall back to a "reloading…" toast.
 - **Lock-free side-writes for lightweight side fields.** A few small, independent fields are written through dedicated endpoints that live **outside** the optimistic lock and don't bump `updated_at`, so they can never race or revert the analyst's session autosave: the **BO-Approved** checkbox, the **"Mark Ready for COE Review"** flip (`/request-review`), the **production sign-off** (`/prod-approve`), and the **Section 5 acknowledgments** (`/acknowledge`). The sign-off and acknowledge endpoints server-stamp the acting user + timestamp for accountability. (The ServiceNow URL used to be a lock-free side-write too, but it now lives in the Edit Engagement Info dialog and is saved with the rest of the metadata via `update_engagement`, which is under the optimistic lock — an explicit dialog save, so no autosave race.)
 - **Unified status chip.** The status chip shown on the engagement page header and on every home-page card follows the COE review flow rather than the raw lifecycle, with active review states taking precedence so a stale `complete` can never mask them. In order: `Draft` (grey) → `In Progress` (amber) → `Ready for COE Review` (blue) → `Changes Requested` (red) → **`COE Approved`** (navy, Section 4 approval) → **`Production Approved`** (green, Section 7 sign-off, `status = complete`). Note that Section 4 approval reads as "COE Approved", **not** done — only the Section 7 sign-off turns the chip green. The chip is computed identically in `Engagement.tsx` (`topStatusChip`) and `Home.tsx` (`engagementStatusChip`); the list endpoint returns `coe_approval_status` so the home cards can apply it.
@@ -223,11 +232,21 @@ genie-discovery-app/
         UCColumnPicker.tsx
         DataSourcesPanel.tsx     # S3 top-of-page: tables/MVs picker, broad-scan MV discovery, notes
         PreworkUploadModal.tsx   # BO Excel upload → parse preview → atomic apply to S1+S2
+        PreworkExportModal.tsx   # Export S1/S2 (+ S4 Benchmarks) to a .xlsx
         ConfirmDialog.tsx        # Reusable confirm modal (guards destructive regenerate/overwrite)
         CompareRestoreDialog.tsx # Side-by-side current-vs-previous compare before a restore
         SectionToc.tsx           # Floating section nav (sessions rail + in-this-session sub-rail)
   static/                        # Vite build output (gitignored)
+  scripts/                       # Live verification harness (run before any redeploy)
+    ai_smoke.py                  # Exercise every AI feature end-to-end; --create-catalog/--create-schema also creates the MV in UC
+    mv_create_test.py            # Draft MV YAML and actually create it in UC
+    mv_quality_check.py          # Query the created MV's measures and compare to ground truth
+    sql_quality_check.py         # Run every plan example query + benchmark SQL against real data
+    push_genie_test.py           # Push the plan to a real Genie Space, inspect, then delete
+    seed_complex.py              # Seed a complex multi-table engagement for stress-testing
 ```
+
+> **Verification harness.** `scripts/` exercises the real end-to-end paths (LLM call → create the view → push the space), not proxies like "app started." Run `python scripts/ai_smoke.py --profile <p> --app <url> --eid <id> --warehouse <id> --create-catalog <cat> --create-schema <sch>` against the deployment a session will use; green means the AI generates *and* uploads correctly.
 
 ---
 
@@ -429,9 +448,20 @@ Functional today:
 - Session 5 acknowledgments gate (reviewed AI / won't share early / follow best practices) — server-stamped "I accept" unlocks Prototype Review + Production Review
 - Regenerate safety on the metric view YAML (S3) and the plan (S5): confirm-before-overwrite, prior version backed up, side-by-side compare before restore
 - Session 7 Production Review: readiness checklist, space access review (with the documented access-management-scope limitation), and COE production sign-off. Engagement completion (`status = complete`) is owned solely by this sign-off
-- Generate Plan (Session 5): schema-grounded, MV-aware, benchmark-style-aware, strips benchmark overlaps, surfaces warnings
+- Generate Plan (Session 5): schema-grounded, MV-aware, benchmark-style-aware; strips only *example queries* that overlap benchmarks (sample questions are kept); surfaces warnings
 - Joins: UC PK/FK auto-seeded + analyst-editable manual joins, regenerate preserves manual rows
-- Push to Genie Space: create-new and update-existing via REST API, OBO-authed, full instruction surface serialized (instructions + sample questions + SQL snippets + example queries + joins + `column_configs`); benchmarks land in the Benchmarks tab. Push honors If-Match optimistic lock — refuses to push stale data.
+- Push to Genie Space: create-new and update-existing via REST API, OBO-authed, full instruction surface serialized (instructions + sample questions + SQL snippets + example queries + joins + `column_configs`); benchmarks land in the Benchmarks tab. Push honors If-Match optimistic lock and runs a data-plan existence preflight that returns a clear error for dropped/renamed tables.
+
+Reliability hardening (2026-06):
+
+- **Metric View YAML is validated three ways before create** (structural lint → per-expression `LIMIT 0` SELECT compile-check that never skips → live scratch create-and-drop), and the Create call gates on a real create-into-target dry-run — so it doesn't generate YAML that errors on upload. Verified live, including a complex multi-table/join engagement, with measures computing correct values vs ground truth.
+- **Robust LLM JSON handling**: tolerant of prose-wrapped JSON, detects truncation and auto-retries with a doubled token budget, right-sized per-task token budgets.
+- **Value-grounded prompts**: sampled distinct values for low-cardinality columns so generated SQL targets the right column.
+- **Benchmark empty-result guard**: a query that runs but returns 0 rows is flagged ("Ran · 0 rows — check") instead of shown as validated.
+- S2 optional Type column (seeds S3 classification); S3 Example Queries + Clarifying Questions; S3 SQL picker scoped to chosen Data Sources; WHERE-clause predicates accepted as metrics.
+- Global Filter applies space-wide (instruction + example queries) with generated UC row-filter DDL for hard enforcement.
+- Benchmarks export to Excel; Section 4 titled "Design Review & Approval".
+- `scripts/` verification harness exercises every AI feature (and the real MV-create + Genie push) end-to-end.
 
 Pending:
 
