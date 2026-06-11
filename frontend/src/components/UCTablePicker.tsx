@@ -5,6 +5,12 @@ interface Props {
   value: string;
   onChange: (value: string) => void;
   readOnly?: boolean;
+  /** When provided and non-empty, the picker shows a single dropdown limited to
+   *  these fully-qualified table names (e.g. the engagement's chosen Data
+   *  Sources) instead of the catalog -> schema -> table cascade, so the analyst
+   *  doesn't have to hunt. A "Browse all…" escape hatch falls back to the full
+   *  cascade for the rare case a table outside the data sources is needed. */
+  restrictTo?: string[];
 }
 
 const cache: Record<string, any[]> = {};
@@ -23,19 +29,24 @@ async function fetchCached(url: string): Promise<any[]> {
   return data;
 }
 
-export default function UCTablePicker({ value, onChange, readOnly }: Props) {
+export default function UCTablePicker({ value, onChange, readOnly, restrictTo }: Props) {
   const [catalogs, setCatalogs] = useState<string[]>([]);
   const [schemas, setSchemas] = useState<string[]>([]);
   const [tables, setTables] = useState<string[]>([]);
+  // When restrictTo is active, let the user opt into the full cascade per-cell.
+  const [browseAll, setBrowseAll] = useState(false);
 
   const parts = value ? value.split(".") : [];
   const selCatalog = parts[0] || "";
   const selSchema = parts[1] || "";
   const selTable = parts[2] || "";
 
+  const restricted = !!(restrictTo && restrictTo.length > 0) && !browseAll;
+
   useEffect(() => {
+    if (restricted) return;
     fetchCached("/api/uc/catalogs").then(setCatalogs);
-  }, []);
+  }, [restricted]);
 
   useEffect(() => {
     if (selCatalog) {
@@ -65,6 +76,35 @@ export default function UCTablePicker({ value, onChange, readOnly }: Props) {
 
   if (readOnly) {
     return <Typography variant="body2" sx={{ fontSize: 14 }}>{value || ""}</Typography>;
+  }
+
+  // Restricted mode: a single dropdown of the chosen Data Sources. Includes the
+  // current value even if it's no longer among them, plus a "Browse all…" escape
+  // hatch to the full cascade.
+  if (restricted) {
+    const opts = Array.from(new Set([...(restrictTo || []), ...(value ? [value] : [])]));
+    return (
+      <FormControl size="small" sx={{ minWidth: 260 }}>
+        <InputLabel>Table</InputLabel>
+        <Select
+          value={value || ""}
+          label="Table"
+          onChange={(e) => {
+            const v = e.target.value as string;
+            if (v === "__browse_all__") { setBrowseAll(true); return; }
+            onChange(v);
+          }}
+        >
+          <MenuItem value="">--</MenuItem>
+          {opts.map((t) => (
+            <MenuItem key={t} value={t}>{t}</MenuItem>
+          ))}
+          <MenuItem value="__browse_all__" sx={{ fontStyle: "italic" }}>
+            Browse all catalogs…
+          </MenuItem>
+        </Select>
+      </FormControl>
+    );
   }
 
   return (

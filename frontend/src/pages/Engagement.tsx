@@ -32,7 +32,7 @@ const SESSION_LABELS = [
   "1: Business Context",
   "2: Questions & Vocabulary",
   "3: Technical Design",
-  "4: COE Review",
+  "4: Design Review & Approval",
   "5: Configure Space",
   "6: Prototype Review",
   "7: Production Review",
@@ -490,6 +490,7 @@ export default function Engagement({ readOnly = false }: Props) {
             question_bank: (sessionDrafts[2]?.question_bank as Record<string, string>[]) || [],
             vocabulary_metrics: (sessionDrafts[2]?.vocabulary_metrics as Record<string, string>[]) || [],
           }}
+          benchmarks={(sessionDrafts[4]?.benchmark_questions as any[]) || []}
           onClose={() => setPreworkExportOpen(false)}
         />
       )}

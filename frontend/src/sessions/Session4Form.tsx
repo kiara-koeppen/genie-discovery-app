@@ -366,7 +366,16 @@ export default function Session4Form({
         error: res.error || "",
       };
       const next = [...benchmarks];
-      next[idx] = { ...next[idx], sample_result: sample } as any;
+      // 0 rows on a clean run is a likely wrong-column/filter bug — flag it.
+      const emptyOk = !res.error && (res.row_count || 0) === 0;
+      next[idx] = {
+        ...next[idx],
+        sample_result: sample,
+        validation_status: res.error ? "failed" : (emptyOk ? "empty" : "ok"),
+        validation_warning: emptyOk
+          ? "Ran but returned 0 rows — verify columns/filters before approving."
+          : "",
+      } as any;
       onChange("benchmark_questions", next);
     } catch (err: any) {
       const sample = {
@@ -379,7 +388,7 @@ export default function Session4Form({
         error: String(err?.message || err),
       };
       const next = [...benchmarks];
-      next[idx] = { ...next[idx], sample_result: sample } as any;
+      next[idx] = { ...next[idx], sample_result: sample, validation_status: "failed" } as any;
       onChange("benchmark_questions", next);
     }
     setRunningSqlIdx(null);
@@ -468,7 +477,16 @@ export default function Session4Form({
         ran_at: new Date().toISOString(),
         error: "",
       };
-      patch.validation_status = validation.retried ? "retried_ok" : "ok";
+      // A query that ran but returned 0 rows is a likely wrong-column/filter bug
+      // (the backend flags it). Surface it as a warning, not a clean pass.
+      if ((validation as any).empty || (validation.sample_result.row_count ?? 0) === 0) {
+        patch.validation_status = "empty";
+        patch.validation_warning = (validation as any).warning
+          || "Ran but returned 0 rows — verify columns/filters before approving.";
+      } else {
+        patch.validation_status = validation.retried ? "retried_ok" : "ok";
+        patch.validation_warning = "";
+      }
     } else if (validation.error) {
       patch.sample_result = {
         ran_at: new Date().toISOString(),
@@ -1138,6 +1156,11 @@ export default function Session4Form({
                         {(b as any).validation_status === "failed" && (
                           <Tooltip title="SQL failed validation against the warehouse, even after one auto-retry. Edit and re-run manually.">
                             <Chip label="Validation failed" size="small" color="error" variant="outlined" sx={{ height: 20 }} />
+                          </Tooltip>
+                        )}
+                        {(b as any).validation_status === "empty" && (
+                          <Tooltip title={(b as any).validation_warning || "Ran but returned 0 rows — likely a wrong column or filter. Verify before approving."}>
+                            <Chip label="Ran · 0 rows — check" size="small" color="warning" variant="outlined" sx={{ height: 20 }} />
                           </Tooltip>
                         )}
                         {(b as any).validation_status === "skipped" && (

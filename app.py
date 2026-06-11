@@ -63,6 +63,7 @@ SESSION_COLS = {
     1: ["business_context", "pain_points", "existing_reports"],
     2: ["question_bank", "vocabulary_metrics"],
     3: ["term_classifications", "sql_expressions", "text_instructions",
+        "clarifying_questions", "example_queries",
         "data_gaps", "scope_boundaries", "global_filter",
         "metric_view_yaml", "metric_view_yaml_previous", "metric_view_fqn"],
     4: ["analyst_commentary", "auto_summary", "data_plan", "benchmark_questions",
@@ -1703,7 +1704,51 @@ def _build_prework_template():
     return buf
 
 
-def _build_prework_export(selected_keys, data):
+# Export-only benchmark sheet. Benchmarks live in Session 4 and are NOT part of
+# the re-uploadable pre-work round-trip (they reference run results, bools, and
+# nested objects), so this sheet is deliberately kept out of _PREWORK_SHEETS.
+_BENCHMARK_EXPORT = {
+    "name": "S4 Benchmarks",
+    "headers": [
+        "Question", "Category", "Difficulty", "Expected SQL",
+        "Sample Result", "Measurement Summary (plain English)", "BO Approved",
+    ],
+    "row_keys": [
+        "question", "category", "difficulty", "expected_sql",
+        "sample_result", "notes", "bo_approved",
+    ],
+}
+
+
+def _format_sample_result(sr):
+    """Render a benchmark's sample_result object as readable plain text for a
+    spreadsheet cell. Returns '' when there's nothing to show."""
+    if not isinstance(sr, dict):
+        return ""
+    if sr.get("error"):
+        return f"ERROR: {sr['error']}"
+    cols = sr.get("columns") or []
+    rows = sr.get("rows") or []
+    if not cols and not rows:
+        return ""
+    lines = []
+    ran_at = sr.get("ran_at")
+    if ran_at:
+        lines.append(f"(ran {ran_at})")
+    if cols:
+        lines.append(" | ".join(str(c) for c in cols))
+    for r in rows[:25]:
+        if isinstance(r, (list, tuple)):
+            lines.append(" | ".join("" if v is None else str(v) for v in r))
+        else:
+            lines.append(str(r))
+    rc = sr.get("row_count")
+    if isinstance(rc, int) and (rc > 25 or sr.get("truncated")):
+        lines.append(f"... ({rc} rows total{', truncated' if sr.get('truncated') else ''})")
+    return "\n".join(lines)
+
+
+def _build_prework_export(selected_keys, data, benchmarks=None):
     """Build a pre-work .xlsx populated with the engagement's current S1/S2 data.
 
     Mirrors the blank template's sheet names, headers, and `_meta` version so an
@@ -1780,6 +1825,35 @@ def _build_prework_export(selected_keys, data):
             )
             ws.add_data_validation(dv)
             dv.add("C3:C200")
+
+    # Export-only Benchmarks sheet (S4). Not part of the re-upload round-trip;
+    # the parser ignores unknown sheets, so this is safe to include.
+    if benchmarks:
+        ws = wb.create_sheet(_BENCHMARK_EXPORT["name"])
+        ws.cell(
+            row=1, column=1,
+            value=("Benchmarks captured in Session 4. Export only — this sheet is not "
+                   "read back on upload."),
+        ).font = instruction_font
+        ws.merge_cells(start_row=1, start_column=1, end_row=1,
+                       end_column=len(_BENCHMARK_EXPORT["headers"]))
+        ws.row_dimensions[1].height = 30
+        ws.cell(row=1, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+        for col_idx, header in enumerate(_BENCHMARK_EXPORT["headers"], start=1):
+            cell = ws.cell(row=2, column=col_idx, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            # Wider columns for SQL and sample result
+            width = 60 if header in ("Expected SQL", "Sample Result") else 36
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+        for r_offset, b in enumerate(benchmarks):
+            r_idx = 3 + r_offset
+            for col_idx, rk in enumerate(_BENCHMARK_EXPORT["row_keys"], start=1):
+                val = b.get(rk, "")
+                cell = ws.cell(row=r_idx, column=col_idx, value=val)
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[r_idx].height = 60
 
     # Hidden metadata sheet — same version key the parser reads, so the export
     # re-uploads cleanly. `kind=export` distinguishes it from a blank template.
@@ -2093,7 +2167,8 @@ def export_prework(eid):
 
     valid_keys = {s["key"] for s in _PREWORK_SHEETS}
     sections_set = {s for s in sections if s in valid_keys}
-    if not sections_set:
+    want_benchmarks = "benchmarks" in sections
+    if not sections_set and not want_benchmarks:
         return jsonify({"error": "No valid sections selected to export."}), 400
 
     # Same defensive normalization as apply-prework: keep only recognized row
@@ -2114,8 +2189,34 @@ def export_prework(eid):
             if any(clean.values()):
                 normalized[k].append(clean)
 
+    # Benchmarks (S4) are export-only and have their own shape: flatten the
+    # nested sample_result to text, coerce bo_approved to Yes/No, keep the rest
+    # as trimmed strings. Drop rows with no question AND no SQL.
+    benchmark_rows = None
+    if want_benchmarks:
+        raw_bms = data.get("benchmarks") or []
+        if not isinstance(raw_bms, list):
+            return jsonify({"error": "data.benchmarks must be a list."}), 400
+        benchmark_rows = []
+        for b in raw_bms:
+            if not isinstance(b, dict):
+                continue
+            question = str(b.get("question") or "").strip()
+            sql = str(b.get("expected_sql") or "").strip()
+            if not question and not sql:
+                continue
+            benchmark_rows.append({
+                "question": question,
+                "category": str(b.get("category") or "").strip(),
+                "difficulty": str(b.get("difficulty") or "").strip(),
+                "expected_sql": sql,
+                "sample_result": _format_sample_result(b.get("sample_result")),
+                "notes": str(b.get("notes") or "").strip(),
+                "bo_approved": "Yes" if b.get("bo_approved") else "No",
+            })
+
     try:
-        buf = _build_prework_export(sections_set, normalized)
+        buf = _build_prework_export(sections_set, normalized, benchmarks=benchmark_rows)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": f"Failed to build export: {e}"}), 500
@@ -2855,7 +2956,7 @@ def _strip_benchmark_overlap(questions, benchmarks):
     return [q for q in questions if not _question_overlaps(q, benchmarks)]
 
 
-def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
+def _build_plan_prompt(eng, schemas=None, mv_definitions=None, value_hints=""):
     """Build the LLM prompt from sessions 1-4 discovery data.
 
     `schemas`: optional {fqn: [(col, type), ...]} dict with real UC column
@@ -2898,6 +2999,16 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
     lines.append("")
 
     lines.append("## Session 3: Technical Design")
+    gf = (s3.get("global_filter") or "").strip()
+    if gf:
+        lines.append("### GLOBAL FILTER — applies to the WHOLE space (not just the metric view)")
+        lines.append(f"```\n{gf}\n```")
+        lines.append(
+            "The analyst requires this predicate on EVERY query in the space, against raw "
+            "tables AND the metric view. You MUST propagate it to all of: (a) a mandatory "
+            "general_instructions bullet, (b) every example_query's WHERE clause, and (c) a "
+            "named sql_filter. See the output rules for exact wording."
+        )
     lines.append("### SQL Expressions / Measures")
     for e in s3.get("sql_expressions", []):
         lines.append(
@@ -2908,6 +3019,27 @@ def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
     lines.append("### Analyst Text Instructions (MUST be consolidated into one general_instructions)")
     for t in s3.get("text_instructions", []):
         lines.append(f"- **{t.get('title','')}**: {t.get('instruction','')}")
+    # Analyst-authored example queries (S3) — these are deliberate, reviewed
+    # examples to surface in the space, distinct from any the LLM drafts.
+    aeq = [e for e in s3.get("example_queries", []) if isinstance(e, dict)
+           and (e.get("sql") or "").strip()]
+    if aeq:
+        lines.append("### Analyst-Provided Example Queries (include these verbatim in example_queries, draft=false)")
+        for e in aeq:
+            q = (e.get("question") or "").strip() or "(no question text)"
+            sql = (e.get("sql") or "").strip()
+            guid = (e.get("usage_guidance") or "").strip()
+            lines.append(f"- Q: {q}\n  SQL: {sql}" + (f"\n  Guidance: {guid}" if guid else ""))
+    # Clarifying / disambiguation questions the analyst wants Genie to ask when a
+    # request is ambiguous (e.g. "service line" -> clinical vs financial).
+    cq = [c for c in s3.get("clarifying_questions", []) if isinstance(c, dict)
+          and (c.get("trigger") or "").strip()]
+    if cq:
+        lines.append("### Analyst Clarifying Questions (fold into general_instructions as disambiguation bullets)")
+        for c in cq:
+            trig = (c.get("trigger") or "").strip()
+            ask = (c.get("clarification") or "").strip()
+            lines.append(f"- When the user asks about \"{trig}\": {ask}")
     lines.append("### Data Gaps")
     for g in s3.get("data_gaps", []):
         lines.append(f"- {g.get('gap_description','')}")
@@ -3036,6 +3168,8 @@ These are the ACTUAL columns that exist on each in-scope table (from UC DESCRIBE
 {joined_schemas}
 </table_schemas>
 """
+        if value_hints:
+            schemas_block += "\n" + value_hints + "\n"
 
     # ----- Classified synonyms block -----
     # In Session 3, the analyst classifies each business term and, for terms
@@ -3150,8 +3284,9 @@ Produce a JSON object with exactly these fields:
 
    - Scope: 1 bullet — what this space answers and who it's for.
    - Out-of-scope: 1-2 bullets — topics Genie should refuse or hand off.
+   - GLOBAL FILTER: if the engagement context has a "GLOBAL FILTER" section, emit a mandatory bullet as the FIRST data-rule bullet, worded exactly like: "ALWAYS apply this filter to every query unless the user explicitly overrides it: <predicate>." Use the predicate verbatim. This is required — the analyst wants it enforced space-wide, not just in the metric view.
    - Global response standards: date format, rounding, required columns, time-zone, default ordering.
-   - Clarification triggers: each as a single bullet using this exact pattern: "When <user_condition> AND <missing_info>, ask: <clarification_question>". Example: "When user asks about revenue AND no date range is specified, ask: which fiscal period (e.g. last quarter, YTD, or a custom range)?"
+   - Clarification triggers: each as a single bullet using this exact pattern: "When <user_condition> AND <missing_info>, ask: <clarification_question>". Example: "When user asks about revenue AND no date range is specified, ask: which fiscal period (e.g. last quarter, YTD, or a custom range)?" If the engagement context has an "Analyst Clarifying Questions" section, EVERY one of those MUST appear here as a clarification-trigger bullet (preserve the analyst's intent, e.g. "When user asks about 'service line', ask: clinical service line or financial service line?").
    - Summaries: optional 1-2 bullets prefixed with "Summary:" that constrain how Genie phrases its prose answers (e.g. "Summary: always show totals as a single sentence with the metric name, the number formatted with thousands separators, and the period."). Only TEXT instructions affect summaries — SQL expressions and example queries do not. Include this bucket only if the analyst commentary specifies a response style.
 
    Synonym routing (see <classified_synonyms> block above for the authoritative list):
@@ -3171,13 +3306,13 @@ Produce a JSON object with exactly these fields:
 
 IMPORTANT SQL qualification rule for snippets below: Genie infers the table from qualified column references in the SQL. Every column reference in snippet SQL MUST be prefixed with the SHORT table name (the last segment of the FQN). Example: for table `my_catalog.my_schema.orders`, write `orders.status`, NOT `status` and NOT `my_catalog.my_schema.orders.status`. The `table` field in each entry is metadata for the analyst UI and is NOT pushed to Genie.
 
-3. "sql_filters" (array): Reusable WHERE-clause expressions. Each: {{"name": "snake_case_id", "sql": "short_table.column = 'value'", "table": "catalog.schema.table", "display_name": "Friendly Name", "synonyms": ["..."], "description": "..."}}. Example: {{"name": "cancelled_orders", "sql": "orders.status = 'CANCELLED'", "table": "my_catalog.my_schema.orders", "display_name": "Cancelled Orders"}}
+3. "sql_filters" (array): Reusable WHERE-clause expressions. Each: {{"name": "snake_case_id", "sql": "short_table.column = 'value'", "table": "catalog.schema.table", "display_name": "Friendly Name", "synonyms": ["..."], "description": "..."}}. Example: {{"name": "cancelled_orders", "sql": "orders.status = 'CANCELLED'", "table": "my_catalog.my_schema.orders", "display_name": "Cancelled Orders"}}. If a GLOBAL FILTER was provided, also emit it here as a named filter (e.g. name "global_filter", display_name "Global Filter") with a description noting it applies to every query, qualifying its columns to the relevant table.
 
 4. "sql_dimensions" (array): Reusable grouping/SELECT column expressions. Same shape as sql_filters. Example: {{"name": "order_year", "sql": "YEAR(orders.created_at)", "table": "my_catalog.my_schema.orders", "display_name": "Order Year"}}
 
 5. "sql_measures" (array): Reusable aggregate expressions (COUNT/SUM/AVG/etc). Same shape. Seed from the analyst's Session 3 SQL Expressions — classify each as filter/dimension/measure based on its SQL (aggregates → measure; WHERE-style predicates → filter; plain column exprs → dimension). Validate syntax and rewrite column references to use the short table prefix (e.g., rewrite `COUNT(CASE WHEN status = 'CANCELLED' THEN 1 END) * 100.0 / COUNT(*)` on table `my_catalog.my_schema.orders` to `COUNT(CASE WHEN orders.status = 'CANCELLED' THEN 1 END) * 100.0 / COUNT(orders.*)`).
 
-6. "example_queries" (array, 3-6 items): Full SQL examples for complex/common questions from the question bank. Each: {{"question": "...", "sql": "...", "draft": true, "usage_guidance": "..."}}. SQL MUST use fully qualified `catalog.schema.table` references because example queries are standalone. Only include questions where you can write reasonably confident SQL given the tables in scope — skip speculative ones. Always set "draft": true so analyst reviews.
+6. "example_queries" (array, 3-6 items): Full SQL examples for complex/common questions from the question bank. Each: {{"question": "...", "sql": "...", "draft": true, "usage_guidance": "..."}}. SQL MUST use fully qualified `catalog.schema.table` references because example queries are standalone. Only include questions where you can write reasonably confident SQL given the tables in scope — skip speculative ones. Set "draft": true for the ones YOU author so the analyst reviews. EXCEPTION: any query in the engagement context's "Analyst-Provided Example Queries" section MUST be included VERBATIM (do not rewrite the SQL) with "draft": false — the analyst already authored and vetted these. These analyst queries are IN ADDITION to the 3-6 you draft. If a GLOBAL FILTER was provided, every example query YOU author MUST include that predicate in its WHERE clause (combine with AND) so the examples model the filter; do not modify the verbatim analyst-provided queries.
 
    Trusted Assets tip: for the 1-3 highest-value recurring questions (the ones a BO will ask repeatedly with different parameters), write the SQL using `:param_name` placeholders (e.g. `WHERE orders.region = :region`) and note this in usage_guidance. When Genie matches the exact parameterized template, the response is labeled "Trusted" — a major reliability signal. Only do this for questions where you can confidently parameterize; don't force it.
 
@@ -3226,14 +3361,21 @@ def _trunc(s, max_chars=MAX_CELL_CHARS):
 # Realistic max output tokens per task. Sonnet emits ~50 tok/sec, so 16K
 # tokens = 5+ min worst case (the timeout cliff). Right-sizing per task is
 # the single biggest speedup lever.
+# NOTE: _call_llm auto-retries once with a doubled budget if a JSON response
+# comes back truncated (finish_reason='length'), so these are starting points,
+# not hard ceilings. They're sized so the COMMON case fits in one call — the
+# retry is a safety net for unusually large engagements, not the happy path.
+# Several of these were previously too small (benchmark-draft 3000 for 12
+# questions WITH SQL; plan 10000 for a full structured config), which truncated
+# the JSON and made the feature appear broken.
 TASK_MAX_TOKENS = {
     "brief":              16000,  # citation-heavy markdown + structured gaps trailer
-    "plan":               10000,  # large structured JSON (filters/dimensions/measures/example_queries/narrative)
-    "mv-yaml":             6000,  # YAML output, typically 2-3K tokens
-    "mv-yaml-fix":         6000,  # retry with corrected columns
-    "benchmark-draft":     3000,  # 12 questions, ~1-2K tokens
-    "benchmark-sql":       1500,  # one SQL query
-    "benchmark-sql-fix":   1500,  # retry with error context
+    "plan":               16000,  # large structured JSON (filters/dimensions/measures/example_queries/narrative)
+    "mv-yaml":             8000,  # YAML output, typically 2-3K tokens but joins/many measures grow it
+    "mv-yaml-fix":         8000,  # retry with corrected columns
+    "benchmark-draft":     8000,  # 12 questions, each with expected SQL — 3000 truncated mid-JSON
+    "benchmark-sql":       2000,  # one SQL query
+    "benchmark-sql-fix":   2000,  # retry with error context
     "benchmark-summary":    600,  # one-paragraph plain English
 }
 DEFAULT_MAX_TOKENS = 8000
@@ -3276,7 +3418,8 @@ def _max_tokens_for(label, override=None):
     return TASK_MAX_TOKENS.get(label, DEFAULT_MAX_TOKENS)
 
 
-def _call_llm_raw(prompt, max_tokens=None, model=None, label=None, retries=2):
+def _call_llm_raw(prompt, max_tokens=None, model=None, label=None, retries=2,
+                  return_meta=False):
     """Call the Databricks serving endpoint and return the raw text content (no JSON parse).
 
     Use this when the prompt asks for non-JSON output (e.g. markdown with a
@@ -3369,22 +3512,30 @@ def _call_llm_raw(prompt, max_tokens=None, model=None, label=None, retries=2):
     elif hasattr(resp, "as_dict"):
         d = resp.as_dict()
     else:
-        d = {"choices": [{"message": {"content": resp.choices[0].message.content}}]}
-    content = d["choices"][0]["message"]["content"]
+        d = {"choices": [{"message": {"content": resp.choices[0].message.content},
+                          "finish_reason": getattr(resp.choices[0], "finish_reason", None)}]}
+    choice0 = d["choices"][0]
+    content = choice0["message"]["content"]
+    # finish_reason == "length" means the model hit max_tokens and the output is
+    # truncated — for JSON tasks this is the #1 cause of a downstream parse
+    # failure, so surface it to the caller to drive a retry with a bigger budget.
+    finish_reason = choice0.get("finish_reason") or choice0.get("finishReason")
     elapsed = time.time() - started
-    print(f"[{tag}] done in {elapsed:.1f}s output_chars={len(content)} pt={prompt_tokens} ct={completion_tokens}", flush=True)
+    print(f"[{tag}] done in {elapsed:.1f}s output_chars={len(content)} "
+          f"finish={finish_reason} pt={prompt_tokens} ct={completion_tokens}", flush=True)
     _log_llm_usage(
         tag, endpoint, prompt_chars, len(content), int(elapsed * 1000),
         prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
         success=True,
     )
+    if return_meta:
+        return content, {"finish_reason": finish_reason, "max_tokens": resolved_max}
     return content
 
 
-def _call_llm(prompt, model=None, label=None, max_tokens=None):
-    """Call the LLM and return parsed JSON. Tolerates ```json fences."""
-    content = _call_llm_raw(prompt, model=model, label=label, max_tokens=max_tokens)
-    text = content.strip()
+def _strip_code_fences(text):
+    """Remove a leading ```json / ``` fence and trailing ``` if present."""
+    text = (text or "").strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text
         if text.endswith("```"):
@@ -3392,7 +3543,100 @@ def _call_llm(prompt, model=None, label=None, max_tokens=None):
         text = text.strip()
         if text.startswith("json"):
             text = text[4:].strip()
-    return json.loads(text)
+    return text
+
+
+def _extract_json_value(text):
+    """Pull the first complete top-level JSON object or array out of `text`,
+    even if the model wrapped it in prose ('Here is the JSON: {...} Hope this
+    helps!'). Scans for the first { or [ and returns the balanced span,
+    respecting strings and escapes. Returns None if no balanced value is found
+    (e.g. the output was truncated mid-structure)."""
+    if not text:
+        return None
+    start = None
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            start = i
+            break
+    if start is None:
+        return None
+    open_ch = text[start]
+    close_ch = "}" if open_ch == "{" else "]"
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None  # never closed -> truncated
+
+
+def _parse_llm_json(content):
+    """Best-effort parse of an LLM response into JSON. Tries, in order:
+    raw, fence-stripped, and balanced-span extraction. Raises ValueError with
+    a snippet if all fail."""
+    for candidate in (content, _strip_code_fences(content)):
+        try:
+            return json.loads((candidate or "").strip())
+        except (json.JSONDecodeError, TypeError):
+            pass
+    span = _extract_json_value(_strip_code_fences(content))
+    if span:
+        try:
+            return json.loads(span)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    raise ValueError(
+        "Could not parse a JSON object from the model response. "
+        f"First 300 chars: {(content or '')[:300]!r}"
+    )
+
+
+def _call_llm(prompt, model=None, label=None, max_tokens=None):
+    """Call the LLM and return parsed JSON.
+
+    Robust against the two failure modes that have repeatedly broken AI
+    features in production:
+      1. The model wraps the JSON in prose or fences -> tolerant extraction.
+      2. The output is truncated at max_tokens (finish_reason='length') so the
+         JSON is incomplete -> automatically retry ONCE with a doubled token
+         budget before giving up.
+    """
+    content, meta = _call_llm_raw(
+        prompt, model=model, label=label, max_tokens=max_tokens, return_meta=True,
+    )
+    try:
+        return _parse_llm_json(content)
+    except ValueError:
+        truncated = (meta.get("finish_reason") in ("length", "max_tokens"))
+        # Retry with a bigger budget when the response was cut off. This is the
+        # fix for "the AI feature works on small engagements but fails on big
+        # ones" — the JSON was simply truncated.
+        if truncated:
+            bumped = min(int((meta.get("max_tokens") or 4000) * 2), 32000)
+            print(f"[{label or 'llm'}] output truncated (finish=length); "
+                  f"retrying once with max_tokens={bumped}", flush=True)
+            content2 = _call_llm_raw(
+                prompt, model=model, label=label, max_tokens=bumped,
+            )
+            return _parse_llm_json(content2)
+        raise
 
 
 def _do_generate_plan(eid, user_token, warehouse_id):
@@ -3509,7 +3753,9 @@ def _do_generate_plan_inner(eid, eng, user_w, warehouse_id):
                 + ". Falling back to Session 3 YAML if available."
             )
 
-    prompt = _build_plan_prompt(eng, schemas=schemas, mv_definitions=mv_definitions)
+    value_hints = _categorical_value_hints(schemas, user_w, wh_to_use) if wh_to_use else ""
+    prompt = _build_plan_prompt(eng, schemas=schemas, mv_definitions=mv_definitions,
+                                value_hints=value_hints)
     plan = _call_llm(prompt, label="plan")
 
     # Normalize shape
@@ -3524,34 +3770,32 @@ def _do_generate_plan_inner(eid, eng, user_w, warehouse_id):
     example_queries = _norm_list(plan.get("example_queries"))
     narrative = str(plan.get("narrative", "")).strip()
 
-    # Belt-and-suspenders: strip any sample_questions / example_queries that
-    # overlap with Session 4 benchmark questions. Benchmarks are the acceptance
-    # test — they MUST NOT appear as configured answers, otherwise Genie just
-    # memorizes them and we lose drift-detection.
+    # Strip example_queries that overlap Session 4 benchmark questions: an
+    # example query carries the ANSWER SQL, so pre-loading one that matches a
+    # benchmark would let Genie memorize the acceptance test and we'd lose
+    # drift-detection.
+    #
+    # sample_questions are NOT stripped. They are display-only prompts shown to
+    # users when they open the space — they contain no SQL/answer, so resembling
+    # a benchmark question leaks nothing. Stripping them used to empty the
+    # space's suggested-questions list whenever benchmarks were drawn from the
+    # question bank (the common case), which looked broken. (Kiara, 2026-06-11.)
     benchmark_qs = [
         (b.get("question") or "").strip()
         for b in s4.get("benchmark_questions", [])
         if (b.get("question") or "").strip()
     ]
     if benchmark_qs:
-        before_sq = len(sample_questions)
-        sample_questions = _strip_benchmark_overlap(sample_questions, benchmark_qs)
-        stripped_sq = before_sq - len(sample_questions)
-
         before_eq = len(example_queries)
         example_queries = [
             eq for eq in example_queries
             if not _question_overlaps(eq.get("question", ""), benchmark_qs)
         ]
         stripped_eq = before_eq - len(example_queries)
-
-        if stripped_sq:
-            warnings.append(
-                f"Removed {stripped_sq} sample question(s) that overlapped with Session 4 benchmarks."
-            )
         if stripped_eq:
             warnings.append(
-                f"Removed {stripped_eq} example query/queries that overlapped with Session 4 benchmarks."
+                f"Removed {stripped_eq} example query/queries that overlapped with Session 4 "
+                f"benchmarks (kept all sample questions — those are display-only)."
             )
 
     # Fetch UC PK/FK joins for tables in Session 4's data plan (NOT LLM-generated).
@@ -3867,6 +4111,26 @@ def draft_benchmark_sql(eid):
         return jsonify({"error": _user_error("draft-benchmark-sql sync", e)}), 500
 
 
+def _flag_empty_benchmark_result(validation, run_result):
+    """A benchmark query that runs cleanly but returns ZERO rows is a strong
+    signal the SQL is semantically wrong — most often a filter on the wrong
+    column (e.g. WHERE plan_type IN ('Medicare','Commercial') when those values
+    live in line_of_business). The execution 'succeeds', so without this the
+    analyst sees a green check on a query that answers nothing. Surface it as a
+    warning so a human verifies before it becomes an acceptance test."""
+    if not isinstance(run_result, dict):
+        return
+    if run_result.get("error"):
+        return
+    if (run_result.get("row_count") or 0) == 0:
+        validation["empty"] = True
+        validation["warning"] = (
+            "This query ran successfully but returned 0 rows. That usually means a "
+            "filter or column is wrong (e.g. filtering a category value against the "
+            "wrong column). Verify the columns and filter values before approving."
+        )
+
+
 def _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user_w):
     in_scope_tables = [
         (d.get("table_or_view") or "").strip()
@@ -3874,9 +4138,11 @@ def _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user
         if d.get("include_in_space") == "Yes" and (d.get("table_or_view") or "").count(".") == 2
     ]
     schema_blocks = []
+    schema_map = {}
     for t in in_scope_tables:
         cols = _describe_table_columns(t, user_w, warehouse_id) if warehouse_id else []
         if cols:
+            schema_map[t] = cols
             col_lines = "\n".join(f"  - {c[0]} ({c[1]})" for c in cols)
             schema_blocks.append(f"{t}:\n{col_lines}")
         else:
@@ -3884,6 +4150,11 @@ def _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user
             # below still instructs the LLM not to invent columns.
             schema_blocks.append(f"{t}:\n  (schema unavailable — be conservative with column references)")
     schemas_text = "\n\n".join(schema_blocks) if schema_blocks else "(no tables in scope)"
+    # Sample categorical values so the LLM maps e.g. 'Medicare' to the column
+    # that actually holds it (line_of_business) instead of guessing by name.
+    hints = _categorical_value_hints(schema_map, user_w, warehouse_id)
+    if hints:
+        schemas_text = schemas_text + "\n\n" + hints
 
     metric_lines = []
     for e in s3.get("sql_expressions", []):
@@ -4012,6 +4283,7 @@ Return JSON: {{"sql": "the corrected SQL"}}. No markdown fences, no commentary."
                         validation["ran"] = True
                         validation["error"] = None
                         validation["sample_result"] = retry_run
+                        _flag_empty_benchmark_result(validation, retry_run)
                 else:
                     validation["error"] = err_msg
             except Exception as e:
@@ -4020,6 +4292,7 @@ Return JSON: {{"sql": "the corrected SQL"}}. No markdown fences, no commentary."
         else:
             validation["ran"] = True
             validation["sample_result"] = run_result
+            _flag_empty_benchmark_result(validation, run_result)
 
     # Second LLM call — summary is derived from the final SQL (post-retry if
     # applicable), not from the question. Guarantees the plain-English
@@ -4310,6 +4583,68 @@ def _collect_engagement_schemas(eng, user_w=None, warehouse_id=None):
     return {t: _describe_table_columns(t, user_w, warehouse_id) for t in sorted(tables)}
 
 
+# String types we sample for distinct values. Numeric/date/high-card columns
+# are skipped — we only want categorical hints.
+_STRING_TYPELIKE = ("string", "varchar", "char")
+_HINT_MAX_DISTINCT = 25   # treat as categorical only if <= this many distinct values
+_HINT_MAX_SHOWN = 15      # cap how many we list per column
+
+
+def _categorical_value_hints(schemas, user_w=None, warehouse_id=None, sample_rows=500):
+    """For each table's low-cardinality STRING columns, return a few distinct
+    sample VALUES so the LLM can map question terms to the RIGHT column (e.g.
+    knowing 'Medicare'/'Commercial' live in line_of_business, not plan_type).
+
+    `schemas` is {fqn: [(col, type), ...]}. Best-effort and SELECT-only: one
+    sampling query per table; any failure is skipped silently. Returns a
+    formatted text block ('' if nothing useful)."""
+    if not (user_w and warehouse_id and schemas):
+        return ""
+    lines = []
+    for fqn, cols in schemas.items():
+        if not cols or fqn.count(".") != 2:
+            continue
+        str_cols = [c for c, t in cols if any(k in (t or "").lower() for k in _STRING_TYPELIKE)]
+        if not str_cols:
+            continue
+        c, s, t = fqn.split(".")
+        sel = ", ".join(f"`{col}`" for col in str_cols)
+        stmt = f"SELECT {sel} FROM `{c}`.`{s}`.`{t}` LIMIT {sample_rows}"
+        try:
+            resp = user_w.statement_execution.execute_statement(
+                warehouse_id=warehouse_id, statement=stmt, wait_timeout="30s")
+            if "SUCCEEDED" not in (str(resp.status.state) if resp.status else ""):
+                continue
+            if not (resp.manifest and resp.result and resp.result.data_array):
+                continue
+            names = [cc.name for cc in resp.manifest.schema.columns]
+            distinct = {n: set() for n in names}
+            for row in resp.result.data_array:
+                for i, n in enumerate(names):
+                    v = row[i]
+                    if v is not None and v != "":
+                        distinct[n].add(str(v))
+        except Exception as e:
+            print(f"[value-hints] {fqn} sample failed: {type(e).__name__}: {e}", flush=True)
+            continue
+        col_hints = []
+        for n in names:
+            vals = sorted(distinct[n])
+            if 1 <= len(vals) <= _HINT_MAX_DISTINCT:
+                shown = ", ".join(vals[:_HINT_MAX_SHOWN])
+                col_hints.append(f"  - {n}: {shown}")
+        if col_hints:
+            lines.append(f"`{fqn}`:\n" + "\n".join(col_hints))
+    if not lines:
+        return ""
+    return (
+        "## Categorical column VALUES (sampled — use these to map question terms "
+        "to the RIGHT column; a value like 'Medicare' belongs to whichever column "
+        "below actually lists it, NOT one whose name merely sounds similar)\n"
+        + "\n".join(lines)
+    )
+
+
 def _build_mv_yaml_prompt(eng, user_w=None, warehouse_id=None):
     """Build the LLM prompt to draft a UC Metric View YAML from Sessions 1-3."""
     s1 = eng["sessions"]["1"]
@@ -4404,6 +4739,10 @@ def _build_mv_yaml_prompt(eng, user_w=None, warehouse_id=None):
         col_str = ", ".join(f"{c} {t}" for c, t in cols)
         lines.append(f"- `{fqn}`: {col_str}")
     lines.append("")
+    _mv_hints = _categorical_value_hints(schemas, user_w, warehouse_id)
+    if _mv_hints:
+        lines.append(_mv_hints)
+        lines.append("")
     lines.append("## Analyst-mapped SQL Expressions (THE CORE INPUT)")
     for e in s3.get("sql_expressions", []):
         lines.append(
@@ -4506,9 +4845,21 @@ measures:
 </metric_view_yaml_spec>
 
 <rules>
-1. Classify each analyst SQL expression:
+1. Classify each analyst SQL expression by its SHAPE — analysts sometimes paste a
+   bare WHERE-clause predicate where a value expression is expected, so look at
+   what the SQL actually is, not just what it's labeled:
    - Aggregate function (COUNT/SUM/AVG/MAX/MIN/...) in the expression → `measures`
-   - No aggregate (plain column, CASE WHEN, DATE_TRUNC, etc.) → `dimensions`
+   - A bare boolean PREDICATE / WHERE-clause fragment (e.g. `status = 'CANCELLED'`,
+     `claim_type IN ('Professional','Facility')`, `receipt_date >= '2024-01-01'`) is
+     NOT a measure or dimension value. Handle it as ONE of:
+       (a) if it scopes the whole space → fold it into the top-level `filter:` (AND
+           it with any existing filter), OR
+       (b) if the analyst clearly wants to COUNT/measure the matching rows → wrap it
+           as a measure: `COUNT(1) FILTER (WHERE <predicate>)`.
+     Pick (a) when the metric_name reads like a scope/exclusion, (b) when it reads
+     like a count/rate of the matching subset. NEVER emit a bare predicate as a
+     dimension or measure `expr` — that produces a boolean column nobody asked for.
+   - No aggregate and not a predicate (plain column, CASE WHEN, DATE_TRUNC, etc.) → `dimensions`
 2. Rewrite column references to be UNQUALIFIED (no table prefix). The MV already knows its source. Turn `claims.initial_decision` into `initial_decision`. Only keep a prefix if the reference targets a JOINED table via the join's alias.
 3. Put business-term synonyms from the vocabulary into the matching dimension/measure `synonyms:` array. Do NOT emit them as an `instructions` key (that key does not exist).
 4. If the analyst supplied a `## Global Filter` section above, copy that SQL verbatim into the top-level `filter:` key — it is the authoritative filter. If a text instruction adds another data-level predicate (e.g., "exclude test claims" → `test_flag = 'N'`), AND the global filter, combine them with `AND`. Skip text instructions that aren't data filters — those belong on the Genie Space, not the MV.
@@ -4671,6 +5022,282 @@ def _validate_yaml_columns(yaml_text, schemas):
     return sorted(missing)
 
 
+# Aggregate functions that make an expression a valid `measure`. A measure expr
+# MUST contain at least one of these; a dimension expr must contain NONE.
+_AGG_FUNCS = {
+    "count", "sum", "avg", "mean", "min", "max", "median", "stddev", "stddev_pop",
+    "stddev_samp", "variance", "var_pop", "var_samp", "approx_count_distinct",
+    "approx_percentile", "percentile", "percentile_approx", "collect_list",
+    "collect_set", "first", "first_value", "last", "last_value", "any", "every",
+    "some", "bool_and", "bool_or", "corr", "covar_pop", "covar_samp", "skewness",
+    "kurtosis", "count_if", "max_by", "min_by", "grouping", "grouping_id",
+    "regr_count", "regr_avgx", "regr_avgy", "regr_slope", "regr_intercept",
+    "regr_r2", "regr_sxx", "regr_sxy", "regr_syy",
+}
+
+# Top-level keys the metric view YAML v1.1 spec allows. Anything else breaks the
+# CREATE ... WITH METRICS write.
+_MV_ALLOWED_TOP_KEYS = {
+    "version", "comment", "source", "filter", "joins", "dimensions",
+    "measures", "materialization",
+}
+
+
+def _expr_has_aggregate(expr):
+    """True if a SQL expression contains a call to a known aggregate function."""
+    import re
+    if not expr:
+        return False
+    # Strip string literals so a function-looking token inside a string doesn't count
+    cleaned = re.sub(r"'[^']*'", " ", str(expr))
+    for fn in _AGG_FUNCS:
+        if re.search(rf"\b{fn}\s*\(", cleaned, re.IGNORECASE):
+            return True
+    return False
+
+
+def _expr_looks_like_predicate(expr):
+    """True if an expr looks like a bare WHERE-clause predicate rather than a
+    value expression — i.e. a top-level comparison with no surrounding aggregate.
+    Used to catch the common analyst mistake of pasting a filter (`status = 'X'`)
+    where a measure/dimension value is expected (change request #4)."""
+    import re
+    if not expr:
+        return False
+    s = str(expr).strip()
+    if _expr_has_aggregate(s):
+        return False
+    # A CASE/IF/COALESCE/CAST expression (or anything with a function call that
+    # wraps a comparison) RETURNS A VALUE — it's a legitimate dimension, not a
+    # bare predicate. Without this guard, `CASE WHEN x = 'Y' THEN 'Yes' ELSE
+    # 'No' END` (a perfectly good categorical dimension) was wrongly flagged,
+    # producing noisy "looks like a filter" warnings on clean YAML.
+    if re.search(r"\b(CASE|IF|COALESCE|NULLIF|IFNULL|CAST|TRY_CAST|WHEN|THEN)\b",
+                 s, re.IGNORECASE):
+        return False
+    # Remove string literals so operators inside strings don't trigger
+    cleaned = re.sub(r"'[^']*'", " ", s)
+    # Bare comparison / membership operators at the surface level
+    if re.search(r"(<=|>=|!=|<>|\s=\s|\s<\s|\s>\s)", cleaned):
+        return True
+    if re.search(r"\b(IN|LIKE|ILIKE|RLIKE|BETWEEN|IS\s+NULL|IS\s+NOT\s+NULL)\b",
+                 cleaned, re.IGNORECASE):
+        return True
+    return False
+
+
+def _lint_mv_yaml(yaml_text):
+    """Deterministic structural lint of a metric view YAML body.
+
+    Returns (hard_errors, warnings). hard_errors are issues that WILL break the
+    `CREATE OR REPLACE VIEW ... WITH METRICS` write (so we feed them to the LLM
+    auto-fix retry and block the push). warnings are likely-wrong-but-creatable
+    issues (e.g. a predicate where a value expression was expected — #4).
+
+    This catches the failure classes the column-existence check misses:
+    name-collisions (CONTAINS_AGGREGATE), measures without an aggregate,
+    dimensions WITH an aggregate, disallowed top-level keys, duplicate names,
+    and bare Y/N literals YAML parses as booleans.
+    """
+    hard, warn = [], []
+    try:
+        import yaml as pyyaml
+    except Exception:
+        return hard, warn
+    try:
+        doc = pyyaml.safe_load(yaml_text)
+    except Exception as e:
+        return [f"YAML does not parse: {e}"], warn
+    if not isinstance(doc, dict):
+        return ["YAML root is not a mapping (expected top-level keys like version/source/measures)."], warn
+
+    # Top-level key whitelist
+    for k in doc.keys():
+        if str(k) not in _MV_ALLOWED_TOP_KEYS:
+            hard.append(
+                f"Invalid top-level key `{k}`. Allowed keys: "
+                f"{', '.join(sorted(_MV_ALLOWED_TOP_KEYS))}. Rules that aren't a "
+                f"filter/dimension/measure belong on the Genie Space, not the metric view."
+            )
+    if not doc.get("source"):
+        hard.append("Missing required `source` (the base table as catalog.schema.table).")
+
+    seen_names = {}
+
+    def _check_member(member, kind):
+        if not isinstance(member, dict):
+            hard.append(f"Each {kind} entry must be a mapping with `name` and `expr`.")
+            return
+        name = (member.get("name") or "").strip()
+        expr = member.get("expr") or ""
+        if not name:
+            hard.append(f"A {kind} is missing its `name`.")
+        else:
+            if " " in name:
+                hard.append(f"{kind} name `{name}` contains a space — use snake_case.")
+            if name.lower() in seen_names:
+                hard.append(
+                    f"Duplicate name `{name}` (also used as a {seen_names[name.lower()]}). "
+                    f"Names must be unique across dimensions and measures."
+                )
+            seen_names[name.lower()] = kind
+        if not expr:
+            hard.append(f"{kind} `{name or '?'}` is missing its `expr`.")
+            return
+        # Name-collision: a measure/dimension name that also appears as a bare
+        # identifier inside its own expr triggers CONTAINS_AGGREGATE / resolution errors.
+        if name and name.lower() in _extract_bare_identifiers(expr):
+            hard.append(
+                f"{kind} `{name}` references a column named `{name}` in its own expr. "
+                f"Rename the {kind} (e.g. add a _pct/_count/_total suffix) so it doesn't "
+                f"collide with the column."
+            )
+        has_agg = _expr_has_aggregate(expr)
+        if kind == "measure" and not has_agg:
+            hard.append(
+                f"measure `{name}` has no aggregate function in its expr (`{expr}`). "
+                f"Measures must aggregate (COUNT/SUM/AVG/...). If this is a filter, move it "
+                f"to the top-level `filter:` key; if it's a row-level value, make it a dimension."
+            )
+        if kind == "dimension" and has_agg:
+            hard.append(
+                f"dimension `{name}` contains an aggregate function in its expr (`{expr}`). "
+                f"Dimensions must be row-level (non-aggregate). Move this to `measures`."
+            )
+        if kind == "dimension" and _expr_looks_like_predicate(expr):
+            warn.append(
+                f"dimension `{name}` looks like a filter predicate (`{expr}`), not a value. "
+                f"If it's meant to scope the data, move it to the top-level `filter:` key."
+            )
+
+    for m in (doc.get("measures") or []):
+        _check_member(m, "measure")
+    for d in (doc.get("dimensions") or []):
+        _check_member(d, "dimension")
+
+    # Bare Y/N booleans inside exprs/filter (YAML 1.1 parses them as booleans)
+    import re
+    def _bare_yn(expr):
+        cleaned = re.sub(r"'[^']*'", " ", str(expr or ""))
+        return bool(re.search(r"(=|<>|!=|\bIN\b)\s*[YN]\b", cleaned))
+    if _bare_yn(doc.get("filter")):
+        warn.append("filter references a bare Y/N — quote string literals ('Y'/'N').")
+
+    return hard, warn
+
+
+def _dryrun_create_mv(user_w, yaml_body, warehouse_id, catalog, schema):
+    """Live validation: create a throwaway metric view from the YAML, then DROP it.
+
+    This is the only way to GUARANTEE the YAML will write to UC — it uses the
+    exact same `CREATE OR REPLACE VIEW ... WITH METRICS` engine path. Returns a
+    dict: {ok: bool, error: str|None, skipped: str|None}. `skipped` is set (and
+    ok=True) when we couldn't run the dry-run for a non-syntax reason — most
+    importantly a CREATE permission denial in the scratch schema — so callers
+    can fall back to lint without treating it as a validation failure.
+    """
+    if not (user_w and warehouse_id and catalog and schema and yaml_body):
+        return {"ok": True, "error": None, "skipped": "missing warehouse/target"}
+    scratch = f"_gdv_validate_{_gen_hex_id()}"
+    fqn = f"`{catalog}`.`{schema}`.`{scratch}`"
+    delim = "$$" if "$$" not in yaml_body else "$MV_DRYRUN$"
+    create_stmt = (
+        f"CREATE OR REPLACE VIEW {fqn}\nWITH METRICS\nLANGUAGE YAML\nAS {delim}\n{yaml_body}\n{delim}"
+    )
+    try:
+        _sql_exec_obo(user_w, create_stmt, warehouse_id)
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        # A permission/authorization failure means we can't validate HERE, not
+        # that the YAML is wrong. Skip gracefully so lint stays authoritative.
+        if any(k in low for k in ("permission", "privilege", "not authorized",
+                                  "access denied", "requires", "insufficient")):
+            return {"ok": True, "error": None, "skipped": f"no create rights in {catalog}.{schema}"}
+        return {"ok": False, "error": msg, "skipped": None}
+    finally:
+        # Always try to clean up the scratch object.
+        try:
+            _sql_exec_obo(user_w, f"DROP VIEW IF EXISTS {fqn}", warehouse_id)
+        except Exception as drop_err:
+            print(f"[mv-dryrun] cleanup of {fqn} failed: {drop_err}", flush=True)
+    return {"ok": True, "error": None, "skipped": None}
+
+
+def _exec_ok_obo(user_w, stmt, warehouse_id):
+    """Run a statement via OBO; return (ok, error_message). Never raises."""
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id, statement=stmt, wait_timeout="50s",
+        )
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    state = str(resp.status.state) if resp.status else ""
+    if "SUCCEEDED" in state:
+        return True, None
+    err = resp.status.error.message if (resp.status and resp.status.error) else f"state={state}"
+    return False, err
+
+
+def _validate_mv_via_select(user_w, yaml_text, warehouse_id):
+    """Compile-check a metric view's expressions WITHOUT creating anything.
+
+    Runs each dimension set and measure set as a `LIMIT 0` SELECT against the
+    source table. This needs only SELECT on the source (which the analyst always
+    has — they picked the table), so unlike the scratch-create dry-run it NEVER
+    skips for permission reasons. Catches the real-world causes of "YAML errors
+    on upload": non-existent columns, invalid aggregate/expression syntax, type
+    errors, bad filter predicates.
+
+    Returns (errors, skipped_reason). errors is a list of Spark messages; empty
+    means every expression compiled. skipped_reason is set (errors empty) when
+    we couldn't run the check (joins/subquery source/no warehouse) and the
+    caller should rely on lint + the scratch dry-run instead.
+    """
+    if not (user_w and warehouse_id and yaml_text):
+        return [], "no warehouse/yaml"
+    try:
+        import yaml as pyyaml
+        doc = pyyaml.safe_load(yaml_text)
+    except Exception as e:
+        return [f"YAML does not parse: {e}"], None
+    if not isinstance(doc, dict):
+        return ["YAML root is not a mapping."], None
+    source = (doc.get("source") or "").strip()
+    # Only handle a plain three-part source with no joins — join semantics
+    # (source.col / alias.col) can't be replicated in a flat SELECT, so defer
+    # those to lint + the scratch-create dry-run to avoid false errors.
+    if source.count(".") != 2 or " " in source or doc.get("joins"):
+        return [], "joined or non-table source — using lint + dry-run instead"
+    c, s, t = source.split(".")
+    src = f"`{c}`.`{s}`.`{t}`"
+    filt = (doc.get("filter") or "").strip()
+    where = f" WHERE ({filt})" if filt else ""
+    errors = []
+
+    dims = [d for d in (doc.get("dimensions") or []) if isinstance(d, dict) and (d.get("expr") or "").strip()]
+    if dims:
+        sel = ", ".join(f"({d['expr']}) AS gdv_d{i}" for i, d in enumerate(dims))
+        ok, err = _exec_ok_obo(user_w, f"SELECT {sel} FROM {src}{where} LIMIT 0", warehouse_id)
+        if not ok:
+            errors.append(f"dimensions/filter failed to compile: {err}")
+
+    meas = [m for m in (doc.get("measures") or []) if isinstance(m, dict) and (m.get("expr") or "").strip()]
+    if meas:
+        sel = ", ".join(f"({m['expr']}) AS gdv_m{i}" for i, m in enumerate(meas))
+        # All-aggregate select with no GROUP BY returns one row — valid.
+        ok, err = _exec_ok_obo(user_w, f"SELECT {sel} FROM {src}{where} LIMIT 1", warehouse_id)
+        if not ok:
+            errors.append(f"measures/filter failed to compile: {err}")
+
+    if not dims and not meas and filt:
+        ok, err = _exec_ok_obo(user_w, f"SELECT 1 FROM {src}{where} LIMIT 0", warehouse_id)
+        if not ok:
+            errors.append(f"filter failed to compile: {err}")
+
+    return errors, None
+
+
 @app.route("/api/engagements/<eid>/mv-prompt-preview", methods=["GET"])
 def mv_prompt_preview(eid):
     """Debug: return the fully-assembled MV YAML prompt for this engagement."""
@@ -4722,6 +5349,20 @@ def _task_draft_mv_yaml(payload):
     )
 
 
+def _mv_issue_list(yaml_text, schemas):
+    """Combine the column-existence check and the structural lint into one list
+    of hard, must-fix problems with a metric view YAML. Returns (issues, warnings)."""
+    missing = _validate_yaml_columns(yaml_text, schemas)
+    hard, warn = _lint_mv_yaml(yaml_text)
+    issues = list(hard)
+    if missing:
+        issues.append(
+            f"References column(s) that don't exist in the source table(s): "
+            f"{', '.join(missing)}. Use only real columns or drop that field."
+        )
+    return issues, warn
+
+
 def _do_draft_mv_yaml_inner(eng, user_w, warehouse_id):
     prompt = _build_mv_yaml_prompt(eng, user_w, warehouse_id)
     result = _call_llm(prompt, label="mv-yaml")
@@ -4730,58 +5371,143 @@ def _do_draft_mv_yaml_inner(eng, user_w, warehouse_id):
     source_table = str(result.get("source_table", "")).strip()
     suggested_name = str(result.get("suggested_name", "")).strip()
 
-    # Post-draft sanity check: verify every bare column reference exists.
-    # If any are missing, retry once with a targeted correction prompt.
     schemas = _collect_engagement_schemas(eng, user_w, warehouse_id)
-    missing = _validate_yaml_columns(yaml_text, schemas)
     warnings = []
-    if missing:
-        print(f"[draft-mv-yaml] validation found missing columns: {missing}", flush=True)
-        schema_lines = []
-        for fqn, cols in schemas.items():
-            if cols:
-                schema_lines.append(f"- `{fqn}`: {', '.join(c for c, _ in cols)}")
-        fix_prompt = f"""You drafted this metric view YAML, but it references columns that don't exist in the underlying tables.
+
+    schema_lines = []
+    for fqn, cols in schemas.items():
+        if cols:
+            schema_lines.append(f"- `{fqn}`: {', '.join(c for c, _ in cols)}")
+    schema_block = "\n".join(schema_lines) or "(schema unavailable)"
+
+    def _fix_once(bad_yaml, problems, label):
+        """Ask the LLM to repair the YAML given a concrete problem list. Returns
+        the repaired (yaml, source_table, suggested_name) or None on failure."""
+        fix_prompt = f"""You drafted this Databricks Unity Catalog metric view YAML, but it has problems that will prevent it from being created.
 
 <your_yaml>
-{yaml_text}
+{bad_yaml}
 </your_yaml>
 
-<missing_columns>
-{', '.join(missing)}
-</missing_columns>
+<problems_to_fix>
+{chr(10).join(f'- {p}' for p in problems)}
+</problems_to_fix>
 
 <authoritative_schema>
-{chr(10).join(schema_lines)}
+{schema_block}
 </authoritative_schema>
 
-Rewrite the YAML so every bare column reference in any `expr`, `filter`, or join `on` clause is a column that actually exists in the authoritative schema above. If a missing column represents a concept that cannot be expressed with real columns, DROP that dimension/measure entirely rather than inventing a column. Keep every other rule from the original task (snake_case name fields, no name-column collisions, quoted string literals, only allowed top-level keys).
+Rewrite the YAML so EVERY problem above is resolved. Rules to honor:
+- Measures MUST contain an aggregate (COUNT/SUM/AVG/...). Dimensions MUST be row-level (no aggregate). A bare WHERE-style predicate belongs in the top-level `filter:` key, never as a measure/dimension expr.
+- No measure/dimension `name` may equal a column referenced in its own expr (add a _pct/_count/_total suffix).
+- Names are unique across all dimensions and measures; snake_case, no spaces.
+- Only allowed top-level keys: version, comment, source, filter, joins, dimensions, measures, materialization.
+- Every bare column reference must be a real column from the authoritative schema. Drop a field rather than invent a column.
+- Quote string literals ('Y'/'N'/'DENIED').
 
 Return JSON with exactly: {{"yaml": "...", "source_table": "...", "suggested_name": "..."}}. No markdown fences."""
         try:
-            result2 = _call_llm(fix_prompt, label="mv-yaml-fix")
-            yaml_text2 = _strip_yaml_fences(str(result2.get("yaml", "")))
-            missing2 = _validate_yaml_columns(yaml_text2, schemas)
-            if yaml_text2 and len(missing2) < len(missing):
-                yaml_text = yaml_text2
-                source_table = str(result2.get("source_table", source_table)).strip() or source_table
-                suggested_name = str(result2.get("suggested_name", suggested_name)).strip() or suggested_name
-                if missing2:
+            r2 = _call_llm(fix_prompt, label=label)
+            return (
+                _strip_yaml_fences(str(r2.get("yaml", ""))),
+                str(r2.get("source_table", "")).strip(),
+                str(r2.get("suggested_name", "")).strip(),
+            )
+        except Exception as e:
+            print(f"[draft-mv-yaml] {label} failed: {e}", flush=True)
+            return None
+
+    # Pass 1: deterministic checks (column existence + structural lint).
+    issues, lint_warn = _mv_issue_list(yaml_text, schemas)
+    if issues:
+        print(f"[draft-mv-yaml] structural/column issues: {issues}", flush=True)
+        fixed = _fix_once(yaml_text, issues, "mv-yaml-fix")
+        if fixed and fixed[0]:
+            new_issues, new_warn = _mv_issue_list(fixed[0], schemas)
+            if len(new_issues) < len(issues):
+                yaml_text = fixed[0]
+                source_table = fixed[1] or source_table
+                suggested_name = fixed[2] or suggested_name
+                issues, lint_warn = new_issues, new_warn
+        if issues:
+            warnings.append(
+                "Structural issues remain — review before creating: " + "; ".join(issues)
+            )
+    warnings.extend(lint_warn)
+
+    # Pass 1.5: COMPILE every expression with LIMIT-0 SELECTs against the source.
+    # Needs only SELECT (the analyst always has it), so unlike the scratch-create
+    # dry-run this NEVER skips for permissions — it's the workhorse that catches
+    # bad columns / invalid SQL before the analyst ever hits "Create" (the #1
+    # cause of "YAML errors on upload"). Up to 2 auto-fix attempts.
+    if not issues and warehouse_id:
+        for attempt in range(2):
+            sel_errors, sel_skipped = _validate_mv_via_select(user_w, yaml_text, warehouse_id)
+            if sel_skipped:
+                print(f"[draft-mv-yaml] select-compile skipped: {sel_skipped}", flush=True)
+                break
+            if not sel_errors:
+                break
+            print(f"[draft-mv-yaml] select-compile errors (attempt {attempt+1}): {sel_errors}", flush=True)
+            fixed = _fix_once(yaml_text, sel_errors, "mv-yaml-fix")
+            if not (fixed and fixed[0]):
+                warnings.append("Some expressions did not compile and the auto-fix failed: "
+                                + "; ".join(sel_errors) + " Review before creating.")
+                break
+            retry_issues, _ = _mv_issue_list(fixed[0], schemas)
+            if retry_issues:
+                warnings.append("Auto-fix introduced structural issues: " + "; ".join(retry_issues))
+                break
+            yaml_text, source_table, suggested_name = (
+                fixed[0], fixed[1] or source_table, fixed[2] or suggested_name)
+        else:
+            # Loop exhausted without a clean compile.
+            last_errors, _ = _validate_mv_via_select(user_w, yaml_text, warehouse_id)
+            if last_errors:
+                warnings.append("Expressions still fail to compile after auto-fix: "
+                                + "; ".join(last_errors) + " Review/edit before creating.")
+
+    # Pass 2: LIVE validation — actually create the metric view (scratch name)
+    # and drop it, so we KNOW it writes. Uses the source table's catalog.schema
+    # as the scratch location; skips gracefully if the user lacks CREATE there.
+    src_for_scratch = source_table or ((schemas and next(iter(schemas))) or "")
+    parts = src_for_scratch.split(".") if src_for_scratch else []
+    if not issues and len(parts) == 3 and warehouse_id:
+        dry = _dryrun_create_mv(user_w, yaml_text, warehouse_id, parts[0], parts[1])
+        if dry.get("skipped"):
+            print(f"[draft-mv-yaml] dry-run skipped: {dry['skipped']}", flush=True)
+        elif not dry.get("ok"):
+            spark_err = dry.get("error") or "unknown error"
+            print(f"[draft-mv-yaml] dry-run create FAILED: {spark_err}", flush=True)
+            fixed = _fix_once(
+                yaml_text,
+                [f"When Databricks tried to create this metric view it failed with: {spark_err}"],
+                "mv-yaml-dryrun-fix",
+            )
+            if fixed and fixed[0]:
+                # Only accept the retry if it ALSO passes deterministic checks.
+                retry_issues, _ = _mv_issue_list(fixed[0], schemas)
+                if not retry_issues:
+                    dry2 = _dryrun_create_mv(user_w, fixed[0], warehouse_id, parts[0], parts[1])
+                    if dry2.get("ok"):
+                        yaml_text = fixed[0]
+                        source_table = fixed[1] or source_table
+                        suggested_name = fixed[2] or suggested_name
+                    else:
+                        warnings.append(
+                            f"The metric view still fails to create: {dry2.get('error') or spark_err}. "
+                            f"Review/edit the YAML before creating."
+                        )
+                else:
                     warnings.append(
-                        f"Retry still has {len(missing2)} unresolved column(s): {', '.join(missing2)}. "
-                        f"Review the YAML before creating."
+                        f"The metric view failed a live create check ({spark_err}) and the auto-fix "
+                        f"still has issues. Review the YAML before creating."
                     )
             else:
                 warnings.append(
-                    f"Columns referenced in YAML that don't exist in the source table: "
-                    f"{', '.join(missing)}. Fix these before creating the metric view."
+                    f"The metric view failed a live create check: {spark_err}. "
+                    f"Review/edit the YAML before creating."
                 )
-        except Exception as e:
-            print(f"[draft-mv-yaml] retry failed: {e}", flush=True)
-            warnings.append(
-                f"Columns referenced in YAML that don't exist in the source table: "
-                f"{', '.join(missing)}. Fix these before creating the metric view."
-            )
 
     return {
         "yaml": yaml_text,
@@ -4875,24 +5601,35 @@ def create_metric_view(eid):
             "owner": owner,
         }), 409
 
-    # Re-run the column validator against the YAML the user is about to push.
-    # The draft step already validates + retries, but the user may have hand-
-    # edited the YAML since. Block the push if we can still prove a column is
-    # hallucinated — much better UX than letting Spark error at CREATE time.
+    # Re-validate the YAML the user is about to push. The draft step already
+    # validates + retries, but the user may have hand-edited the YAML since.
+    # Block the push if we can prove it's broken — much better UX than letting
+    # Spark error at CREATE time. Two layers: (1) deterministic column + lint
+    # checks, (2) a live scratch create+drop in the TARGET schema, which is the
+    # definitive "will this write to UC" test.
     rows = sql_exec(f"SELECT * FROM {TABLE} WHERE engagement_id = :eid", {"eid": eid})
     if rows:
         eng_for_schema = parse_row(rows[0])
         schemas = _collect_engagement_schemas(eng_for_schema, user_w, warehouse_id)
-        missing = _validate_yaml_columns(yaml_body, schemas)
-        if missing:
+        issues, _warn = _mv_issue_list(yaml_body, schemas)
+        if issues:
             return jsonify({
                 "error": (
-                    f"YAML references column(s) that don't exist in the source "
-                    f"table(s): {', '.join(missing)}. Fix the YAML or re-draft, "
-                    f"then try again."
+                    "The metric view YAML has problems that would fail at create: "
+                    + "; ".join(issues) + ". Fix the YAML or re-draft, then try again."
                 ),
-                "missing_columns": missing,
+                "issues": issues,
             }), 400
+
+    # Live dry-run in the real target schema. If it can't create here, surface
+    # the exact Spark error instead of a half-applied write. (Skips only on a
+    # CREATE-permission denial, which the real create below will surface anyway.)
+    dry = _dryrun_create_mv(user_w, yaml_body, warehouse_id, catalog_name, schema_name)
+    if not dry.get("ok"):
+        return jsonify({
+            "error": f"The metric view failed to create: {dry.get('error')}. Fix the YAML and retry.",
+            "dryrun_error": dry.get("error"),
+        }), 400
 
     # YAML may contain $$ — escape using a unique delimiter if collision
     delim = "$$"
@@ -4970,6 +5707,34 @@ def _snippet_entry(e, include_alias=True):
     return entry
 
 
+def _unresolved_data_plan_tables(eng, user_w, warehouse_id):
+    """Return the list of in-scope data-plan tables/MVs that don't resolve under
+    the user's grants. Pushing a space whose data_sources reference a dropped or
+    renamed table makes the Genie API fail with a confusing PERMISSION_DENIED /
+    'table does not exist' wall of text — this lets the caller turn that into a
+    clear, actionable message naming the offending tables. Best-effort: needs a
+    warehouse; returns [] if it can't check (so it never blocks a valid push)."""
+    if not (user_w and warehouse_id):
+        return []
+    s4 = eng["sessions"]["4"]
+    fqns = [
+        (d.get("table_or_view") or "").strip()
+        for d in s4.get("data_plan", [])
+        if d.get("include_in_space") == "Yes" and (d.get("table_or_view") or "").count(".") == 2
+    ]
+    missing = []
+    for fqn in fqns:
+        c, s, t = fqn.split(".")
+        ok, err = _exec_ok_obo(user_w, f"DESCRIBE TABLE `{c}`.`{s}`.`{t}`", warehouse_id)
+        # Only flag definitive "not found" — leave permission/other errors to the
+        # Genie API so we don't false-block on a transient or access quirk.
+        if not ok and err and any(k in err.upper() for k in (
+                "TABLE_OR_VIEW_NOT_FOUND", "DOES NOT EXIST", "CANNOT BE FOUND",
+                "NOT_FOUND")):
+            missing.append(fqn)
+    return missing
+
+
 def _build_serialized_space(eng, plan):
     """Build the Genie serialized_space JSON from discovery data + edited plan.
     `plan` is a dict with: general_instructions, sample_questions,
@@ -4986,15 +5751,18 @@ def _build_serialized_space(eng, plan):
     joins_in = plan.get("joins") or []
     benchmarks_in = plan.get("benchmarks") or []
 
-    # Strip any sample or example that overlaps with a benchmark — benchmarks are
-    # the acceptance test, they MUST NOT appear as configured answers.
+    # Strip EXAMPLE QUERIES that overlap a benchmark — an example query carries
+    # the answer SQL, so pushing one that matches a benchmark would leak the
+    # acceptance test. sample_questions are NOT stripped (display-only prompts,
+    # no answer leak) — stripping them here was emptying the space's suggested
+    # questions even after we stopped stripping at plan-generation time. Keep the
+    # two paths consistent. (Kiara, 2026-06-11.)
     benchmark_qs = [
         (b.get("question") or "").strip()
         for b in benchmarks_in
         if (b.get("question") or "").strip()
     ]
     if benchmark_qs:
-        sample_questions = _strip_benchmark_overlap(sample_questions, benchmark_qs)
         example_queries = [
             eq for eq in example_queries
             if not _question_overlaps(eq.get("question", ""), benchmark_qs)
@@ -5302,6 +6070,20 @@ def push_to_genie(eid):
 
     if not warehouse_id:
         return jsonify({"error": "warehouse_id is required"}), 400
+
+    # Preflight: a data-plan table that was deleted/renamed makes the Genie API
+    # fail with a confusing PERMISSION_DENIED/'table does not exist' error.
+    # Catch it here and return a clear, actionable message instead.
+    missing_tables = _unresolved_data_plan_tables(eng, user_w, warehouse_id)
+    if missing_tables:
+        return jsonify({
+            "error": (
+                "These tables in your Session 4 data plan no longer exist (or were "
+                "renamed): " + ", ".join(missing_tables) + ". Remove them from the "
+                "data plan in Session 3/4 (or recreate them), then push again."
+            ),
+            "missing_tables": missing_tables,
+        }), 400
 
     try:
         serialized = _build_serialized_space(eng, plan)

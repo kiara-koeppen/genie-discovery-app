@@ -33,6 +33,19 @@ const TEXT_INSTR_COLS: ColumnDef[] = [
   { key: "instruction", label: "Instruction", type: "textarea" },
 ];
 
+// #7: analyst-authored example SQL queries (surfaced verbatim in the Genie space).
+const EXAMPLE_QUERY_COLS: ColumnDef[] = [
+  { key: "question", label: "Question", type: "textarea" },
+  { key: "sql", label: "Example SQL", type: "textarea" },
+  { key: "usage_guidance", label: "Usage Guidance (optional)", type: "textarea" },
+];
+
+// #2: clarifying / disambiguation questions Genie should ask on ambiguous terms.
+const CLARIFYING_COLS: ColumnDef[] = [
+  { key: "trigger", label: "When the user asks about…" },
+  { key: "clarification", label: "Genie should ask…", type: "textarea" },
+];
+
 const GAP_COLS: ColumnDef[] = [
   { key: "business_question", label: "Business Question", type: "textarea" },
   { key: "data_available", label: "Data Available?", width: 130, type: "select", options: ["Yes", "No", "Partial"] },
@@ -84,6 +97,7 @@ export default function Session3Form({
 }: Props) {
   const [joins, setJoins] = useState<{ table: string; keys: string }[]>([]);
   const [metricViews, setMetricViews] = useState<string[]>([]);
+  const [showRowFilterDdl, setShowRowFilterDdl] = useState(false);
 
   // Metric View builder state
   const [mvCatalogs, setMvCatalogs] = useState<string[]>([]);
@@ -123,6 +137,64 @@ export default function Session3Form({
     () => vocabTerms.filter((v: any) => (typeMap.get(v.business_term) || []).length > 0).length,
     [vocabTerms, typeMap],
   );
+
+  // Data Sources the analyst chose at the top of S3 (lives on S4's data_plan).
+  // Used to restrict the SQL Expressions table picker so they don't hunt the
+  // full catalog tree (#8). Includes tables + metric views that are in scope.
+  const dataSourceFqns = useMemo(
+    () =>
+      (session4Data?.data_plan || [])
+        .filter((d: any) => d.include_in_space === "Yes")
+        .map((d: any) => (d.table_or_view || "").trim())
+        .filter((t: string) => t && t.split(".").length === 3),
+    [session4Data],
+  );
+
+  // Build a starter UC row-filter DDL from the global filter + in-scope tables.
+  // This is the HARD-enforcement path (enforced on every query, any tool). It's
+  // a review-before-run template: column types are guessed (STRING) and every
+  // table is assumed to carry the referenced columns.
+  const rowFilterDdl = useMemo(() => {
+    const predicate = (data.global_filter || "").trim();
+    if (!predicate || dataSourceFqns.length === 0) return "";
+    // Extract candidate column names: identifiers that aren't SQL keywords and
+    // aren't inside string literals.
+    const KEYWORDS = new Set([
+      "and", "or", "not", "in", "is", "null", "like", "ilike", "rlike", "between",
+      "true", "false", "case", "when", "then", "else", "end", "cast", "as",
+      "current_date", "current_timestamp", "interval", "date", "timestamp",
+    ]);
+    const noStrings = predicate.replace(/'[^']*'/g, " ");
+    const cols = Array.from(
+      new Set(
+        (noStrings.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [])
+          .filter((t: string) => !KEYWORDS.has(t.toLowerCase()))
+          .filter((t: string) => !/^\d/.test(t)),
+      ),
+    );
+    if (cols.length === 0) return "";
+    // Define the function in the first data source's catalog.schema.
+    const [cat, sch] = dataSourceFqns[0].split(".");
+    const fnFqn = `\`${cat}\`.\`${sch}\`.genie_global_filter`;
+    const params = cols.map((c) => `${c} STRING`).join(", ");
+    const onCols = cols.join(", ");
+    const alters = dataSourceFqns
+      .map((fqn: string) => {
+        const [c, s, t] = fqn.split(".");
+        return `ALTER TABLE \`${c}\`.\`${s}\`.\`${t}\` SET ROW FILTER ${fnFqn} ON (${onCols});`;
+      })
+      .join("\n");
+    return [
+      "-- Hard enforcement (optional): a UC row filter is applied to EVERY query",
+      "-- against these tables, from any tool, per user. Review column names + types",
+      "-- (guessed STRING below) and confirm each table has these columns. Run as a",
+      "-- table owner. Docs: Row filters and column masks.",
+      `CREATE OR REPLACE FUNCTION ${fnFqn}(${params})`,
+      "  RETURN " + predicate + ";",
+      "",
+      alters,
+    ].join("\n");
+  }, [data.global_filter, dataSourceFqns]);
 
   // Derive unique tables from sql_expressions
   const selectedTables = useMemo(() => {
@@ -304,6 +376,35 @@ export default function Session3Form({
       onChange("text_instructions", res.instrs);
     }
   };
+
+  // Seed classifications from any Type set in Session 2. Runs only for terms
+  // that have an S2 `term_type` AND no existing S3 classification entry, so it
+  // never overrides a classification the analyst made (or cleared) here. Mirrors
+  // handleClassify so auto-rows (e.g. a Metric's SQL Expression row) get created.
+  useEffect(() => {
+    if (readOnly) return;
+    const existing = data.term_classifications || [];
+    const haveTerm = new Set(existing.map((c: any) => c.business_term));
+    const toSeed = vocabTerms.filter(
+      (v: any) => v.term_type && !haveTerm.has(v.business_term),
+    );
+    if (toSeed.length === 0) return;
+    const classifications = [...existing];
+    for (const v of toSeed) {
+      classifications.push({ business_term: v.business_term, types: [v.term_type] });
+    }
+    onChange("term_classifications", classifications);
+    const res = _reconcileAutoRows(
+      classifications,
+      data.sql_expressions || [],
+      data.text_instructions || [],
+    );
+    if (res.changed) {
+      onChange("sql_expressions", res.exprs);
+      onChange("text_instructions", res.instrs);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vocabTerms, readOnly]);
 
   // Load catalogs + warehouses once for the MV builder
   useEffect(() => {
@@ -952,12 +1053,19 @@ export default function Session3Form({
         </AccordionSummary>
         <AccordionDetails>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            A SQL boolean expression applied to every metric. Use for row-level
-            exclusions that apply across the board — e.g., excluding test rows,
-            voided records, or out-of-scope categories. This becomes the metric
-            view's top-level <code>filter:</code> and is included in the generate-plan prompt.
-            Leave blank if none apply.
+            A SQL boolean expression applied across the board — e.g., excluding
+            test rows, voided records, or out-of-scope categories. It becomes the
+            metric view's top-level <code>filter:</code> (hard) AND, when you generate
+            the plan in Session 5, a mandatory instruction + a filter on every example
+            query so Genie applies it to <strong>raw-table queries too</strong>, not just
+            the metric view. Leave blank if none apply.
           </Typography>
+          <Alert severity="info" sx={{ mb: 2 }}>
+            Instruction-level enforcement is best-effort — Genie usually honors it but
+            can miss it on novel questions. For <strong>guaranteed</strong> enforcement on
+            every query (any tool, per user), apply it as a Unity Catalog row filter on the
+            source tables. Use the generated DDL below as a starting point.
+          </Alert>
           <TextField
             fullWidth
             multiline
@@ -968,6 +1076,44 @@ export default function Session3Form({
             disabled={readOnly}
             sx={{ "& .MuiInputBase-input": { fontFamily: "monospace", fontSize: 13 } }}
           />
+          {(data.global_filter || "").trim() && dataSourceFqns.length > 0 && (
+            <Box sx={{ mt: 2 }}>
+              <Button
+                size="small"
+                variant="text"
+                onClick={() => setShowRowFilterDdl((v) => !v)}
+              >
+                {showRowFilterDdl ? "Hide" : "Show"} hard-enforcement DDL (UC row filter)
+              </Button>
+              {showRowFilterDdl && (
+                <Box sx={{ mt: 1 }}>
+                  <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 0.5 }}>
+                    <Button
+                      size="small"
+                      onClick={() => navigator.clipboard?.writeText(rowFilterDdl)}
+                    >
+                      Copy DDL
+                    </Button>
+                  </Box>
+                  <Box
+                    component="pre"
+                    sx={{
+                      bgcolor: "grey.50", border: "1px solid", borderColor: "divider",
+                      borderRadius: 1, p: 1.5, fontSize: 12, fontFamily: "monospace",
+                      overflowX: "auto", whiteSpace: "pre", m: 0,
+                    }}
+                  >
+                    {rowFilterDdl}
+                  </Box>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+                    Review before running: confirm the column list and types, and that every
+                    table actually has those columns. Run as a table owner. This changes the
+                    tables for ALL consumers, not just this Genie space.
+                  </Typography>
+                </Box>
+              )}
+            </Box>
+          )}
         </AccordionDetails>
       </Accordion>
 
@@ -989,10 +1135,81 @@ export default function Session3Form({
             <strong> Global Filter</strong> above — not per row. Rows are auto-added when you classify
             a term as Metric above.
           </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            <strong>Aggregate or a WHERE clause?</strong> An aggregate
+            (e.g. <code>COUNT(1)</code>, <code>SUM(paid_amount)</code>) becomes a measure.
+            A bare condition / WHERE-clause fragment also works
+            (e.g. <code>initial_decision = 'DENIED'</code>): the generator will either
+            fold it into the metric view's filter or count the matching rows as
+            <code> COUNT(1) FILTER (WHERE …)</code>, depending on how the metric reads.
+            You don't have to rewrite it as a SELECT.
+          </Typography>
+          {dataSourceFqns.length > 0 && (
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+              The Table picker is limited to your {dataSourceFqns.length} chosen
+              Data Source{dataSourceFqns.length === 1 ? "" : "s"}. Pick
+              <em> Browse all catalogs…</em> in the dropdown if you need another table.
+            </Typography>
+          )}
           <EditableTable
             columns={SQL_EXPR_COLS}
             rows={data.sql_expressions || []}
             onChange={(rows) => onChange("sql_expressions", rows)}
+            readOnly={readOnly}
+            restrictTables={dataSourceFqns}
+          />
+        </AccordionDetails>
+      </Accordion>
+
+      {/* ---- Example Queries (#7) ---- */}
+      <Accordion id="section-3-example-queries" defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="h6">Example Queries</Typography>
+            {(data.example_queries || []).length > 0 && (
+              <Chip label={`${(data.example_queries || []).length}`} size="small" variant="outlined" />
+            )}
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            When you already know the SQL for an important question, define it here
+            instead of forcing it into a metric or synonym. These are surfaced to
+            Genie verbatim as example queries (not drafts) when you generate the
+            plan in Session 5. Use fully qualified <code>catalog.schema.table</code>{" "}
+            names — example queries are standalone.
+          </Typography>
+          <EditableTable
+            columns={EXAMPLE_QUERY_COLS}
+            rows={data.example_queries || []}
+            onChange={(rows) => onChange("example_queries", rows)}
+            readOnly={readOnly}
+          />
+        </AccordionDetails>
+      </Accordion>
+
+      {/* ---- Clarifying Questions (#2) ---- */}
+      <Accordion id="section-3-clarifying-questions" defaultExpanded>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="h6">Clarifying Questions</Typography>
+            {(data.clarifying_questions || []).length > 0 && (
+              <Chip label={`${(data.clarifying_questions || []).length}`} size="small" variant="outlined" />
+            )}
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            For ambiguous terms, tell Genie to ask a follow-up before answering.
+            Example: when someone asks about <em>"service lines"</em>, Genie can ask
+            whether they mean <em>clinical</em> or <em>financial</em> service line.
+            These become clarification triggers in the space's instructions when you
+            generate the plan in Session 5.
+          </Typography>
+          <EditableTable
+            columns={CLARIFYING_COLS}
+            rows={data.clarifying_questions || []}
+            onChange={(rows) => onChange("clarifying_questions", rows)}
             readOnly={readOnly}
           />
         </AccordionDetails>
