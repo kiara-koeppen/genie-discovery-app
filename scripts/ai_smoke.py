@@ -144,10 +144,21 @@ def mv_create_check(app, profile, eid, warehouse, catalog, schema):
                       {"catalog": catalog, "schema": schema, "name": name,
                        "yaml": yaml_body, "warehouse_id": warehouse, "overwrite": True})
     if status == 200 and cr.get("success"):
-        # best-effort cleanup
-        _req("POST", f"{app}/api/engagements/{eid}/run-benchmark-sql", profile,
-             {"sql": f"DROP VIEW IF EXISTS {cr.get('fqn')}", "warehouse_id": warehouse})
-        return True, f"created+dropped {cr.get('fqn')}"
+        # Best-effort cleanup via the SQL API (the app's run-benchmark-sql is
+        # SELECT-only, so it can't DROP). Don't fail the check if cleanup fails.
+        fqn = cr.get("fqn")
+        try:
+            subprocess.run(
+                ["databricks", "api", "post", "/api/2.0/sql/statements",
+                 "--profile", profile, "--json",
+                 json.dumps({"warehouse_id": warehouse,
+                             "statement": f"DROP VIEW IF EXISTS {fqn}",
+                             "wait_timeout": "30s"})],
+                capture_output=True, text=True, timeout=60)
+            cleaned = "created+dropped"
+        except Exception:
+            cleaned = f"created (manual drop needed: {fqn})"
+        return True, f"{cleaned} {fqn}"
     return False, f"create HTTP {status}: {json.dumps(cr)[:200]}"
 
 
