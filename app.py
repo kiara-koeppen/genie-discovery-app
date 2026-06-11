@@ -3766,34 +3766,32 @@ def _do_generate_plan_inner(eid, eng, user_w, warehouse_id):
     example_queries = _norm_list(plan.get("example_queries"))
     narrative = str(plan.get("narrative", "")).strip()
 
-    # Belt-and-suspenders: strip any sample_questions / example_queries that
-    # overlap with Session 4 benchmark questions. Benchmarks are the acceptance
-    # test — they MUST NOT appear as configured answers, otherwise Genie just
-    # memorizes them and we lose drift-detection.
+    # Strip example_queries that overlap Session 4 benchmark questions: an
+    # example query carries the ANSWER SQL, so pre-loading one that matches a
+    # benchmark would let Genie memorize the acceptance test and we'd lose
+    # drift-detection.
+    #
+    # sample_questions are NOT stripped. They are display-only prompts shown to
+    # users when they open the space — they contain no SQL/answer, so resembling
+    # a benchmark question leaks nothing. Stripping them used to empty the
+    # space's suggested-questions list whenever benchmarks were drawn from the
+    # question bank (the common case), which looked broken. (Kiara, 2026-06-11.)
     benchmark_qs = [
         (b.get("question") or "").strip()
         for b in s4.get("benchmark_questions", [])
         if (b.get("question") or "").strip()
     ]
     if benchmark_qs:
-        before_sq = len(sample_questions)
-        sample_questions = _strip_benchmark_overlap(sample_questions, benchmark_qs)
-        stripped_sq = before_sq - len(sample_questions)
-
         before_eq = len(example_queries)
         example_queries = [
             eq for eq in example_queries
             if not _question_overlaps(eq.get("question", ""), benchmark_qs)
         ]
         stripped_eq = before_eq - len(example_queries)
-
-        if stripped_sq:
-            warnings.append(
-                f"Removed {stripped_sq} sample question(s) that overlapped with Session 4 benchmarks."
-            )
         if stripped_eq:
             warnings.append(
-                f"Removed {stripped_eq} example query/queries that overlapped with Session 4 benchmarks."
+                f"Removed {stripped_eq} example query/queries that overlapped with Session 4 "
+                f"benchmarks (kept all sample questions — those are display-only)."
             )
 
     # Fetch UC PK/FK joins for tables in Session 4's data plan (NOT LLM-generated).
@@ -5119,6 +5117,80 @@ def _dryrun_create_mv(user_w, yaml_body, warehouse_id, catalog, schema):
     return {"ok": True, "error": None, "skipped": None}
 
 
+def _exec_ok_obo(user_w, stmt, warehouse_id):
+    """Run a statement via OBO; return (ok, error_message). Never raises."""
+    try:
+        resp = user_w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id, statement=stmt, wait_timeout="50s",
+        )
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    state = str(resp.status.state) if resp.status else ""
+    if "SUCCEEDED" in state:
+        return True, None
+    err = resp.status.error.message if (resp.status and resp.status.error) else f"state={state}"
+    return False, err
+
+
+def _validate_mv_via_select(user_w, yaml_text, warehouse_id):
+    """Compile-check a metric view's expressions WITHOUT creating anything.
+
+    Runs each dimension set and measure set as a `LIMIT 0` SELECT against the
+    source table. This needs only SELECT on the source (which the analyst always
+    has — they picked the table), so unlike the scratch-create dry-run it NEVER
+    skips for permission reasons. Catches the real-world causes of "YAML errors
+    on upload": non-existent columns, invalid aggregate/expression syntax, type
+    errors, bad filter predicates.
+
+    Returns (errors, skipped_reason). errors is a list of Spark messages; empty
+    means every expression compiled. skipped_reason is set (errors empty) when
+    we couldn't run the check (joins/subquery source/no warehouse) and the
+    caller should rely on lint + the scratch dry-run instead.
+    """
+    if not (user_w and warehouse_id and yaml_text):
+        return [], "no warehouse/yaml"
+    try:
+        import yaml as pyyaml
+        doc = pyyaml.safe_load(yaml_text)
+    except Exception as e:
+        return [f"YAML does not parse: {e}"], None
+    if not isinstance(doc, dict):
+        return ["YAML root is not a mapping."], None
+    source = (doc.get("source") or "").strip()
+    # Only handle a plain three-part source with no joins — join semantics
+    # (source.col / alias.col) can't be replicated in a flat SELECT, so defer
+    # those to lint + the scratch-create dry-run to avoid false errors.
+    if source.count(".") != 2 or " " in source or doc.get("joins"):
+        return [], "joined or non-table source — using lint + dry-run instead"
+    c, s, t = source.split(".")
+    src = f"`{c}`.`{s}`.`{t}`"
+    filt = (doc.get("filter") or "").strip()
+    where = f" WHERE ({filt})" if filt else ""
+    errors = []
+
+    dims = [d for d in (doc.get("dimensions") or []) if isinstance(d, dict) and (d.get("expr") or "").strip()]
+    if dims:
+        sel = ", ".join(f"({d['expr']}) AS gdv_d{i}" for i, d in enumerate(dims))
+        ok, err = _exec_ok_obo(user_w, f"SELECT {sel} FROM {src}{where} LIMIT 0", warehouse_id)
+        if not ok:
+            errors.append(f"dimensions/filter failed to compile: {err}")
+
+    meas = [m for m in (doc.get("measures") or []) if isinstance(m, dict) and (m.get("expr") or "").strip()]
+    if meas:
+        sel = ", ".join(f"({m['expr']}) AS gdv_m{i}" for i, m in enumerate(meas))
+        # All-aggregate select with no GROUP BY returns one row — valid.
+        ok, err = _exec_ok_obo(user_w, f"SELECT {sel} FROM {src}{where} LIMIT 1", warehouse_id)
+        if not ok:
+            errors.append(f"measures/filter failed to compile: {err}")
+
+    if not dims and not meas and filt:
+        ok, err = _exec_ok_obo(user_w, f"SELECT 1 FROM {src}{where} LIMIT 0", warehouse_id)
+        if not ok:
+            errors.append(f"filter failed to compile: {err}")
+
+    return errors, None
+
+
 @app.route("/api/engagements/<eid>/mv-prompt-preview", methods=["GET"])
 def mv_prompt_preview(eid):
     """Debug: return the fully-assembled MV YAML prompt for this engagement."""
@@ -5255,6 +5327,38 @@ Return JSON with exactly: {{"yaml": "...", "source_table": "...", "suggested_nam
                 "Structural issues remain — review before creating: " + "; ".join(issues)
             )
     warnings.extend(lint_warn)
+
+    # Pass 1.5: COMPILE every expression with LIMIT-0 SELECTs against the source.
+    # Needs only SELECT (the analyst always has it), so unlike the scratch-create
+    # dry-run this NEVER skips for permissions — it's the workhorse that catches
+    # bad columns / invalid SQL before the analyst ever hits "Create" (the #1
+    # cause of "YAML errors on upload"). Up to 2 auto-fix attempts.
+    if not issues and warehouse_id:
+        for attempt in range(2):
+            sel_errors, sel_skipped = _validate_mv_via_select(user_w, yaml_text, warehouse_id)
+            if sel_skipped:
+                print(f"[draft-mv-yaml] select-compile skipped: {sel_skipped}", flush=True)
+                break
+            if not sel_errors:
+                break
+            print(f"[draft-mv-yaml] select-compile errors (attempt {attempt+1}): {sel_errors}", flush=True)
+            fixed = _fix_once(yaml_text, sel_errors, "mv-yaml-fix")
+            if not (fixed and fixed[0]):
+                warnings.append("Some expressions did not compile and the auto-fix failed: "
+                                + "; ".join(sel_errors) + " Review before creating.")
+                break
+            retry_issues, _ = _mv_issue_list(fixed[0], schemas)
+            if retry_issues:
+                warnings.append("Auto-fix introduced structural issues: " + "; ".join(retry_issues))
+                break
+            yaml_text, source_table, suggested_name = (
+                fixed[0], fixed[1] or source_table, fixed[2] or suggested_name)
+        else:
+            # Loop exhausted without a clean compile.
+            last_errors, _ = _validate_mv_via_select(user_w, yaml_text, warehouse_id)
+            if last_errors:
+                warnings.append("Expressions still fail to compile after auto-fix: "
+                                + "; ".join(last_errors) + " Review/edit before creating.")
 
     # Pass 2: LIVE validation — actually create the metric view (scratch name)
     # and drop it, so we KNOW it writes. Uses the source table's catalog.schema
