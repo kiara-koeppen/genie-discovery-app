@@ -115,12 +115,37 @@ TASKS = [
 ]
 
 
+def mv_create_check(app, token, eid, warehouse, catalog, schema):
+    """Draft the MV YAML AND actually create it in UC (scratch name), then drop
+    it. This is the check that matches the real-world failure: 'YAML that errors
+    on upload'. Returns (ok, detail)."""
+    state, result, error = run_job(app, token, "draft_mv_yaml", eid, warehouse)
+    if state != "succeeded":
+        return False, f"draft [{state}] {error}"
+    yaml_body = (result.get("yaml") or "").strip()
+    if not yaml_body:
+        return False, "draft produced empty yaml"
+    name = f"gdv_smoke_{int(time.time())}"
+    status, cr = _req("POST", f"{app}/api/engagements/{eid}/create-metric-view", token,
+                      {"catalog": catalog, "schema": schema, "name": name,
+                       "yaml": yaml_body, "warehouse_id": warehouse, "overwrite": True})
+    if status == 200 and cr.get("success"):
+        # best-effort cleanup
+        _req("POST", f"{app}/api/engagements/{eid}/run-benchmark-sql", token,
+             {"sql": f"DROP VIEW IF EXISTS {cr.get('fqn')}", "warehouse_id": warehouse})
+        return True, f"created+dropped {cr.get('fqn')}"
+    return False, f"create HTTP {status}: {json.dumps(cr)[:200]}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", required=True)
     ap.add_argument("--app", required=True)
     ap.add_argument("--eid", required=True)
     ap.add_argument("--warehouse", required=True)
+    ap.add_argument("--create-catalog", help="if set with --create-schema, also "
+                    "verify the drafted MV actually CREATEs in UC here")
+    ap.add_argument("--create-schema")
     args = ap.parse_args()
 
     token = get_token(args.profile)
@@ -137,6 +162,15 @@ def main():
         ok, detail = validator(result)
         all_ok = all_ok and ok
         print(f"{'PASS ' if ok else 'FAIL '} {label:18s} [{state}] {dt:5.1f}s  {detail}")
+
+    # The check that actually matches 'YAML errors on upload': create it for real.
+    if args.create_catalog and args.create_schema:
+        t0 = time.time()
+        ok, detail = mv_create_check(args.app, token, args.eid, args.warehouse,
+                                     args.create_catalog, args.create_schema)
+        all_ok = all_ok and ok
+        print(f"{'PASS ' if ok else 'FAIL '} {'MV creates in UC':18s} [create] {time.time()-t0:5.1f}s  {detail}")
+
     print("\n" + ("ALL AI FEATURES GREEN" if all_ok else "SOME AI FEATURES FAILED"))
     sys.exit(0 if all_ok else 1)
 
