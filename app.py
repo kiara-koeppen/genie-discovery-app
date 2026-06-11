@@ -5751,15 +5751,18 @@ def _build_serialized_space(eng, plan):
     joins_in = plan.get("joins") or []
     benchmarks_in = plan.get("benchmarks") or []
 
-    # Strip any sample or example that overlaps with a benchmark — benchmarks are
-    # the acceptance test, they MUST NOT appear as configured answers.
+    # Strip EXAMPLE QUERIES that overlap a benchmark — an example query carries
+    # the answer SQL, so pushing one that matches a benchmark would leak the
+    # acceptance test. sample_questions are NOT stripped (display-only prompts,
+    # no answer leak) — stripping them here was emptying the space's suggested
+    # questions even after we stopped stripping at plan-generation time. Keep the
+    # two paths consistent. (Kiara, 2026-06-11.)
     benchmark_qs = [
         (b.get("question") or "").strip()
         for b in benchmarks_in
         if (b.get("question") or "").strip()
     ]
     if benchmark_qs:
-        sample_questions = _strip_benchmark_overlap(sample_questions, benchmark_qs)
         example_queries = [
             eq for eq in example_queries
             if not _question_overlaps(eq.get("question", ""), benchmark_qs)
