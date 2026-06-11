@@ -24,33 +24,47 @@ import urllib.request
 import urllib.error
 
 
-def get_token(profile):
-    out = subprocess.check_output(
-        ["databricks", "auth", "token", "--profile", profile], text=True
-    )
-    return json.loads(out)["access_token"]
+# Token cache. kk_test OAuth tokens are short-lived, so on a multi-minute run we
+# MUST refresh — otherwise polling/job-starts start returning 401 mid-test and
+# the run looks like an app failure when it isn't. Refresh on age and on any 401.
+_TOK = {"profile": None, "val": None, "ts": 0.0}
 
 
-def _req(method, url, token, body=None, timeout=120):
+def get_token(profile, force=False):
+    import time as _t
+    if force or _TOK["val"] is None or _TOK["profile"] != profile or (_t.time() - _TOK["ts"]) > 120:
+        out = subprocess.check_output(
+            ["databricks", "auth", "token", "--profile", profile], text=True)
+        _TOK.update(profile=profile, val=json.loads(out)["access_token"], ts=_t.time())
+    return _TOK["val"]
+
+
+def _req(method, url, profile, body=None, timeout=120, _retried=False):
+    """Make a request, always resolving a fresh token from `profile` (refreshes
+    on age and on 401) so long runs don't die on token expiry."""
+    tok = get_token(profile)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Authorization", f"Bearer {tok}")
     if data:
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
+        if e.code == 401 and not _retried:
+            get_token(profile, force=True)  # refresh + retry once
+            return _req(method, url, profile, body, timeout, _retried=True)
         try:
             return e.code, json.loads(e.read().decode())
         except Exception:
             return e.code, {"error": f"HTTP {e.code}"}
 
 
-def run_job(app, token, task_type, eid, warehouse, poll_timeout=240):
+def run_job(app, profile, task_type, eid, warehouse, poll_timeout=240):
     """Start an async job and poll to completion. Returns (state, result, error)."""
     status, resp = _req(
-        "POST", f"{app}/api/jobs/start", token,
+        "POST", f"{app}/api/jobs/start", profile,
         {"task_type": task_type,
          "payload": {"engagement_id": eid, "warehouse_id": warehouse}},
     )
@@ -60,7 +74,7 @@ def run_job(app, token, task_type, eid, warehouse, poll_timeout=240):
     deadline = time.time() + poll_timeout
     while time.time() < deadline:
         time.sleep(3)
-        s, jr = _req("GET", f"{app}/api/jobs/{job_id}", token)
+        s, jr = _req("GET", f"{app}/api/jobs/{job_id}", profile)
         state = jr.get("state", "")
         # Backend terminal states (see _run_job): success="done", failure="failed".
         if state == "done":
@@ -115,23 +129,23 @@ TASKS = [
 ]
 
 
-def mv_create_check(app, token, eid, warehouse, catalog, schema):
+def mv_create_check(app, profile, eid, warehouse, catalog, schema):
     """Draft the MV YAML AND actually create it in UC (scratch name), then drop
     it. This is the check that matches the real-world failure: 'YAML that errors
     on upload'. Returns (ok, detail)."""
-    state, result, error = run_job(app, token, "draft_mv_yaml", eid, warehouse)
+    state, result, error = run_job(app, profile, "draft_mv_yaml", eid, warehouse)
     if state != "succeeded":
         return False, f"draft [{state}] {error}"
     yaml_body = (result.get("yaml") or "").strip()
     if not yaml_body:
         return False, "draft produced empty yaml"
     name = f"gdv_smoke_{int(time.time())}"
-    status, cr = _req("POST", f"{app}/api/engagements/{eid}/create-metric-view", token,
+    status, cr = _req("POST", f"{app}/api/engagements/{eid}/create-metric-view", profile,
                       {"catalog": catalog, "schema": schema, "name": name,
                        "yaml": yaml_body, "warehouse_id": warehouse, "overwrite": True})
     if status == 200 and cr.get("success"):
         # best-effort cleanup
-        _req("POST", f"{app}/api/engagements/{eid}/run-benchmark-sql", token,
+        _req("POST", f"{app}/api/engagements/{eid}/run-benchmark-sql", profile,
              {"sql": f"DROP VIEW IF EXISTS {cr.get('fqn')}", "warehouse_id": warehouse})
         return True, f"created+dropped {cr.get('fqn')}"
     return False, f"create HTTP {status}: {json.dumps(cr)[:200]}"
@@ -148,12 +162,12 @@ def main():
     ap.add_argument("--create-schema")
     args = ap.parse_args()
 
-    token = get_token(args.profile)
+    get_token(args.profile)  # prime cache
     print(f"App: {args.app}\nEngagement: {args.eid}\nWarehouse: {args.warehouse}\n")
     all_ok = True
     for task_type, label, validator in TASKS:
         t0 = time.time()
-        state, result, error = run_job(args.app, token, task_type, args.eid, args.warehouse)
+        state, result, error = run_job(args.app, args.profile, task_type, args.eid, args.warehouse)
         dt = time.time() - t0
         if state != "succeeded":
             all_ok = False
@@ -166,7 +180,7 @@ def main():
     # The check that actually matches 'YAML errors on upload': create it for real.
     if args.create_catalog and args.create_schema:
         t0 = time.time()
-        ok, detail = mv_create_check(args.app, token, args.eid, args.warehouse,
+        ok, detail = mv_create_check(args.app, args.profile, args.eid, args.warehouse,
                                      args.create_catalog, args.create_schema)
         all_ok = all_ok and ok
         print(f"{'PASS ' if ok else 'FAIL '} {'MV creates in UC':18s} [create] {time.time()-t0:5.1f}s  {detail}")
