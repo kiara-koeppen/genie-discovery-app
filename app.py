@@ -5707,6 +5707,34 @@ def _snippet_entry(e, include_alias=True):
     return entry
 
 
+def _unresolved_data_plan_tables(eng, user_w, warehouse_id):
+    """Return the list of in-scope data-plan tables/MVs that don't resolve under
+    the user's grants. Pushing a space whose data_sources reference a dropped or
+    renamed table makes the Genie API fail with a confusing PERMISSION_DENIED /
+    'table does not exist' wall of text — this lets the caller turn that into a
+    clear, actionable message naming the offending tables. Best-effort: needs a
+    warehouse; returns [] if it can't check (so it never blocks a valid push)."""
+    if not (user_w and warehouse_id):
+        return []
+    s4 = eng["sessions"]["4"]
+    fqns = [
+        (d.get("table_or_view") or "").strip()
+        for d in s4.get("data_plan", [])
+        if d.get("include_in_space") == "Yes" and (d.get("table_or_view") or "").count(".") == 2
+    ]
+    missing = []
+    for fqn in fqns:
+        c, s, t = fqn.split(".")
+        ok, err = _exec_ok_obo(user_w, f"DESCRIBE TABLE `{c}`.`{s}`.`{t}`", warehouse_id)
+        # Only flag definitive "not found" — leave permission/other errors to the
+        # Genie API so we don't false-block on a transient or access quirk.
+        if not ok and err and any(k in err.upper() for k in (
+                "TABLE_OR_VIEW_NOT_FOUND", "DOES NOT EXIST", "CANNOT BE FOUND",
+                "NOT_FOUND")):
+            missing.append(fqn)
+    return missing
+
+
 def _build_serialized_space(eng, plan):
     """Build the Genie serialized_space JSON from discovery data + edited plan.
     `plan` is a dict with: general_instructions, sample_questions,
@@ -6039,6 +6067,20 @@ def push_to_genie(eid):
 
     if not warehouse_id:
         return jsonify({"error": "warehouse_id is required"}), 400
+
+    # Preflight: a data-plan table that was deleted/renamed makes the Genie API
+    # fail with a confusing PERMISSION_DENIED/'table does not exist' error.
+    # Catch it here and return a clear, actionable message instead.
+    missing_tables = _unresolved_data_plan_tables(eng, user_w, warehouse_id)
+    if missing_tables:
+        return jsonify({
+            "error": (
+                "These tables in your Session 4 data plan no longer exist (or were "
+                "renamed): " + ", ".join(missing_tables) + ". Remove them from the "
+                "data plan in Session 3/4 (or recreate them), then push again."
+            ),
+            "missing_tables": missing_tables,
+        }), 400
 
     try:
         serialized = _build_serialized_space(eng, plan)
