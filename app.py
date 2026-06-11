@@ -2956,7 +2956,7 @@ def _strip_benchmark_overlap(questions, benchmarks):
     return [q for q in questions if not _question_overlaps(q, benchmarks)]
 
 
-def _build_plan_prompt(eng, schemas=None, mv_definitions=None):
+def _build_plan_prompt(eng, schemas=None, mv_definitions=None, value_hints=""):
     """Build the LLM prompt from sessions 1-4 discovery data.
 
     `schemas`: optional {fqn: [(col, type), ...]} dict with real UC column
@@ -3168,6 +3168,8 @@ These are the ACTUAL columns that exist on each in-scope table (from UC DESCRIBE
 {joined_schemas}
 </table_schemas>
 """
+        if value_hints:
+            schemas_block += "\n" + value_hints + "\n"
 
     # ----- Classified synonyms block -----
     # In Session 3, the analyst classifies each business term and, for terms
@@ -3751,7 +3753,9 @@ def _do_generate_plan_inner(eid, eng, user_w, warehouse_id):
                 + ". Falling back to Session 3 YAML if available."
             )
 
-    prompt = _build_plan_prompt(eng, schemas=schemas, mv_definitions=mv_definitions)
+    value_hints = _categorical_value_hints(schemas, user_w, wh_to_use) if wh_to_use else ""
+    prompt = _build_plan_prompt(eng, schemas=schemas, mv_definitions=mv_definitions,
+                                value_hints=value_hints)
     plan = _call_llm(prompt, label="plan")
 
     # Normalize shape
@@ -4134,9 +4138,11 @@ def _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user
         if d.get("include_in_space") == "Yes" and (d.get("table_or_view") or "").count(".") == 2
     ]
     schema_blocks = []
+    schema_map = {}
     for t in in_scope_tables:
         cols = _describe_table_columns(t, user_w, warehouse_id) if warehouse_id else []
         if cols:
+            schema_map[t] = cols
             col_lines = "\n".join(f"  - {c[0]} ({c[1]})" for c in cols)
             schema_blocks.append(f"{t}:\n{col_lines}")
         else:
@@ -4144,6 +4150,11 @@ def _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user
             # below still instructs the LLM not to invent columns.
             schema_blocks.append(f"{t}:\n  (schema unavailable — be conservative with column references)")
     schemas_text = "\n\n".join(schema_blocks) if schema_blocks else "(no tables in scope)"
+    # Sample categorical values so the LLM maps e.g. 'Medicare' to the column
+    # that actually holds it (line_of_business) instead of guessing by name.
+    hints = _categorical_value_hints(schema_map, user_w, warehouse_id)
+    if hints:
+        schemas_text = schemas_text + "\n\n" + hints
 
     metric_lines = []
     for e in s3.get("sql_expressions", []):
@@ -4572,6 +4583,68 @@ def _collect_engagement_schemas(eng, user_w=None, warehouse_id=None):
     return {t: _describe_table_columns(t, user_w, warehouse_id) for t in sorted(tables)}
 
 
+# String types we sample for distinct values. Numeric/date/high-card columns
+# are skipped — we only want categorical hints.
+_STRING_TYPELIKE = ("string", "varchar", "char")
+_HINT_MAX_DISTINCT = 25   # treat as categorical only if <= this many distinct values
+_HINT_MAX_SHOWN = 15      # cap how many we list per column
+
+
+def _categorical_value_hints(schemas, user_w=None, warehouse_id=None, sample_rows=500):
+    """For each table's low-cardinality STRING columns, return a few distinct
+    sample VALUES so the LLM can map question terms to the RIGHT column (e.g.
+    knowing 'Medicare'/'Commercial' live in line_of_business, not plan_type).
+
+    `schemas` is {fqn: [(col, type), ...]}. Best-effort and SELECT-only: one
+    sampling query per table; any failure is skipped silently. Returns a
+    formatted text block ('' if nothing useful)."""
+    if not (user_w and warehouse_id and schemas):
+        return ""
+    lines = []
+    for fqn, cols in schemas.items():
+        if not cols or fqn.count(".") != 2:
+            continue
+        str_cols = [c for c, t in cols if any(k in (t or "").lower() for k in _STRING_TYPELIKE)]
+        if not str_cols:
+            continue
+        c, s, t = fqn.split(".")
+        sel = ", ".join(f"`{col}`" for col in str_cols)
+        stmt = f"SELECT {sel} FROM `{c}`.`{s}`.`{t}` LIMIT {sample_rows}"
+        try:
+            resp = user_w.statement_execution.execute_statement(
+                warehouse_id=warehouse_id, statement=stmt, wait_timeout="30s")
+            if "SUCCEEDED" not in (str(resp.status.state) if resp.status else ""):
+                continue
+            if not (resp.manifest and resp.result and resp.result.data_array):
+                continue
+            names = [cc.name for cc in resp.manifest.schema.columns]
+            distinct = {n: set() for n in names}
+            for row in resp.result.data_array:
+                for i, n in enumerate(names):
+                    v = row[i]
+                    if v is not None and v != "":
+                        distinct[n].add(str(v))
+        except Exception as e:
+            print(f"[value-hints] {fqn} sample failed: {type(e).__name__}: {e}", flush=True)
+            continue
+        col_hints = []
+        for n in names:
+            vals = sorted(distinct[n])
+            if 1 <= len(vals) <= _HINT_MAX_DISTINCT:
+                shown = ", ".join(vals[:_HINT_MAX_SHOWN])
+                col_hints.append(f"  - {n}: {shown}")
+        if col_hints:
+            lines.append(f"`{fqn}`:\n" + "\n".join(col_hints))
+    if not lines:
+        return ""
+    return (
+        "## Categorical column VALUES (sampled — use these to map question terms "
+        "to the RIGHT column; a value like 'Medicare' belongs to whichever column "
+        "below actually lists it, NOT one whose name merely sounds similar)\n"
+        + "\n".join(lines)
+    )
+
+
 def _build_mv_yaml_prompt(eng, user_w=None, warehouse_id=None):
     """Build the LLM prompt to draft a UC Metric View YAML from Sessions 1-3."""
     s1 = eng["sessions"]["1"]
@@ -4666,6 +4739,10 @@ def _build_mv_yaml_prompt(eng, user_w=None, warehouse_id=None):
         col_str = ", ".join(f"{c} {t}" for c, t in cols)
         lines.append(f"- `{fqn}`: {col_str}")
     lines.append("")
+    _mv_hints = _categorical_value_hints(schemas, user_w, warehouse_id)
+    if _mv_hints:
+        lines.append(_mv_hints)
+        lines.append("")
     lines.append("## Analyst-mapped SQL Expressions (THE CORE INPUT)")
     for e in s3.get("sql_expressions", []):
         lines.append(
