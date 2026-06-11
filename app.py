@@ -3359,14 +3359,21 @@ def _trunc(s, max_chars=MAX_CELL_CHARS):
 # Realistic max output tokens per task. Sonnet emits ~50 tok/sec, so 16K
 # tokens = 5+ min worst case (the timeout cliff). Right-sizing per task is
 # the single biggest speedup lever.
+# NOTE: _call_llm auto-retries once with a doubled budget if a JSON response
+# comes back truncated (finish_reason='length'), so these are starting points,
+# not hard ceilings. They're sized so the COMMON case fits in one call — the
+# retry is a safety net for unusually large engagements, not the happy path.
+# Several of these were previously too small (benchmark-draft 3000 for 12
+# questions WITH SQL; plan 10000 for a full structured config), which truncated
+# the JSON and made the feature appear broken.
 TASK_MAX_TOKENS = {
     "brief":              16000,  # citation-heavy markdown + structured gaps trailer
-    "plan":               10000,  # large structured JSON (filters/dimensions/measures/example_queries/narrative)
-    "mv-yaml":             6000,  # YAML output, typically 2-3K tokens
-    "mv-yaml-fix":         6000,  # retry with corrected columns
-    "benchmark-draft":     3000,  # 12 questions, ~1-2K tokens
-    "benchmark-sql":       1500,  # one SQL query
-    "benchmark-sql-fix":   1500,  # retry with error context
+    "plan":               16000,  # large structured JSON (filters/dimensions/measures/example_queries/narrative)
+    "mv-yaml":             8000,  # YAML output, typically 2-3K tokens but joins/many measures grow it
+    "mv-yaml-fix":         8000,  # retry with corrected columns
+    "benchmark-draft":     8000,  # 12 questions, each with expected SQL — 3000 truncated mid-JSON
+    "benchmark-sql":       2000,  # one SQL query
+    "benchmark-sql-fix":   2000,  # retry with error context
     "benchmark-summary":    600,  # one-paragraph plain English
 }
 DEFAULT_MAX_TOKENS = 8000
@@ -3409,7 +3416,8 @@ def _max_tokens_for(label, override=None):
     return TASK_MAX_TOKENS.get(label, DEFAULT_MAX_TOKENS)
 
 
-def _call_llm_raw(prompt, max_tokens=None, model=None, label=None, retries=2):
+def _call_llm_raw(prompt, max_tokens=None, model=None, label=None, retries=2,
+                  return_meta=False):
     """Call the Databricks serving endpoint and return the raw text content (no JSON parse).
 
     Use this when the prompt asks for non-JSON output (e.g. markdown with a
@@ -3502,22 +3510,30 @@ def _call_llm_raw(prompt, max_tokens=None, model=None, label=None, retries=2):
     elif hasattr(resp, "as_dict"):
         d = resp.as_dict()
     else:
-        d = {"choices": [{"message": {"content": resp.choices[0].message.content}}]}
-    content = d["choices"][0]["message"]["content"]
+        d = {"choices": [{"message": {"content": resp.choices[0].message.content},
+                          "finish_reason": getattr(resp.choices[0], "finish_reason", None)}]}
+    choice0 = d["choices"][0]
+    content = choice0["message"]["content"]
+    # finish_reason == "length" means the model hit max_tokens and the output is
+    # truncated — for JSON tasks this is the #1 cause of a downstream parse
+    # failure, so surface it to the caller to drive a retry with a bigger budget.
+    finish_reason = choice0.get("finish_reason") or choice0.get("finishReason")
     elapsed = time.time() - started
-    print(f"[{tag}] done in {elapsed:.1f}s output_chars={len(content)} pt={prompt_tokens} ct={completion_tokens}", flush=True)
+    print(f"[{tag}] done in {elapsed:.1f}s output_chars={len(content)} "
+          f"finish={finish_reason} pt={prompt_tokens} ct={completion_tokens}", flush=True)
     _log_llm_usage(
         tag, endpoint, prompt_chars, len(content), int(elapsed * 1000),
         prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
         success=True,
     )
+    if return_meta:
+        return content, {"finish_reason": finish_reason, "max_tokens": resolved_max}
     return content
 
 
-def _call_llm(prompt, model=None, label=None, max_tokens=None):
-    """Call the LLM and return parsed JSON. Tolerates ```json fences."""
-    content = _call_llm_raw(prompt, model=model, label=label, max_tokens=max_tokens)
-    text = content.strip()
+def _strip_code_fences(text):
+    """Remove a leading ```json / ``` fence and trailing ``` if present."""
+    text = (text or "").strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text
         if text.endswith("```"):
@@ -3525,7 +3541,100 @@ def _call_llm(prompt, model=None, label=None, max_tokens=None):
         text = text.strip()
         if text.startswith("json"):
             text = text[4:].strip()
-    return json.loads(text)
+    return text
+
+
+def _extract_json_value(text):
+    """Pull the first complete top-level JSON object or array out of `text`,
+    even if the model wrapped it in prose ('Here is the JSON: {...} Hope this
+    helps!'). Scans for the first { or [ and returns the balanced span,
+    respecting strings and escapes. Returns None if no balanced value is found
+    (e.g. the output was truncated mid-structure)."""
+    if not text:
+        return None
+    start = None
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            start = i
+            break
+    if start is None:
+        return None
+    open_ch = text[start]
+    close_ch = "}" if open_ch == "{" else "]"
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None  # never closed -> truncated
+
+
+def _parse_llm_json(content):
+    """Best-effort parse of an LLM response into JSON. Tries, in order:
+    raw, fence-stripped, and balanced-span extraction. Raises ValueError with
+    a snippet if all fail."""
+    for candidate in (content, _strip_code_fences(content)):
+        try:
+            return json.loads((candidate or "").strip())
+        except (json.JSONDecodeError, TypeError):
+            pass
+    span = _extract_json_value(_strip_code_fences(content))
+    if span:
+        try:
+            return json.loads(span)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    raise ValueError(
+        "Could not parse a JSON object from the model response. "
+        f"First 300 chars: {(content or '')[:300]!r}"
+    )
+
+
+def _call_llm(prompt, model=None, label=None, max_tokens=None):
+    """Call the LLM and return parsed JSON.
+
+    Robust against the two failure modes that have repeatedly broken AI
+    features in production:
+      1. The model wraps the JSON in prose or fences -> tolerant extraction.
+      2. The output is truncated at max_tokens (finish_reason='length') so the
+         JSON is incomplete -> automatically retry ONCE with a doubled token
+         budget before giving up.
+    """
+    content, meta = _call_llm_raw(
+        prompt, model=model, label=label, max_tokens=max_tokens, return_meta=True,
+    )
+    try:
+        return _parse_llm_json(content)
+    except ValueError:
+        truncated = (meta.get("finish_reason") in ("length", "max_tokens"))
+        # Retry with a bigger budget when the response was cut off. This is the
+        # fix for "the AI feature works on small engagements but fails on big
+        # ones" — the JSON was simply truncated.
+        if truncated:
+            bumped = min(int((meta.get("max_tokens") or 4000) * 2), 32000)
+            print(f"[{label or 'llm'}] output truncated (finish=length); "
+                  f"retrying once with max_tokens={bumped}", flush=True)
+            content2 = _call_llm_raw(
+                prompt, model=model, label=label, max_tokens=bumped,
+            )
+            return _parse_llm_json(content2)
+        raise
 
 
 def _do_generate_plan(eid, user_token, warehouse_id):
