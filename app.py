@@ -4107,6 +4107,26 @@ def draft_benchmark_sql(eid):
         return jsonify({"error": _user_error("draft-benchmark-sql sync", e)}), 500
 
 
+def _flag_empty_benchmark_result(validation, run_result):
+    """A benchmark query that runs cleanly but returns ZERO rows is a strong
+    signal the SQL is semantically wrong — most often a filter on the wrong
+    column (e.g. WHERE plan_type IN ('Medicare','Commercial') when those values
+    live in line_of_business). The execution 'succeeds', so without this the
+    analyst sees a green check on a query that answers nothing. Surface it as a
+    warning so a human verifies before it becomes an acceptance test."""
+    if not isinstance(run_result, dict):
+        return
+    if run_result.get("error"):
+        return
+    if (run_result.get("row_count") or 0) == 0:
+        validation["empty"] = True
+        validation["warning"] = (
+            "This query ran successfully but returned 0 rows. That usually means a "
+            "filter or column is wrong (e.g. filtering a category value against the "
+            "wrong column). Verify the columns and filter values before approving."
+        )
+
+
 def _do_draft_benchmark_sql_inner(question, warehouse_id, validate, s3, s4, user_w):
     in_scope_tables = [
         (d.get("table_or_view") or "").strip()
@@ -4252,6 +4272,7 @@ Return JSON: {{"sql": "the corrected SQL"}}. No markdown fences, no commentary."
                         validation["ran"] = True
                         validation["error"] = None
                         validation["sample_result"] = retry_run
+                        _flag_empty_benchmark_result(validation, retry_run)
                 else:
                     validation["error"] = err_msg
             except Exception as e:
@@ -4260,6 +4281,7 @@ Return JSON: {{"sql": "the corrected SQL"}}. No markdown fences, no commentary."
         else:
             validation["ran"] = True
             validation["sample_result"] = run_result
+            _flag_empty_benchmark_result(validation, run_result)
 
     # Second LLM call — summary is derived from the final SQL (post-retry if
     # applicable), not from the question. Guarantees the plain-English
