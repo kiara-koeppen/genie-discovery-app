@@ -4968,6 +4968,14 @@ def _expr_looks_like_predicate(expr):
     s = str(expr).strip()
     if _expr_has_aggregate(s):
         return False
+    # A CASE/IF/COALESCE/CAST expression (or anything with a function call that
+    # wraps a comparison) RETURNS A VALUE — it's a legitimate dimension, not a
+    # bare predicate. Without this guard, `CASE WHEN x = 'Y' THEN 'Yes' ELSE
+    # 'No' END` (a perfectly good categorical dimension) was wrongly flagged,
+    # producing noisy "looks like a filter" warnings on clean YAML.
+    if re.search(r"\b(CASE|IF|COALESCE|NULLIF|IFNULL|CAST|TRY_CAST|WHEN|THEN)\b",
+                 s, re.IGNORECASE):
+        return False
     # Remove string literals so operators inside strings don't trigger
     cleaned = re.sub(r"'[^']*'", " ", s)
     # Bare comparison / membership operators at the surface level
