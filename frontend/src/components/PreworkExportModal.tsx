@@ -2,24 +2,20 @@ import { useState, useEffect, useMemo } from "react";
 import {
   Dialog, DialogTitle, DialogContent, DialogActions, Button,
   Box, Typography, Checkbox, FormControlLabel, Stack, Alert, Chip,
+  ToggleButton, ToggleButtonGroup,
 } from "@mui/material";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
-import { api, BenchmarkQuestion } from "../api";
+import { api } from "../api";
 
-// Order and labels match the backend's _PREWORK_SHEETS (the only sections that
-// export to a clean tabular layout). Backend is authoritative; if you add a
-// section there, add it here too.
+// Order and labels match the backend's _PREWORK_SHEETS. Backend is
+// authoritative; if you add a section there, add it here too.
 const SECTION_LABELS: { key: string; label: string; session: number }[] = [
   { key: "business_context", label: "Business Context", session: 1 },
   { key: "pain_points", label: "Pain Points", session: 1 },
   { key: "existing_reports", label: "Existing Reports", session: 1 },
-  { key: "question_bank", label: "Question Bank", session: 2 },
   { key: "vocabulary_metrics", label: "Key Terms & Metrics", session: 2 },
+  { key: "question_bank", label: "Question Bank", session: 2 },
 ];
-
-// Export-only key for S4 benchmarks. Not in SECTION_LABELS because it isn't part
-// of the re-uploadable round-trip and carries a different data shape.
-const BENCHMARKS_KEY = "benchmarks";
 
 interface Props {
   open: boolean;
@@ -27,22 +23,20 @@ interface Props {
   /** Current S1/S2 data, keyed by section. Rows are exported verbatim (WYSIWYG
    *  with the open forms). */
   currentData: Record<string, Record<string, string>[]>;
-  /** Current S4 benchmark rows (export-only). */
-  benchmarks?: BenchmarkQuestion[];
   onClose: () => void;
 }
 
 export default function PreworkExportModal({
-  open, engagementId, currentData, benchmarks = [], onClose,
+  open, engagementId, currentData, onClose,
 }: Props) {
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
     for (const s of SECTION_LABELS) c[s.key] = (currentData[s.key] || []).length;
-    c[BENCHMARKS_KEY] = benchmarks.length;
     return c;
-  }, [currentData, benchmarks]);
+  }, [currentData]);
 
   const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [format, setFormat] = useState<"xlsx" | "csv">("xlsx");
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState("");
 
@@ -53,32 +47,20 @@ export default function PreworkExportModal({
     if (!open) return;
     const init: Record<string, boolean> = {};
     for (const s of SECTION_LABELS) init[s.key] = counts[s.key] > 0;
-    init[BENCHMARKS_KEY] = counts[BENCHMARKS_KEY] > 0;
     setSelected(init);
     setError("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const chosen = [
-    ...SECTION_LABELS.filter((s) => selected[s.key]).map((s) => s.key),
-    ...(selected[BENCHMARKS_KEY] ? [BENCHMARKS_KEY] : []),
-  ];
+  const chosen = SECTION_LABELS.filter((s) => selected[s.key]).map((s) => s.key);
 
   const doExport = async () => {
     setExporting(true);
     setError("");
     try {
       const data: Record<string, Record<string, string>[]> = {};
-      for (const k of chosen) {
-        if (k === BENCHMARKS_KEY) continue;
-        data[k] = currentData[k] || [];
-      }
-      await api.exportPrework(
-        engagementId,
-        chosen,
-        data,
-        selected[BENCHMARKS_KEY] ? benchmarks : undefined,
-      );
+      for (const k of chosen) data[k] = currentData[k] || [];
+      await api.exportPrework(engagementId, chosen, data, format);
       onClose();
     } catch (e: any) {
       setError(e?.message || "Export failed");
@@ -118,13 +100,28 @@ export default function PreworkExportModal({
 
   return (
     <Dialog open={open} onClose={exporting ? undefined : onClose} maxWidth="sm" fullWidth>
-      <DialogTitle>Export to Excel</DialogTitle>
+      <DialogTitle>Export</DialogTitle>
       <DialogContent dividers>
         <Typography variant="body2" sx={{ mb: 2 }}>
-          Choose which sections to export. Sessions 1 & 2 match the pre-work
-          template, so you can edit them and load them back via{" "}
-          <strong>Upload Pre-Work</strong>. Benchmarks are export-only.
+          Choose which sections to export. The <strong>.xlsx</strong> matches the pre-work
+          template, so you can edit it and load it back via <strong>Upload Pre-Work</strong>.
+          The <strong>.csv</strong> is a flat export for loading into Genie Code.
         </Typography>
+
+        <Box sx={{ mb: 2 }}>
+          <Typography variant="overline" color="text.secondary">Format</Typography>
+          <Box>
+            <ToggleButtonGroup
+              size="small"
+              exclusive
+              value={format}
+              onChange={(_, v) => { if (v) setFormat(v); }}
+            >
+              <ToggleButton value="xlsx">.xlsx (re-uploadable)</ToggleButton>
+              <ToggleButton value="csv">.csv (Genie Code)</ToggleButton>
+            </ToggleButtonGroup>
+          </Box>
+        </Box>
 
         <Typography variant="overline" color="text.secondary">
           Session 1 — Business Context
@@ -134,17 +131,10 @@ export default function PreworkExportModal({
         </Stack>
 
         <Typography variant="overline" color="text.secondary">
-          Session 2 — Questions & Vocabulary
-        </Typography>
-        <Stack sx={{ mb: 1.5, pl: 0.5 }}>
-          {SECTION_LABELS.filter((s) => s.session === 2).map(renderSection)}
-        </Stack>
-
-        <Typography variant="overline" color="text.secondary">
-          Session 4 — Design Review & Approval
+          Session 2 — Key Terms & Questions
         </Typography>
         <Stack sx={{ pl: 0.5 }}>
-          {renderSection({ key: BENCHMARKS_KEY, label: "Benchmarks" })}
+          {SECTION_LABELS.filter((s) => s.session === 2).map(renderSection)}
         </Stack>
 
         {error && (
@@ -163,7 +153,7 @@ export default function PreworkExportModal({
           onClick={doExport}
           disabled={exporting || chosen.length === 0}
         >
-          {exporting ? "Exporting…" : `Export ${chosen.length || ""} .xlsx`}
+          {exporting ? "Exporting…" : `Export .${format}`}
         </Button>
       </DialogActions>
     </Dialog>

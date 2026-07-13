@@ -1,5 +1,5 @@
 /* ------------------------------------------------------------------ */
-/* Data models matching the Delta tables                              */
+/* Data models matching the Delta tables (deterministic v2, 4 sessions) */
 /* ------------------------------------------------------------------ */
 
 export interface Engagement {
@@ -21,9 +21,6 @@ export interface SessionData {
   "2": Session2Data;
   "3": Session3Data;
   "4": Session4Data;
-  "5": Session5Data;
-  "6": Session6Data;
-  "7": Session7Data;
 }
 
 /* Session 1: Business Context Discovery */
@@ -51,9 +48,13 @@ export interface Session1Data {
   existing_reports: ExistingReport[];
 }
 
-/* Session 2: Questions & Vocabulary */
+/* Session 2: Key Terms & Metrics + Questions */
+export type QuestionType = "Benchmark" | "Testing" | "Out of scope" | "Clarifying";
+
 export interface QuestionBankEntry {
   question_text: string;
+  /** Benchmark | Testing | Out of scope | Clarifying (may be "" until flagged). */
+  type: string;
   decision_it_drives: string;
 }
 
@@ -64,46 +65,11 @@ export interface VocabMetricEntry {
 }
 
 export interface Session2Data {
-  question_bank: QuestionBankEntry[];
   vocabulary_metrics: VocabMetricEntry[];
+  question_bank: QuestionBankEntry[];
 }
 
-/* Session 3: Technical Design & Data Mapping */
-export interface TermClassification {
-  business_term: string;
-  types: string[];
-  /**
-   * Only populated when "Synonym" is in `types`. Tells the S5 prompt where to
-   * route this term's synonyms:
-   *   - kind="column": the term is another name for a specific column
-   *     (alternate column name). Pushed to column_configs on column_fqn.
-   *   - kind="value": the term is another name for a specific VALUE inside a
-   *     column (entity matching). Pushed to column_configs entity matching
-   *     on column_fqn for column_value.
-   *   - kind="cross_cutting": general team jargon with no specific column.
-   *     Falls back to general_instructions.
-   *
-   * If absent (legacy / unset), treated as cross_cutting for backward compat.
-   */
-  synonym_target?: SynonymTarget;
-}
-
-export interface SynonymTarget {
-  kind: "column" | "value" | "cross_cutting";
-  /** FQN of the column for "column" or "value" kind. Empty for "cross_cutting". */
-  column_fqn?: string;
-  /** For "value" kind only: which value the synonym refers to. */
-  column_value?: string;
-}
-
-export interface SqlExpression {
-  metric_name: string;
-  uc_table: string;
-  sql_code: string;
-  synonyms: string;
-  instructions: string;
-}
-
+/* Session 3: Technical Design (slimmed) */
 export interface TextInstruction {
   title: string;
   instruction: string;
@@ -122,22 +88,7 @@ export interface ScopeBoundary {
   notes: string;
 }
 
-export interface Session3Data {
-  term_classifications: TermClassification[];
-  sql_expressions: SqlExpression[];
-  text_instructions: TextInstruction[];
-  /** #7: analyst-authored example SQL queries, surfaced verbatim in the space. */
-  example_queries?: { question: string; sql: string; usage_guidance?: string }[];
-  /** #2: disambiguation prompts Genie should ask on ambiguous terms. */
-  clarifying_questions?: { trigger: string; clarification: string }[];
-  data_gaps: DataGap[];
-  scope_boundaries: ScopeBoundary[];
-  metric_view_yaml: string;
-  /** Backup of the prior YAML, written before an AI redraft so it can be restored. */
-  metric_view_yaml_previous?: string;
-}
-
-/* Session 4: COE Review */
+/** A source table/view the analyst identified for this engagement. */
 export interface DataPlanEntry {
   table_or_view: string;
   type: string;
@@ -145,87 +96,21 @@ export interface DataPlanEntry {
   notes: string;
 }
 
-export interface Session4Data {
-  analyst_commentary: string;
-  auto_summary: string;
+export interface Session3Data {
   data_plan: DataPlanEntry[];
+  plan_warehouse_id: string;
+  /** Free-text global filter comment for the Data Architect. */
+  global_filter: string;
+  text_instructions: TextInstruction[];
+  data_gaps: DataGap[];
+  scope_boundaries: ScopeBoundary[];
+}
+
+/* Session 4: COE Review (approval gate only) */
+export interface Session4Data {
   coe_approval_status: string;
   coe_approval_notes: string;
   coe_reviewer_email: string;
-}
-
-/* Session 5: Configure Genie Space */
-export interface Session5Data {
-  genie_space_id: string;
-  genie_space_config: string;
-  /** Backup snapshot of the plan_* fields, written immediately before a plan
-   *  regeneration so the analyst can restore the prior version. */
-  plan_previous?: Record<string, any>;
-  /** Section 5 acknowledgments gate (reviewed AI / won't share early / follow
-   *  best practices). accepted_at is set only when all three are checked, and
-   *  is what unlocks Prototype Review. */
-  acknowledgments?: {
-    reviewed_ai?: boolean;
-    no_share?: boolean;
-    best_practices?: boolean;
-    accepted_by?: string;
-    accepted_at?: string;
-  };
-}
-
-/* Session 6: Prototype Review */
-export interface PrototypeResult {
-  question_asked: string;
-  result: string;
-  pass_fail: string;
-  business_owner_reaction: string;
-  failure_diagnosis: string;
-  proposed_fix: string;
-}
-
-export interface FixEntry {
-  question: string;
-  failure_mode: string;
-  specific_fix: string;
-  priority: string;
-  fixed: string;
-}
-
-export interface Benchmark {
-  question: string;
-  expected_answer: string;
-  source_of_truth: string;
-  category: string;
-}
-
-export interface PhrasingNote {
-  original_phrasing: string;
-  rephrased_to: string;
-}
-
-export interface Session6Data {
-  prototype_results: PrototypeResult[];
-  fixes_log: FixEntry[];
-  benchmarks: Benchmark[];
-  phrasing_notes: PhrasingNote[];
-}
-
-/* Session 7: Production Review */
-export interface ProductionChecklistItem {
-  label: string;
-  done: boolean;
-  notes: string;
-}
-
-export interface Session7Data {
-  production_checklist: ProductionChecklistItem[];
-  /** Free-text notes on who SHOULD have access, for reconciliation against
-   *  the live Genie space ACL. */
-  prod_access_notes: string;
-  /** COE production sign-off (recorded only — does not gate anything). */
-  prod_approval_status: string;
-  prod_approval_notes: string;
-  prod_reviewer_email: string;
 }
 
 /* Editable table column config */
