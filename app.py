@@ -1538,12 +1538,17 @@ def download_prework_template():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": f"Failed to build template: {e}"}), 500
-    return send_file(
+    resp = send_file(
         buf,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         as_attachment=True,
         download_name="genie-discovery-bo-prework.xlsx",
     )
+    # The template lives at a fixed URL; without this the browser can serve a
+    # stale cached copy after the template format changes.
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.route("/api/engagements/<eid>/parse-prework", methods=["POST"])
