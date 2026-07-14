@@ -8,6 +8,7 @@ import HourglassTopIcon from "@mui/icons-material/HourglassTop";
 import PendingIcon from "@mui/icons-material/Pending";
 import SendIcon from "@mui/icons-material/Send";
 import { api } from "../api";
+import ReadinessSummary from "../components/ReadinessSummary";
 
 interface Props {
   data: Record<string, any>;
@@ -18,13 +19,18 @@ interface Props {
   engagementId?: string;
   isCoeMember?: boolean;
   isBoOnly?: boolean;
+  /** Sessions 1-3 drafts — read-only, feed the deterministic Readiness Summary. */
+  session1Data?: Record<string, any>;
+  session2Data?: Record<string, any>;
+  session3Data?: Record<string, any>;
   /** Reload the engagement after a status change so every surface reflects
    *  the server truth (status, reviewer, chip) without clobbering columns. */
   onReload?: () => void;
 }
 
 export default function Session4Form({
-  data, readOnly, engagementId, isCoeMember, isBoOnly, onReload,
+  data, readOnly, engagementId, isCoeMember, isBoOnly,
+  session1Data, session2Data, session3Data, onReload,
 }: Props) {
   const approvalStatus = data.coe_approval_status || "pending";
   const [approvalNotes, setApprovalNotes] = useState<string>(data.coe_approval_notes || "");
@@ -84,6 +90,9 @@ export default function Session4Form({
           {error}
         </Alert>
       )}
+
+      {/* Deterministic readiness brief, computed from Sessions 1-3 (no AI). */}
+      <ReadinessSummary s1={session1Data} s2={session2Data} s3={session3Data} />
 
       {/* Approval status */}
       <Box sx={{ mb: 2, display: "flex", alignItems: "center", gap: 2 }}>

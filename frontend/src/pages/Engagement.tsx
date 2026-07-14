@@ -543,6 +543,9 @@ export default function Engagement({ readOnly = false }: Props) {
         {tab === 3 && (
           <Session4Form
             {...sessionProps(4)}
+            session1Data={sessionDrafts[1]}
+            session2Data={sessionDrafts[2]}
+            session3Data={sessionDrafts[3]}
             engagementId={id}
             isCoeMember={isCoeMember}
             isBoOnly={isBoOnly}
