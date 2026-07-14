@@ -1219,6 +1219,29 @@ def _build_prework_template():
             ws.add_data_validation(dv)
             dv.add("B3:B200")
 
+        # Seed three question examples so the Type dropdown is visible in a
+        # populated cell (BOs otherwise miss the click-to-reveal dropdown) and
+        # the Clarification column's purpose is obvious. Parser skips these.
+        if sheet["key"] == "question_bank":
+            ws.cell(row=3, column=1, value="↓ EXAMPLES (delete these rows and replace with your own) ↓").font = (
+                Font(italic=True, color="888888", bold=True)
+            )
+            ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=4)
+            q_examples = [
+                ("What was our ED volume by site last month?", "Benchmark",
+                 "Staffing / capacity decisions", ""),
+                ("Do you mean inpatient or ED visits?", "Clarifying",
+                 "", "Ask: inpatient or ED encounters?"),
+                ("Can I see individual provider salaries?", "Out of scope",
+                 "", ""),
+            ]
+            for r_idx, (q, typ, dec, clar) in enumerate(q_examples, start=4):
+                for c_idx, val in enumerate((q, typ, dec, clar), start=1):
+                    cell = ws.cell(row=r_idx, column=c_idx, value=val)
+                    cell.font = Font(italic=True, color="888888")
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+                ws.row_dimensions[r_idx].height = 30
+
         # Seed three examples on the Key Terms & Metrics sheet to demonstrate
         # that BOTH metrics and vocabulary belong here. The parser detects and
         # skips these rows so they don't import as real data even if the BO
@@ -1434,11 +1457,11 @@ def _parse_prework_xlsx(file_bytes):
             )
             continue
 
-        # Identify the seeded-example rows on vocabulary_metrics so we don't
-        # import them. Triggered by an "EXAMPLES" banner in column A; the next
-        # three rows are skipped if they still hold the seeded values.
+        # Identify the seeded-example rows (Key Terms AND Question Bank) so we
+        # don't import them. Triggered by an "EXAMPLES" banner in column A; the
+        # next three rows are skipped.
         skip_rows = set()
-        if sheet_cfg["key"] == "vocabulary_metrics":
+        if sheet_cfg["key"] in ("vocabulary_metrics", "question_bank"):
             for r_idx in range(3, min(ws.max_row, 12) + 1):
                 v = ws.cell(row=r_idx, column=1).value
                 if isinstance(v, str) and "examples" in v.lower() and (
