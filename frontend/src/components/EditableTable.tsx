@@ -74,10 +74,27 @@ export default function EditableTable({ columns, rows, onChange, readOnly, restr
         <TableBody>
           {rows.map((row, idx) => (
             <TableRow key={idx} hover>
-              {columns.map((c) => (
+              {columns.map((c) => {
+                const forcedReadOnly =
+                  readOnly ||
+                  c.readOnlyField === true ||
+                  (typeof c.readOnlyField === "string" && !!row[c.readOnlyField]);
+                // enabledWhen: cell is active only when row[field] === equals.
+                const gatedOff = !!c.enabledWhen && row[c.enabledWhen.field] !== c.enabledWhen.equals;
+                return (
                 <TableCell key={c.key} sx={{ verticalAlign: "top", py: 0.75 }}>
-                  {readOnly || (c.readOnlyField === true) || (typeof c.readOnlyField === "string" && !!row[c.readOnlyField]) ? (
+                  {forcedReadOnly ? (
                     <span style={{ whiteSpace: "pre-wrap", fontSize: 14 }}>{row[c.key] || ""}</span>
+                  ) : gatedOff ? (
+                    <TextField
+                      size="small"
+                      fullWidth
+                      disabled
+                      value={row[c.key] || ""}
+                      placeholder="—"
+                      variant="outlined"
+                      sx={{ "& .MuiOutlinedInput-root": { fontSize: 14 } }}
+                    />
                   ) : c.type === "uc_table" ? (
                     <UCTablePicker
                       value={row[c.key] || ""}
@@ -146,7 +163,8 @@ export default function EditableTable({ columns, rows, onChange, readOnly, restr
                     />
                   )}
                 </TableCell>
-              ))}
+                );
+              })}
               {!readOnly && (
                 <TableCell sx={{ py: 0.75 }}>
                   <IconButton size="small" onClick={() => removeRow(idx)} color="error">

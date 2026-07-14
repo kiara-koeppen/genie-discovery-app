@@ -56,6 +56,9 @@ export interface QuestionBankEntry {
   /** Benchmark | Testing | Out of scope | Clarifying (may be "" until flagged). */
   type: string;
   decision_it_drives: string;
+  /** Only meaningful for Clarifying-type questions: the follow-up Genie should
+   *  ask back when the request is ambiguous. Blank/greyed for other types. */
+  clarification?: string;
 }
 
 export interface VocabMetricEntry {
@@ -86,6 +89,9 @@ export interface ScopeBoundary {
   item: string;
   in_scope: string;
   notes: string;
+  /** Set on rows auto-added from an S2 "Out of scope" question — holds the
+   *  source question text so re-opening S3 doesn't duplicate the row. */
+  oos_src?: string;
 }
 
 /** A source table/view the analyst identified for this engagement. */
@@ -121,4 +127,8 @@ export interface ColumnDef {
   type?: "text" | "textarea" | "select" | "uc_column" | "uc_table";
   options?: string[];
   readOnlyField?: boolean | string;
+  /** Cell is editable only when the row's `field` equals `equals`; otherwise it
+   *  renders greyed/disabled. Used e.g. so a Clarification cell is active only
+   *  on Clarifying-type question rows. */
+  enabledWhen?: { field: string; equals: string };
 }

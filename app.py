@@ -1102,11 +1102,12 @@ _PREWORK_SHEETS = [
         "name": "S2 Question Bank",
         "key": "question_bank",
         "session": 2,
-        "headers": ["Question", "Type", "Decision It Drives"],
-        "row_keys": ["question_text", "type", "decision_it_drives"],
+        "headers": ["Question", "Type", "Decision It Drives", "Clarification (Genie asks)"],
+        "row_keys": ["question_text", "type", "decision_it_drives", "clarification"],
         "instruction": ("Real questions your team needs answered. Flag each "
                         "question's Type (Benchmark, Testing, Out of scope, or "
-                        "Clarifying) and note the decision it helps you make."),
+                        "Clarifying), note the decision it helps you make, and for "
+                        "Clarifying questions fill the follow-up Genie should ask."),
     },
     {
         # Renamed from "Vocabulary & Metrics" in the app -- BOs were reading

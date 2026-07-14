@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import {
   Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert, Chip,
   TextField, List, ListItem, ListItemText,
@@ -45,6 +46,28 @@ export default function Session3Form({
   const reports = (session1Data?.existing_reports as any[]) || [];
   const terms = (session2Data?.vocabulary_metrics as any[]) || [];
   const panelReadOnly = readOnly || isBoOnly;
+
+  // Auto-populate Scope Boundaries from S2 "Out of scope" questions. Each
+  // auto-added row carries oos_src (the source question text) so re-opening S3
+  // never duplicates it; the analyst can edit item/notes freely. A row persists
+  // until the question's type is changed away from "Out of scope" in S2.
+  useEffect(() => {
+    if (panelReadOnly) return;
+    const oos = questions
+      .filter((q) => (q?.type || "") === "Out of scope")
+      .map((q) => (q.question_text || "").trim())
+      .filter(Boolean);
+    if (oos.length === 0) return;
+    const existing = (data.scope_boundaries as any[]) || [];
+    const haveSrc = new Set(existing.filter((r) => r?.oos_src).map((r) => r.oos_src));
+    const missing = oos.filter((q) => !haveSrc.has(q));
+    if (missing.length === 0) return;
+    const additions = missing.map((q) => ({
+      item: q, in_scope: "Out of Scope", notes: "", oos_src: q,
+    }));
+    onChange("scope_boundaries", [...existing, ...additions]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [questions, data.scope_boundaries, panelReadOnly]);
 
   return (
     <Box>
@@ -215,8 +238,10 @@ export default function Session3Form({
         </AccordionSummary>
         <AccordionDetails>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            What this space will and won't cover. Out-of-scope areas here should line up with
-            the "Out of scope" questions flagged in Session 2.
+            What this space will and won't cover. Questions flagged{" "}
+            <strong>Out of scope</strong> in Session 2 are added here automatically
+            (Scope = Out of Scope) — edit the notes/redirect, or change a question's
+            type in Session 2 to remove its row.
           </Typography>
           <EditableTable
             columns={SCOPE_COLS}

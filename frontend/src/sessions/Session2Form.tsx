@@ -11,6 +11,9 @@ const QUESTION_COLS: ColumnDef[] = [
   { key: "question_text", label: "Question", type: "textarea" },
   { key: "type", label: "Type", width: 150, type: "select", options: QUESTION_TYPE_OPTIONS },
   { key: "decision_it_drives", label: "Decision It Drives", type: "textarea" },
+  // Only active on Clarifying rows: the follow-up Genie should ask back.
+  { key: "clarification", label: "Clarification (Genie asks)", type: "textarea",
+    enabledWhen: { field: "type", equals: "Clarifying" } },
 ];
 
 const VOCAB_COLS: ColumnDef[] = [
@@ -78,7 +81,9 @@ export default function Session2Form({ data, onChange, readOnly }: Props) {
             questions to exercise the space during MVP development.{" "}
             <strong>Out of scope</strong> — questions this space intentionally won't
             answer (these drive the general text instructions). <strong>Clarifying</strong>{" "}
-            — questions Genie should ask back when a request is ambiguous.
+            — ambiguous asks Genie should follow up on; for these, fill the{" "}
+            <strong>Clarification (Genie asks)</strong> column with the exact
+            follow-up question (it's greyed out for other types).
           </Typography>
           <EditableTable
             columns={QUESTION_COLS}
