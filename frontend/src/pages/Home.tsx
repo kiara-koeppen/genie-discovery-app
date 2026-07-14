@@ -18,17 +18,16 @@ const SESSION_LABELS = [
 ];
 
 // Status chip for an engagement card. Mirrors the engagement-page top chip
-// exactly. Active COE review states take precedence over the raw lifecycle so a
-// stale "complete" can't mask them. Two approval milestones: Section 4 COE
-// approval -> "COE Approved" (navy), Section 7 production sign-off ->
-// "Production Approved" (green, status === "complete"); S7 wins over S4.
+// exactly. Active COE review states take precedence over the raw lifecycle.
+// COE approval is the terminal milestone -> "Ready for Pilot" (green,
+// status === "ready_for_pilot"); piloting happens outside the app.
 function engagementStatusChip(
   e: Record<string, string>,
 ): { label: string; color: "default" | "warning" | "success" | "info" | "error" | "primary" } {
   if (e.coe_approval_status === "changes_requested") return { label: "Changes Requested", color: "error" };
   if (e.coe_approval_status === "ready_for_review") return { label: "Ready for COE Review", color: "info" };
-  if (e.status === "complete") return { label: "Production Approved", color: "success" };
-  if (e.coe_approval_status === "approved") return { label: "COE Approved", color: "primary" };
+  if (e.status === "ready_for_pilot" || e.status === "complete" || e.coe_approval_status === "approved")
+    return { label: "Ready for Pilot", color: "success" };
   if (e.status === "in_progress") return { label: "In Progress", color: "warning" };
   return { label: e.status?.replace("_", " ") || "draft", color: "default" };
 }

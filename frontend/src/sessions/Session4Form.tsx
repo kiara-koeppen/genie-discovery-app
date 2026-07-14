@@ -1,618 +1,72 @@
-import { useEffect, useState, useMemo, useRef } from "react";
+import { useState } from "react";
 import {
-  Typography, Box, Accordion, AccordionSummary, AccordionDetails, Alert,
-  TextField, Button, Chip, Paper, Divider, Stack, IconButton, MenuItem, Select,
-  Checkbox, CircularProgress, Tooltip, FormControlLabel, Switch,
-  Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions,
-  Table, TableHead, TableBody, TableRow, TableCell, InputLabel, FormControl,
+  Box, Typography, Alert, Chip, Button, Stack, TextField, Divider,
 } from "@mui/material";
-import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
-import PendingIcon from "@mui/icons-material/Pending";
 import ErrorIcon from "@mui/icons-material/Error";
-import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
-import AddIcon from "@mui/icons-material/Add";
-import DeleteIcon from "@mui/icons-material/Delete";
-import PlayArrowIcon from "@mui/icons-material/PlayArrow";
-import LockIcon from "@mui/icons-material/Lock";
-import SendIcon from "@mui/icons-material/Send";
 import HourglassTopIcon from "@mui/icons-material/HourglassTop";
-import ReactMarkdown from "react-markdown";
-import EditableTable from "../components/EditableTable";
-import ExpandableTextField from "../components/ExpandableTextField";
-import { api, pollJob, BenchmarkQuestion, BriefGap, AnalystCommentary } from "../api";
-import type { ColumnDef } from "../types";
-
-// --- Gap-matching helpers (for preserving analyst responses across regenerations) ---
-function slug(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-}
-function tokens(s: string): Set<string> {
-  return new Set(s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter(Boolean));
-}
-function jaccard(a: Set<string>, b: Set<string>): number {
-  if (!a.size && !b.size) return 0;
-  let inter = 0;
-  a.forEach((t) => b.has(t) && inter++);
-  return inter / (a.size + b.size - inter);
-}
-function findCarryoverKey(
-  gapId: string,
-  gapTitle: string,
-  oldResponses: Record<string, string>,
-  oldTitleByKey: Record<string, string>,
-): string | null {
-  if (oldResponses[gapId]) return gapId;
-  const newTokens = tokens(gapTitle);
-  let bestKey: string | null = null;
-  let bestScore = 0;
-  for (const k of Object.keys(oldResponses)) {
-    const oldTitle = oldTitleByKey[k] || k.replace(/-/g, " ");
-    const score = jaccard(newTokens, tokens(oldTitle));
-    if (score > bestScore) {
-      bestScore = score;
-      bestKey = k;
-    }
-  }
-  return bestScore >= 0.5 ? bestKey : null;
-}
-function normalizeCommentary(raw: any): AnalystCommentary {
-  if (!raw) return { gap_responses: {}, resolved_gaps: {} };
-  if (typeof raw === "string") {
-    // Frontend received a string somehow (legacy load path). Preserve text.
-    return { gap_responses: {}, resolved_gaps: {}, legacy_notes: raw };
-  }
-  return {
-    gap_responses: raw.gap_responses || {},
-    resolved_gaps: raw.resolved_gaps || {},
-    legacy_notes: raw.legacy_notes || undefined,
-  };
-}
-
-const DATA_PLAN_COLS: ColumnDef[] = [
-  { key: "table_or_view", label: "Table / Metric View", type: "uc_table" },
-  { key: "type", label: "Type", width: 140, type: "select", options: ["Table", "Metric View"] },
-  { key: "include_in_space", label: "Include in Genie Space?", width: 160, type: "select", options: ["Yes", "No", "TBD"] },
-  { key: "notes", label: "Notes", type: "textarea" },
-];
+import PendingIcon from "@mui/icons-material/Pending";
+import SendIcon from "@mui/icons-material/Send";
+import { api } from "../api";
+import ReadinessSummary from "../components/ReadinessSummary";
 
 interface Props {
   data: Record<string, any>;
-  onChange: (section: string, value: any) => void;
+  /** Present for interface parity with the other session forms; the COE gate
+   *  writes through dedicated endpoints + reload, not the session draft. */
+  onChange?: (section: string, value: any) => void;
   readOnly?: boolean;
+  engagementId?: string;
+  isCoeMember?: boolean;
+  isBoOnly?: boolean;
+  /** Sessions 1-3 drafts — read-only, feed the deterministic Readiness Summary. */
   session1Data?: Record<string, any>;
   session2Data?: Record<string, any>;
   session3Data?: Record<string, any>;
-  engagementId?: string;
-  isCoeMember?: boolean;
-  /** True when the caller is in the BO group AND not in COE. BO-only users see
-   *  most of S4 read-only; only the BO Approved benchmark checkboxes are
-   *  interactive (and they call the dedicated PATCH endpoint). */
-  isBoOnly?: boolean;
+  /** Reload the engagement after a status change so every surface reflects
+   *  the server truth (status, reviewer, chip) without clobbering columns. */
+  onReload?: () => void;
 }
 
 export default function Session4Form({
-  data, onChange, readOnly, session1Data, session2Data, session3Data, engagementId, isCoeMember, isBoOnly,
+  data, readOnly, engagementId, isCoeMember, isBoOnly,
+  session1Data, session2Data, session3Data, onReload,
 }: Props) {
-  // BO users render this whole section read-only EXCEPT the BO-Approved
-  // benchmark checkboxes (which are wired to a dedicated PATCH endpoint
-  // below). Combining with the existing `readOnly` prop catches both
-  // gating paths.
-  const sectionReadOnly = readOnly || !!isBoOnly;
-  // Only COE and BO group members can flip the BO Approved checkbox. Default
-  // analysts (not in either group) cannot. The checkbox calls a dedicated
-  // PATCH endpoint (api.setBenchmarkBoApproved) rather than going through
-  // the normal section save path so it doesn't conflict with optimistic
-  // locking on the rest of S4.
-  // BO-Approved is intentionally NOT gatekept by group — anyone who can view
-  // the engagement (and isn't in global read-only mode) can toggle it.
-  const canToggleBoApproved = !readOnly;
-  const [summary, setSummary] = useState("");
-  const [loadingSummary, setLoadingSummary] = useState(false);
-  const [briefError, setBriefError] = useState("");
-  const [briefElapsed, setBriefElapsed] = useState(0);
-  const [currentGaps, setCurrentGaps] = useState<BriefGap[]>([]);
-  const [approvalNotes, setApprovalNotes] = useState("");
-  const [draftingBenchmarks, setDraftingBenchmarks] = useState(false);
-  const [draftingSqlIdx, setDraftingSqlIdx] = useState<number | null>(null);
-  const [draftingAllSql, setDraftingAllSql] = useState(false);
-  const [showBenchmarkSql, setShowBenchmarkSql] = useState(true);
-  const [draftCount, setDraftCount] = useState(12);
-  const [draftReplaceOpen, setDraftReplaceOpen] = useState(false);
-  const [warehouses, setWarehouses] = useState<{ id: string; name: string }[]>([]);
-  const [benchmarkWarehouseId, setBenchmarkWarehouseId] = useState<string>("");
-  const [runningSqlIdx, setRunningSqlIdx] = useState<number | null>(null);
-  const [runningAllSql, setRunningAllSql] = useState(false);
-  const [refreshingSummaryIdx, setRefreshingSummaryIdx] = useState<number | null>(null);
-
   const approvalStatus = data.coe_approval_status || "pending";
-  const benchmarks: BenchmarkQuestion[] = data.benchmark_questions || [];
-  const approvedBenchmarkCount = benchmarks.filter(
-    (b) => b.bo_approved && b.question?.trim() && b.expected_sql?.trim(),
-  ).length;
-  const canApprove = approvedBenchmarkCount >= 5;
-
-  // Pre-populate data plan from Session 3 tables
-  const session3Tables = useMemo(() => {
-    const tables = new Set<string>();
-    (session3Data?.sql_expressions || []).forEach((e: any) => {
-      if (e.uc_table && e.uc_table.split(".").length === 3) tables.add(e.uc_table);
-    });
-    return Array.from(tables);
-  }, [session3Data]);
-
-  // Seed data plan from Session 3 tables on first mount, only if the analyst
-  // hasn't put a real table in any row yet. Ref guard prevents clobbering
-  // later edits when session3Tables re-computes.
-  const seeded = useRef(false);
-  useEffect(() => {
-    if (seeded.current) return;
-    if (session3Tables.length === 0) return;
-    const currentRows = data.data_plan || [];
-    const hasRealData = currentRows.some((r: any) => r.table_or_view);
-    if (hasRealData) {
-      seeded.current = true;
-      return;
-    }
-    const plan = session3Tables.map((t) => ({
-      table_or_view: t,
-      type: "Table",
-      include_in_space: "Yes",
-      notes: "",
-    }));
-    onChange("data_plan", plan);
-    seeded.current = true;
-  }, [session3Tables]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // When Session 3 records a created metric view, append it to the data plan
-  // (if not already present). Reactive — catches MVs created after S4 seeding.
-  const mvFqn = (session3Data?.metric_view_fqn || "").trim();
-  useEffect(() => {
-    if (!mvFqn) return;
-    const rows = data.data_plan || [];
-    const already = rows.some((r: any) => (r.table_or_view || "").trim() === mvFqn);
-    if (already) return;
-    const next = [
-      ...rows,
-      { table_or_view: mvFqn, type: "Metric View", include_in_space: "Yes", notes: "" },
-    ];
-    onChange("data_plan", next);
-  }, [mvFqn]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Current analyst commentary (always normalized to structured form)
-  const commentary: AnalystCommentary = useMemo(
-    () => normalizeCommentary(data.analyst_commentary),
-    [data.analyst_commentary],
-  );
-
-  // Reconcile gaps from a fresh brief against existing analyst responses.
-  // Carry forward responses where the gap still exists; archive disappeared
-  // gaps in resolved_gaps so the analyst's writeup isn't lost.
-  const reconcileGaps = (newGaps: BriefGap[]) => {
-    const oldResponses = commentary.gap_responses || {};
-    const oldResolved = commentary.resolved_gaps || {};
-    // We don't have old titles persisted (only IDs), so use ID as proxy when
-    // matching by Jaccard. This is good enough for slug-style IDs.
-    const oldTitleByKey: Record<string, string> = {};
-    for (const k of Object.keys(oldResponses)) oldTitleByKey[k] = k.replace(/-/g, " ");
-
-    const nextResponses: Record<string, string> = {};
-    const consumedOldKeys = new Set<string>();
-
-    for (const g of newGaps) {
-      const carryKey = findCarryoverKey(g.id, g.title, oldResponses, oldTitleByKey);
-      if (carryKey) {
-        nextResponses[g.id] = oldResponses[carryKey];
-        consumedOldKeys.add(carryKey);
-      } else {
-        nextResponses[g.id] = "";
-      }
-    }
-    // Anything in oldResponses that wasn't consumed -> archive into resolved_gaps
-    const nextResolved = { ...oldResolved };
-    for (const k of Object.keys(oldResponses)) {
-      if (consumedOldKeys.has(k)) continue;
-      const text = oldResponses[k];
-      if (!text || !text.trim()) continue; // don't archive empty placeholders
-      nextResolved[k] = {
-        title: oldTitleByKey[k] || k,
-        severity: "Unknown",
-        response: text,
-      };
-    }
-    onChange("analyst_commentary", {
-      gap_responses: nextResponses,
-      resolved_gaps: nextResolved,
-    });
-  };
-
-  // Fetch auto-summary via async job runner (avoids the gateway 60s timeout).
-  // The brief LLM call frequently exceeds 60s wall-clock, which would 504 if
-  // we held a single HTTP request open. Instead: kick off a background job,
-  // then poll a fast status endpoint until the brief is ready.
-  const fetchSummary = async () => {
-    if (!engagementId) return;
-    setLoadingSummary(true);
-    setBriefError("");
-    setBriefElapsed(0);
-    try {
-      const { job_id } = await api.startJob("readiness_brief", {
-        engagement_id: engagementId,
-      });
-      const res = await pollJob<{
-        summary: string;
-        unacknowledged_gaps?: BriefGap[];
-      }>(job_id, {
-        intervalMs: 2000,
-        onProgress: (s) => setBriefElapsed(s),
-      });
-      setSummary(res.summary);
-      onChange("auto_summary", res.summary);
-      const gaps = res.unacknowledged_gaps || [];
-      setCurrentGaps(gaps);
-      onChange("brief_unacknowledged_gaps", gaps);
-      reconcileGaps(gaps);
-    } catch (err: any) {
-      const msg = err?.message || String(err);
-      setBriefError(msg);
-      console.error("[readiness-brief] generate failed:", err);
-    }
-    setLoadingSummary(false);
-    setBriefElapsed(0);
-  };
-
-  // Format elapsed seconds as "0:42" / "1:15" for the button label.
-  const formatElapsed = (secs: number) => {
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${m}:${s.toString().padStart(2, "0")}`;
-  };
-
-  // Require some S1-S3 content before auto-firing brief generation. An empty
-  // engagement gives the LLM nothing to summarize and tends to 502 the model
-  // serving endpoint. User can still trigger manually via Generate Brief.
-  const hasMinimalContent = (
-    (session1Data?.business_context || []).some((q: any) => (q?.response || "").trim()) ||
-    (session2Data?.question_bank || []).some((q: any) => (q?.question_text || "").trim()) ||
-    (session3Data?.sql_expressions || []).length > 0
-  );
-  useEffect(() => {
-    if (data.auto_summary) setSummary(data.auto_summary);
-    if (data.brief_unacknowledged_gaps) setCurrentGaps(data.brief_unacknowledged_gaps);
-    if (!data.auto_summary && engagementId && hasMinimalContent) fetchSummary();
-  }, [engagementId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const updateGapResponse = (gapId: string, text: string) => {
-    onChange("analyst_commentary", {
-      ...commentary,
-      gap_responses: { ...(commentary.gap_responses || {}), [gapId]: text },
-    });
-  };
-
-  const severityColor = (s: string): "error" | "warning" | "info" | "default" => {
-    if (s === "High") return "error";
-    if (s === "Medium") return "warning";
-    if (s === "Low") return "info";
-    return "default";
-  };
-  const respondedCount = currentGaps.filter(
-    (g) => ((commentary.gap_responses || {})[g.id] || "").trim(),
-  ).length;
-  const resolvedEntries = Object.entries(commentary.resolved_gaps || {});
-
-  // Benchmark handlers
-  const updateBenchmark = (idx: number, field: keyof BenchmarkQuestion, value: any) => {
-    const next = [...benchmarks];
-    next[idx] = { ...next[idx], [field]: value };
-    onChange("benchmark_questions", next);
-  };
-  const removeBenchmark = (idx: number) =>
-    onChange("benchmark_questions", benchmarks.filter((_, i) => i !== idx));
-  const addBenchmark = () =>
-    onChange("benchmark_questions", [
-      ...benchmarks,
-      { question: "", category: "Core", difficulty: "Medium", expected_sql: "", notes: "", bo_approved: false },
-    ]);
-  // Load warehouses once for benchmark execution
-  useEffect(() => {
-    api.listWarehouses()
-      .then((ws) => setWarehouses(ws.map((w) => ({ id: w.id, name: w.name }))))
-      .catch(() => setWarehouses([]));
-  }, []);
-  useEffect(() => {
-    if (!benchmarkWarehouseId && warehouses.length > 0) setBenchmarkWarehouseId(warehouses[0].id);
-  }, [warehouses, benchmarkWarehouseId]);
-
-  const handleDraftBenchmarksClick = () => {
-    const hasExisting = benchmarks.some((b) => b.question?.trim());
-    if (hasExisting) {
-      setDraftReplaceOpen(true);
-    } else {
-      runDraftBenchmarks("replace");
-    }
-  };
-  const runDraftBenchmarks = async (mode: "replace" | "append") => {
-    if (!engagementId) return;
-    setDraftReplaceOpen(false);
-    setDraftingBenchmarks(true);
-    try {
-      const res = await api.draftBenchmarks(engagementId, draftCount);
-      const incoming = res.benchmarks || [];
-      onChange(
-        "benchmark_questions",
-        mode === "replace" ? incoming : [...benchmarks, ...incoming],
-      );
-    } catch (err) {
-      console.error(err);
-    }
-    setDraftingBenchmarks(false);
-  };
-  const runBenchmarkSql = async (idx: number) => {
-    if (!engagementId) return;
-    const b = benchmarks[idx];
-    const sql = b?.expected_sql?.trim();
-    if (!sql) return;
-    if (!benchmarkWarehouseId) return;
-    setRunningSqlIdx(idx);
-    try {
-      const res = await api.runBenchmarkSql(engagementId, sql, benchmarkWarehouseId);
-      const sample = {
-        ran_at: new Date().toISOString(),
-        columns: res.columns || [],
-        rows: res.rows || [],
-        row_count: res.row_count || 0,
-        truncated: !!res.truncated,
-        limit: res.limit || 50,
-        error: res.error || "",
-      };
-      const next = [...benchmarks];
-      // 0 rows on a clean run is a likely wrong-column/filter bug — flag it.
-      const emptyOk = !res.error && (res.row_count || 0) === 0;
-      next[idx] = {
-        ...next[idx],
-        sample_result: sample,
-        validation_status: res.error ? "failed" : (emptyOk ? "empty" : "ok"),
-        validation_warning: emptyOk
-          ? "Ran but returned 0 rows — verify columns/filters before approving."
-          : "",
-      } as any;
-      onChange("benchmark_questions", next);
-    } catch (err: any) {
-      const sample = {
-        ran_at: new Date().toISOString(),
-        columns: [],
-        rows: [],
-        row_count: 0,
-        truncated: false,
-        limit: 50,
-        error: String(err?.message || err),
-      };
-      const next = [...benchmarks];
-      next[idx] = { ...next[idx], sample_result: sample, validation_status: "failed" } as any;
-      onChange("benchmark_questions", next);
-    }
-    setRunningSqlIdx(null);
-  };
-  const runAllBenchmarkSql = async () => {
-    if (!engagementId || !benchmarkWarehouseId) return;
-    setRunningAllSql(true);
-    const next = [...benchmarks];
-    for (let i = 0; i < next.length; i++) {
-      const b = next[i];
-      const sql = b?.expected_sql?.trim();
-      if (!sql) continue;
-      setRunningSqlIdx(i);
-      try {
-        const res = await api.runBenchmarkSql(engagementId, sql, benchmarkWarehouseId);
-        next[i] = {
-          ...next[i],
-          sample_result: {
-            ran_at: new Date().toISOString(),
-            columns: res.columns || [],
-            rows: res.rows || [],
-            row_count: res.row_count || 0,
-            truncated: !!res.truncated,
-            limit: res.limit || 50,
-            error: res.error || "",
-          },
-        } as any;
-      } catch (err: any) {
-        next[i] = {
-          ...next[i],
-          sample_result: {
-            ran_at: new Date().toISOString(),
-            columns: [],
-            rows: [],
-            row_count: 0,
-            truncated: false,
-            limit: 50,
-            error: String(err?.message || err),
-          },
-        } as any;
-      }
-      onChange("benchmark_questions", [...next]);
-    }
-    setRunningSqlIdx(null);
-    setRunningAllSql(false);
-  };
-  const refreshSummaryForRow = async (idx: number) => {
-    if (!engagementId) return;
-    const b = benchmarks[idx];
-    const q = b?.question?.trim();
-    const sql = b?.expected_sql?.trim();
-    if (!q || !sql) return;
-    setRefreshingSummaryIdx(idx);
-    try {
-      const res = await api.draftBenchmarkSummary(engagementId, q, sql);
-      if (res.explanation) {
-        const next = [...benchmarks];
-        next[idx] = { ...next[idx], notes: res.explanation };
-        onChange("benchmark_questions", next);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-    setRefreshingSummaryIdx(null);
-  };
-  const clearBenchmarkResult = (idx: number) => {
-    const next = [...benchmarks];
-    const { sample_result: _drop, ...rest } = (next[idx] as any) || {};
-    next[idx] = rest;
-    onChange("benchmark_questions", next);
-  };
-  // Translate the backend validation field into the row's sample_result + a
-  // small "validation_status" tag the UI uses for the per-row chip.
-  type ValidationField = Awaited<ReturnType<typeof api.draftBenchmarkSql>>["validation"];
-  const applyValidationToPatch = (
-    patch: Record<string, any>,
-    validation: ValidationField | undefined,
-  ) => {
-    if (!validation) {
-      patch.validation_status = "skipped"; // no warehouse selected, or backend skipped
-      return;
-    }
-    if (validation.ran && validation.sample_result) {
-      patch.sample_result = {
-        ...validation.sample_result,
-        ran_at: new Date().toISOString(),
-        error: "",
-      };
-      // A query that ran but returned 0 rows is a likely wrong-column/filter bug
-      // (the backend flags it). Surface it as a warning, not a clean pass.
-      if ((validation as any).empty || (validation.sample_result.row_count ?? 0) === 0) {
-        patch.validation_status = "empty";
-        patch.validation_warning = (validation as any).warning
-          || "Ran but returned 0 rows — verify columns/filters before approving.";
-      } else {
-        patch.validation_status = validation.retried ? "retried_ok" : "ok";
-        patch.validation_warning = "";
-      }
-    } else if (validation.error) {
-      patch.sample_result = {
-        ran_at: new Date().toISOString(),
-        columns: [],
-        rows: [],
-        row_count: 0,
-        truncated: false,
-        limit: 50,
-        error: validation.error,
-      };
-      patch.validation_status = "failed";
-    }
-  };
-
-  const draftSqlForRow = async (idx: number) => {
-    if (!engagementId) return;
-    const q = benchmarks[idx]?.question?.trim();
-    if (!q) return;
-    setDraftingSqlIdx(idx);
-    try {
-      const validate = !!benchmarkWarehouseId;
-      const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId, validate);
-      const existing = benchmarks[idx];
-      const patch: Record<string, any> = { expected_sql: res.sql };
-      // Only populate notes with the plain-English explanation if the analyst
-      // hasn't already written something there — never clobber their notes.
-      if (res.explanation && !existing?.notes?.trim()) {
-        patch.notes = res.explanation;
-      }
-      if (validate) applyValidationToPatch(patch, res.validation);
-      const next = [...benchmarks];
-      next[idx] = { ...existing, ...patch };
-      onChange("benchmark_questions", next);
-    } catch (err) {
-      console.error(err);
-    }
-    setDraftingSqlIdx(null);
-  };
-  const draftAllSql = async () => {
-    if (!engagementId) return;
-    setDraftingAllSql(true);
-    const next = [...benchmarks];
-
-    // Build the list of rows that actually need work, skipping already-filled
-    // ones up front so the concurrency window isn't wasted on no-ops.
-    const todo: number[] = [];
-    for (let i = 0; i < next.length; i++) {
-      const b = next[i];
-      const q = b.question?.trim();
-      if (!q) continue;
-      const hasSql = !!b.expected_sql?.trim();
-      const hasNotes = !!b.notes?.trim();
-      if (hasSql && hasNotes) continue;
-      todo.push(i);
-    }
-
-    // Process rows in concurrent batches. Each LLM call hits the gateway
-    // independently, so 12 rows × ~30-60s sequential = 6-12 minutes (well past
-    // any reasonable client timeout). With CONCURRENCY=4 the wall-clock time
-    // is ~3x faster. The cap is intentionally conservative — pushing too many
-    // simultaneous calls can trip endpoint concurrency limits.
-    const CONCURRENCY = 4;
-    const processOne = async (i: number) => {
-      const b = next[i];
-      const q = b.question!.trim();
-      const hasSql = !!b.expected_sql?.trim();
-      const hasNotes = !!b.notes?.trim();
-      try {
-        if (!hasSql) {
-          const validate = !!benchmarkWarehouseId;
-          const res = await api.draftBenchmarkSql(engagementId, q, benchmarkWarehouseId, validate);
-          const patch: Record<string, any> = { expected_sql: res.sql };
-          if (res.explanation && !hasNotes) patch.notes = res.explanation;
-          if (validate) applyValidationToPatch(patch, res.validation);
-          next[i] = { ...next[i], ...patch };
-        } else {
-          const res = await api.draftBenchmarkSummary(engagementId, q, b.expected_sql);
-          if (res.explanation) next[i] = { ...next[i], notes: res.explanation };
-        }
-        // Surface partial progress as each batch member completes.
-        onChange("benchmark_questions", [...next]);
-      } catch (err) {
-        console.error(err);
-      }
-    };
-
-    for (let start = 0; start < todo.length; start += CONCURRENCY) {
-      const batch = todo.slice(start, start + CONCURRENCY);
-      await Promise.all(batch.map(processOne));
-    }
-
-    setDraftingAllSql(false);
-  };
+  const [approvalNotes, setApprovalNotes] = useState<string>(data.coe_approval_notes || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
 
   const handleApproval = async (status: string) => {
     if (!engagementId) return;
+    setBusy(true);
+    setError("");
     try {
       await api.coeApprove(engagementId, { status, notes: approvalNotes });
-      onChange("coe_approval_status", status);
-      onChange("coe_approval_notes", approvalNotes);
-    } catch {
-      // handled silently
+      onReload?.();
+    } catch (e: any) {
+      setError(e?.message || "Failed to record the review decision.");
     }
+    setBusy(false);
   };
 
-  // Analyst action: flip status to 'ready_for_review' and notify the COE
-  // (Teams notification fires server-side, best-effort). Mirrors the new
-  // status into the session-4 draft so the next autosave stays consistent —
-  // the backend write is lock-free and doesn't bump updated_at.
-  const [requestingReview, setRequestingReview] = useState(false);
   const handleRequestReview = async () => {
     if (!engagementId) return;
-    setRequestingReview(true);
+    setBusy(true);
+    setError("");
     try {
       await api.requestReview(engagementId);
-      onChange("coe_approval_status", "ready_for_review");
-    } catch {
-      // best-effort; status chip simply won't advance on failure
+      onReload?.();
+    } catch (e: any) {
+      setError(e?.message || "Failed to submit for review.");
     }
-    setRequestingReview(false);
+    setBusy(false);
   };
 
   const statusChip = () => {
     switch (approvalStatus) {
       case "approved":
-        return <Chip icon={<CheckCircleIcon />} label="Approved" color="success" />;
+        return <Chip icon={<CheckCircleIcon />} label="Approved — Ready for Pilot" color="success" />;
       case "changes_requested":
         return <Chip icon={<ErrorIcon />} label="Changes Requested" color="warning" />;
       case "ready_for_review":
@@ -625,12 +79,22 @@ export default function Session4Form({
   return (
     <Box>
       <Alert severity="info" sx={{ mb: 2 }}>
-        <strong>COE Review:</strong> The analyst submits their work from Sessions 1-3 for Center of Excellence
-        approval. Include your commentary, review the data plan, and ensure metric views are addressed.
-        COE reviewers will approve or request changes before the Genie Space can be configured.
+        <strong>COE Review:</strong> The final gate before this engagement moves from dev to
+        production and into phased piloting. The analyst submits the work from Sessions 1-3;
+        a Center of Excellence reviewer approves it or requests changes. Approving marks the
+        engagement <strong>Ready for Pilot</strong>.
       </Alert>
 
-      {/* Approval Status */}
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError("")}>
+          {error}
+        </Alert>
+      )}
+
+      {/* Deterministic readiness brief, computed from Sessions 1-3 (no AI). */}
+      <ReadinessSummary s1={session1Data} s2={session2Data} s3={session3Data} />
+
+      {/* Approval status */}
       <Box sx={{ mb: 2, display: "flex", alignItems: "center", gap: 2 }}>
         <Typography variant="subtitle1"><strong>Approval Status:</strong></Typography>
         {statusChip()}
@@ -647,7 +111,7 @@ export default function Session4Form({
         </Alert>
       )}
 
-      {/* Analyst submit-for-review control. Available to anyone who can edit S4
+      {/* Analyst submit-for-review control. Available to anyone who can edit
           (not BO-only, not read-only). Hidden once the COE has approved. */}
       {!readOnly && !isBoOnly && approvalStatus !== "approved" && (
         <Box sx={{ mb: 2 }}>
@@ -659,7 +123,7 @@ export default function Session4Form({
                   color="inherit"
                   size="small"
                   startIcon={<SendIcon />}
-                  disabled={requestingReview}
+                  disabled={busy}
                   onClick={handleRequestReview}
                 >
                   Notify COE again
@@ -673,10 +137,10 @@ export default function Session4Form({
               <Button
                 variant="contained"
                 startIcon={<SendIcon />}
-                disabled={requestingReview}
+                disabled={busy}
                 onClick={handleRequestReview}
               >
-                {requestingReview ? "Submitting…" : "Mark Ready for COE Review"}
+                {busy ? "Submitting…" : "Mark Ready for COE Review"}
               </Button>
               <Typography variant="body2" color="text.secondary">
                 {approvalStatus === "changes_requested"
@@ -688,704 +152,46 @@ export default function Session4Form({
         </Box>
       )}
 
-      {/* Data Plan -- read-only mirror of what was picked in S3's Data Sources panel.
-          Authoring lives in S3; S4 just reviews + uses as input for the Readiness Brief. */}
-      <Accordion id="section-4-data-plan" defaultExpanded>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-            <Typography variant="h6">Data Plan</Typography>
-            <Chip
-              label={`${(data.data_plan || []).length} items`}
-              size="small"
-              variant="outlined"
-            />
-            <Chip
-              icon={<LockIcon sx={{ fontSize: 14 }} />}
-              label="Authored in Session 3"
-              size="small"
-              variant="outlined"
-            />
-          </Box>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Alert severity="info" sx={{ mb: 2 }}>
-            The data plan is now authored in Session 3's <strong>Data Sources</strong> panel.
-            This section shows what was picked, read-only. To add or remove tables / metric
-            views, switch back to Session 3.
-          </Alert>
-          <EditableTable
-            columns={DATA_PLAN_COLS}
-            rows={data.data_plan || []}
-            onChange={(rows) => onChange("data_plan", rows)}
-            readOnly={true}
-          />
-        </AccordionDetails>
-      </Accordion>
-
-      {/* Readiness Brief */}
-      <Accordion id="section-4-readiness-brief" defaultExpanded>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Stack direction="row" alignItems="center" spacing={1}>
-            <Typography variant="h6">Readiness Brief</Typography>
-            <Chip label="AI-generated" size="small" variant="outlined" icon={<AutoAwesomeIcon />} />
-          </Stack>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Citation-backed synthesis of Sessions 1-3 plus the Data Plan above. Includes coverage
-            analysis (which Question Bank items the design answers) and an explicit gaps section
-            that distinguishes analyst-acknowledged gaps from unacknowledged coverage failures.
-            Regenerate after any change to Sessions 1-3 or the Data Plan.
-          </Typography>
-          {!sectionReadOnly && (
-            <Button
-              size="small"
-              variant="outlined"
-              startIcon={loadingSummary ? <CircularProgress size={14} /> : <AutoAwesomeIcon />}
-              onClick={fetchSummary}
-              disabled={loadingSummary}
-              sx={{ mb: 2 }}
-            >
-              {loadingSummary
-                ? `Generating... ${formatElapsed(briefElapsed)}`
-                : (summary ? "Regenerate Brief" : "Generate Brief")}
-            </Button>
-          )}
-          {briefError && (
-            <Alert severity="error" sx={{ mb: 2 }} onClose={() => setBriefError("")}>
-              <strong>Brief generation failed:</strong>{" "}
-              <Box component="span" sx={{ fontFamily: "monospace", fontSize: 12 }}>
-                {briefError}
-              </Box>
-            </Alert>
-          )}
-          <Paper
-            variant="outlined"
-            sx={{
-              p: 3,
-              bgcolor: "grey.50",
-              fontSize: 14,
-              "& h1": { fontSize: "1.4rem", mt: 2, mb: 1 },
-              "& h2": { fontSize: "1.2rem", mt: 2.5, mb: 1, borderBottom: "1px solid", borderColor: "divider", pb: 0.5 },
-              "& h3": { fontSize: "1.05rem", mt: 2, mb: 0.5 },
-              "& p": { my: 1, lineHeight: 1.6 },
-              "& ul, & ol": { pl: 3, my: 1 },
-              "& li": { my: 0.25 },
-              "& code": { bgcolor: "grey.200", px: 0.5, borderRadius: 0.5, fontSize: "0.9em" },
-              "& pre": { bgcolor: "grey.900", color: "grey.100", p: 1.5, borderRadius: 1, overflowX: "auto" },
-              "& pre code": { bgcolor: "transparent", color: "inherit" },
-              "& strong": { fontWeight: 600 },
-            }}
-          >
-            {summary
-              ? <ReactMarkdown>{summary}</ReactMarkdown>
-              : <Typography variant="body2" color="text.secondary">No brief generated yet. Click Generate to synthesize Sessions 1-4 into a COE-ready brief.</Typography>}
-          </Paper>
-        </AccordionDetails>
-      </Accordion>
-
-      {/* Analyst Commentary -- structured gap responses */}
-      <Accordion id="section-4-analyst-commentary" defaultExpanded>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Stack direction="row" alignItems="center" spacing={1}>
-            <Typography variant="h6">Analyst Commentary</Typography>
-            {currentGaps.length > 0 && (
-              <Chip
-                label={`${respondedCount} of ${currentGaps.length} addressed`}
-                size="small"
-                color={respondedCount === currentGaps.length ? "success" : "default"}
-              />
-            )}
-          </Stack>
-        </AccordionSummary>
-        <AccordionDetails>
-          {commentary.legacy_notes && (
-            <Alert severity="info" variant="outlined" sx={{ mb: 2 }}>
-              <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Legacy Notes (read-only)</Typography>
-              <Typography
-                variant="body2"
-                sx={{ whiteSpace: "pre-wrap", fontStyle: "italic" }}
-              >
-                {commentary.legacy_notes}
-              </Typography>
-              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
-                This text was saved before the structured per-gap commentary was introduced.
-                Copy whatever's still relevant into the gap response cards below.
-              </Typography>
-            </Alert>
-          )}
-          {currentGaps.length === 0 ? (
-            <Alert severity="info" variant="outlined">
-              {summary
-                ? "The Readiness Brief did not surface any unacknowledged gaps. Nothing to comment on here -- you're good to proceed."
-                : "Generate the Readiness Brief above to surface gaps. Each unacknowledged gap will appear here as a card for you to respond to."}
-            </Alert>
-          ) : (
-            <>
-              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                Each unacknowledged gap from the Readiness Brief is below. Explain to the COE why
-                each gap exists, how it will be addressed, or why it can ship as-is. Your responses
-                are preserved when you regenerate the brief, even if titles shift slightly.
-              </Typography>
-              <Stack spacing={2}>
-                {currentGaps.map((g) => {
-                  const resp = (commentary.gap_responses || {})[g.id] || "";
-                  return (
-                    <Paper key={g.id} variant="outlined" sx={{ p: 2 }}>
-                      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
-                        <Chip label={g.severity} size="small" color={severityColor(g.severity)} />
-                        <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
-                          {g.title}
-                        </Typography>
-                      </Stack>
-                      {g.summary && (
-                        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                          {g.summary}
-                        </Typography>
-                      )}
-                      {g.citations && g.citations.length > 0 && (
-                        <Stack direction="row" spacing={0.5} sx={{ mb: 1.5, flexWrap: "wrap", gap: 0.5 }}>
-                          {g.citations.map((c, i) => (
-                            <Chip key={i} label={c} size="small" variant="outlined" sx={{ fontSize: 11 }} />
-                          ))}
-                        </Stack>
-                      )}
-                      <ExpandableTextField
-                        minRows={2}
-                        placeholder="How will this gap be addressed? Why is it acceptable to ship as-is? What's the analyst's take?"
-                        value={resp}
-                        onChange={(v) => updateGapResponse(g.id, v)}
-                        disabled={sectionReadOnly}
-                        dialogTitle={`Response: ${g.title}`}
-                      />
-                    </Paper>
-                  );
-                })}
-              </Stack>
-              {resolvedEntries.length > 0 && (
-                <Accordion sx={{ mt: 2 }}>
-                  <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-                    <Stack direction="row" alignItems="center" spacing={1}>
-                      <Typography variant="subtitle2" color="text.secondary">
-                        Resolved Gaps (archived)
-                      </Typography>
-                      <Chip label={resolvedEntries.length} size="small" />
-                    </Stack>
-                  </AccordionSummary>
-                  <AccordionDetails>
-                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-                      Gaps that were flagged in a previous brief but no longer appear. Your prior
-                      responses are preserved here for audit trail. Read-only.
-                    </Typography>
-                    <Stack spacing={1.5}>
-                      {resolvedEntries.map(([k, v]) => (
-                        <Paper key={k} variant="outlined" sx={{ p: 1.5, bgcolor: "grey.50" }}>
-                          <Typography variant="subtitle2">{v.title}</Typography>
-                          <Typography
-                            variant="body2"
-                            color="text.secondary"
-                            sx={{ mt: 0.5, whiteSpace: "pre-wrap" }}
-                          >
-                            {v.response}
-                          </Typography>
-                        </Paper>
-                      ))}
-                    </Stack>
-                  </AccordionDetails>
-                </Accordion>
-              )}
-            </>
-          )}
-        </AccordionDetails>
-      </Accordion>
-
-      {/* Benchmark Questions */}
-      <Accordion id="section-4-benchmarks" defaultExpanded>
-        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-          <Stack direction="row" alignItems="center" spacing={1}>
-            <Typography variant="h6">Benchmark Questions</Typography>
-            <Chip label={`${benchmarks.length} drafted`} size="small" variant="outlined" />
-            <Chip
-              label={`${approvedBenchmarkCount} BO-approved`}
-              size="small"
-              color={approvedBenchmarkCount >= 5 ? "success" : "default"}
-            />
-          </Stack>
-        </AccordionSummary>
-        <AccordionDetails>
-          <Alert severity="info" sx={{ mb: 2 }}>
-            These are the <strong>acceptance-test questions</strong> the Genie Space will be scored
-            against (target &gt;80% pass rate). The analyst, business owner, and COE reviewer must
-            agree on these before the space is built. They will NOT be pushed as sample questions
-            or example queries — the whole point is to measure whether Genie can answer them from
-            the other configured context. Minimum 5 BO-approved to unlock COE approval.
-          </Alert>
-
-          {!sectionReadOnly && (
-            <Stack direction="row" spacing={1} sx={{ mb: 2, flexWrap: "wrap", alignItems: "center" }}>
-              <TextField
-                size="small"
-                type="number"
-                label="# to draft"
-                value={draftCount}
-                onChange={(e) => {
-                  const n = parseInt(e.target.value, 10);
-                  if (Number.isFinite(n)) setDraftCount(Math.max(1, Math.min(50, n)));
-                }}
-                inputProps={{ min: 1, max: 50 }}
-                sx={{ width: 110 }}
-              />
-              <Button
-                variant="outlined"
-                size="small"
-                startIcon={draftingBenchmarks ? <CircularProgress size={14} /> : <AutoAwesomeIcon />}
-                onClick={handleDraftBenchmarksClick}
-                disabled={draftingBenchmarks}
-              >
-                {draftingBenchmarks ? "Drafting..." : `Draft ${draftCount} Benchmarks from Sessions 1-4`}
-              </Button>
-              <Button
-                variant="outlined"
-                size="small"
-                color="secondary"
-                startIcon={draftingAllSql ? <CircularProgress size={14} /> : <AutoAwesomeIcon />}
-                onClick={draftAllSql}
-                disabled={draftingAllSql || benchmarks.filter((b) => b.question?.trim() && (!b.expected_sql?.trim() || !b.notes?.trim())).length === 0}
-              >
-                {draftingAllSql ? "Drafting SQL..." : "Draft All Expected SQL"}
-              </Button>
-              <Button
-                variant="outlined"
-                size="small"
-                color="primary"
-                startIcon={runningAllSql ? <CircularProgress size={14} /> : <PlayArrowIcon />}
-                onClick={runAllBenchmarkSql}
-                disabled={
-                  runningAllSql ||
-                  !benchmarkWarehouseId ||
-                  benchmarks.filter((b) => b.expected_sql?.trim()).length === 0
-                }
-              >
-                {runningAllSql ? "Running..." : "Run All SQL"}
-              </Button>
-              <Button size="small" startIcon={<AddIcon />} onClick={addBenchmark}>
-                Add blank row
-              </Button>
-              <Box sx={{ flex: 1 }} />
-              <FormControl size="small" sx={{ minWidth: 200 }}>
-                <InputLabel>SQL Warehouse</InputLabel>
-                <Select
-                  value={benchmarkWarehouseId}
-                  label="SQL Warehouse"
-                  onChange={(e) => setBenchmarkWarehouseId(e.target.value)}
-                >
-                  {warehouses.map((w) => (
-                    <MenuItem key={w.id} value={w.id}>{w.name}</MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-              <FormControlLabel
-                control={
-                  <Switch
-                    size="small"
-                    checked={showBenchmarkSql}
-                    onChange={(e) => setShowBenchmarkSql(e.target.checked)}
-                  />
-                }
-                label={<Typography variant="caption">Show Expected SQL</Typography>}
-                sx={{ ml: 0 }}
-              />
-            </Stack>
-          )}
-          {sectionReadOnly && (
-            <Box sx={{ mb: 2, display: "flex", justifyContent: "flex-end" }}>
-              <FormControlLabel
-                control={
-                  <Switch
-                    size="small"
-                    checked={showBenchmarkSql}
-                    onChange={(e) => setShowBenchmarkSql(e.target.checked)}
-                  />
-                }
-                label={<Typography variant="caption">Show Expected SQL</Typography>}
-                sx={{ ml: 0 }}
-              />
-            </Box>
-          )}
-          {!sectionReadOnly && (
-            <Alert severity="warning" sx={{ mb: 2 }} variant="outlined">
-              LLM-drafted SQL is a starting point only. <strong>Verify every query</strong> runs
-              against your data and returns what the question asks before marking it BO-approved.
-            </Alert>
-          )}
-
-          {benchmarks.length > 0 && (
-            <Stack spacing={2}>
-              {benchmarks.map((b, i) => (
-                <Paper key={i} variant="outlined" sx={{ p: 2 }}>
-                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
-                    <Chip label={`#${i + 1}`} size="small" />
-                    <Select
-                      size="small"
-                      value={b.category || "Core"}
-                      onChange={(e) => updateBenchmark(i, "category", e.target.value)}
-                      disabled={sectionReadOnly}
-                      sx={{ minWidth: 120 }}
-                    >
-                      <MenuItem value="Core">Core</MenuItem>
-                      <MenuItem value="Edge Case">Edge Case</MenuItem>
-                    </Select>
-                    <Select
-                      size="small"
-                      value={b.difficulty || "Medium"}
-                      onChange={(e) => updateBenchmark(i, "difficulty", e.target.value)}
-                      disabled={sectionReadOnly}
-                      sx={{ minWidth: 110 }}
-                    >
-                      <MenuItem value="Easy">Easy</MenuItem>
-                      <MenuItem value="Medium">Medium</MenuItem>
-                      <MenuItem value="Hard">Hard</MenuItem>
-                    </Select>
-                    <Box sx={{ flex: 1 }} />
-                    <Tooltip
-                      title={
-                        !canToggleBoApproved
-                          ? "Only COE or BO group members can change BO Approved"
-                          : !b.question?.trim() || !b.expected_sql?.trim()
-                          ? "Question and SQL required before BO approval"
-                          : "BO approved"
-                      }
-                    >
-                      <span>
-                        <Stack direction="row" alignItems="center" spacing={0.5}>
-                          <Checkbox
-                            size="small"
-                            checked={!!b.bo_approved}
-                            onChange={(e) => {
-                              if (!engagementId || !canToggleBoApproved) return;
-                              const newVal = e.target.checked;
-                              // Optimistic update: flip the UI immediately so
-                              // the click feels instant. The PATCH below
-                              // persists; on failure we revert. Lives outside
-                              // the engagement optimistic lock — save_session
-                              // preserves bo_approved server-side, so a
-                              // follow-up analyst autosave won't overwrite.
-                              updateBenchmark(i, "bo_approved", newVal);
-                              api.setBenchmarkBoApproved(engagementId, i, newVal)
-                                .catch((err) => {
-                                  console.error("BO Approved update failed:", err);
-                                  updateBenchmark(i, "bo_approved", !newVal);
-                                });
-                            }}
-                            disabled={
-                              !canToggleBoApproved ||
-                              !b.question?.trim() ||
-                              !b.expected_sql?.trim()
-                            }
-                          />
-                          <Typography variant="caption">BO approved</Typography>
-                        </Stack>
-                      </span>
-                    </Tooltip>
-                    {!sectionReadOnly && (
-                      <IconButton size="small" onClick={() => removeBenchmark(i)}>
-                        <DeleteIcon fontSize="small" />
-                      </IconButton>
-                    )}
-                  </Stack>
-
-                  <TextField
-                    fullWidth multiline size="small"
-                    label="Question"
-                    value={b.question || ""}
-                    onChange={(e) => updateBenchmark(i, "question", e.target.value)}
-                    disabled={sectionReadOnly}
-                    sx={{ mb: 1.5 }}
-                  />
-
-                  {showBenchmarkSql && (
-                    <>
-                      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
-                        <Typography variant="caption" color="text.secondary">
-                          Expected SQL
-                        </Typography>
-                        {!sectionReadOnly && (
-                          <Tooltip title="Draft SQL + plain-English summary for this row with AI">
-                            <span>
-                              <IconButton
-                                size="small"
-                                onClick={() => draftSqlForRow(i)}
-                                disabled={draftingSqlIdx === i || !b.question?.trim()}
-                              >
-                                {draftingSqlIdx === i ? <CircularProgress size={14} /> : <AutoAwesomeIcon fontSize="small" />}
-                              </IconButton>
-                            </span>
-                          </Tooltip>
-                        )}
-                        <Tooltip title={
-                          !b.expected_sql?.trim()
-                            ? "Draft or write SQL first"
-                            : !benchmarkWarehouseId
-                              ? "Pick a SQL warehouse above"
-                              : `Run SQL on warehouse (LIMIT 50 for preview)`
-                        }>
-                          <span>
-                            <IconButton
-                              size="small"
-                              color="primary"
-                              onClick={() => runBenchmarkSql(i)}
-                              disabled={sectionReadOnly || runningSqlIdx === i || !b.expected_sql?.trim() || !benchmarkWarehouseId}
-                            >
-                              {runningSqlIdx === i ? <CircularProgress size={14} /> : <PlayArrowIcon fontSize="small" />}
-                            </IconButton>
-                          </span>
-                        </Tooltip>
-                        {b.expected_sql?.trim() && (
-                          <Chip label="SQL drafted" size="small" variant="outlined" sx={{ height: 20 }} />
-                        )}
-                        {(b as any).validation_status === "ok" && (
-                          <Tooltip title="SQL was validated against the warehouse on draft and ran successfully.">
-                            <Chip label="Validated" size="small" color="success" variant="outlined" sx={{ height: 20 }} />
-                          </Tooltip>
-                        )}
-                        {(b as any).validation_status === "retried_ok" && (
-                          <Tooltip title="First draft failed; auto-retry succeeded with corrected SQL.">
-                            <Chip label="Validated (retried)" size="small" color="success" variant="outlined" sx={{ height: 20 }} />
-                          </Tooltip>
-                        )}
-                        {(b as any).validation_status === "failed" && (
-                          <Tooltip title="SQL failed validation against the warehouse, even after one auto-retry. Edit and re-run manually.">
-                            <Chip label="Validation failed" size="small" color="error" variant="outlined" sx={{ height: 20 }} />
-                          </Tooltip>
-                        )}
-                        {(b as any).validation_status === "empty" && (
-                          <Tooltip title={(b as any).validation_warning || "Ran but returned 0 rows — likely a wrong column or filter. Verify before approving."}>
-                            <Chip label="Ran · 0 rows — check" size="small" color="warning" variant="outlined" sx={{ height: 20 }} />
-                          </Tooltip>
-                        )}
-                        {(b as any).validation_status === "skipped" && (
-                          <Tooltip title="No SQL warehouse was selected at draft time, so the SQL wasn't auto-validated. Pick a warehouse and click Run to validate.">
-                            <Chip label="Not validated" size="small" variant="outlined" sx={{ height: 20 }} />
-                          </Tooltip>
-                        )}
-                      </Stack>
-                      <ExpandableTextField
-                        value={b.expected_sql || ""}
-                        onChange={(v) => updateBenchmark(i, "expected_sql", v)}
-                        placeholder="SELECT ..."
-                        disabled={sectionReadOnly}
-                        minRows={2}
-                        monospace
-                        dialogTitle={`Expected SQL — Benchmark #${i + 1}`}
-                      />
-                    </>
-                  )}
-
-                  {/* Sample result — shown regardless of Show Expected SQL toggle,
-                      so BO can skim results without seeing the query. */}
-                  {(b as any).sample_result && (
-                    <Box sx={{ mt: 1 }}>
-                      {(b as any).sample_result.error ? (
-                        <Alert severity="error">
-                          <Typography variant="caption" sx={{ fontFamily: "monospace", whiteSpace: "pre-wrap" }}>
-                            {(b as any).sample_result.error}
-                          </Typography>
-                        </Alert>
-                      ) : (
-                        <Paper variant="outlined" sx={{ p: 1 }}>
-                          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.5 }}>
-                            Sample result — {(b as any).sample_result.row_count} row{(b as any).sample_result.row_count === 1 ? "" : "s"}
-                            {(b as any).sample_result.truncated && ` (truncated to LIMIT ${(b as any).sample_result.limit})`}
-                          </Typography>
-                          {(b as any).sample_result.rows.length === 0 ? (
-                            <Typography variant="caption" color="text.secondary">
-                              Query returned no rows.
-                            </Typography>
-                          ) : (
-                            <Box sx={{ overflowX: "auto", maxHeight: 260 }}>
-                              <Table size="small" stickyHeader>
-                                <TableHead>
-                                  <TableRow>
-                                    {(b as any).sample_result.columns.map((c: string) => (
-                                      <TableCell key={c} sx={{ fontWeight: 600, fontSize: 12 }}>{c}</TableCell>
-                                    ))}
-                                  </TableRow>
-                                </TableHead>
-                                <TableBody>
-                                  {(b as any).sample_result.rows.map((row: any[], ri: number) => (
-                                    <TableRow key={ri}>
-                                      {row.map((cell, ci) => (
-                                        <TableCell key={ci} sx={{ fontSize: 12, fontFamily: "monospace" }}>
-                                          {cell === null ? <em style={{ color: "#999" }}>NULL</em> : String(cell)}
-                                        </TableCell>
-                                      ))}
-                                    </TableRow>
-                                  ))}
-                                </TableBody>
-                              </Table>
-                            </Box>
-                          )}
-                        </Paper>
-                      )}
-                    </Box>
-                  )}
-                  {!showBenchmarkSql && b.expected_sql?.trim() && (
-                    <Box sx={{ mb: 1 }}>
-                      <Chip label="SQL drafted" size="small" variant="outlined" />
-                    </Box>
-                  )}
-
-                  <Box sx={{ mt: showBenchmarkSql ? 1.5 : 0 }}>
-                    <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
-                      <Typography variant="caption" color="text.secondary">
-                        Measurement Summary (plain English)
-                      </Typography>
-                      {!sectionReadOnly && (
-                        <Tooltip title="Regenerate summary from the current SQL (overwrites existing summary)">
-                          <span>
-                            <IconButton
-                              size="small"
-                              onClick={() => refreshSummaryForRow(i)}
-                              disabled={refreshingSummaryIdx === i || !b.expected_sql?.trim() || !b.question?.trim()}
-                            >
-                              {refreshingSummaryIdx === i ? <CircularProgress size={14} /> : <AutoAwesomeIcon fontSize="small" />}
-                            </IconButton>
-                          </span>
-                        </Tooltip>
-                      )}
-                    </Stack>
-                    <ExpandableTextField
-                      value={b.notes || ""}
-                      onChange={(v) => updateBenchmark(i, "notes", v)}
-                      placeholder="How we're measuring this, in plain English. Auto-filled when SQL is drafted."
-                      disabled={sectionReadOnly}
-                      minRows={2}
-                      dialogTitle={`Measurement Summary — Benchmark #${i + 1}`}
-                    />
-                  </Box>
-                </Paper>
-              ))}
-            </Stack>
-          )}
-          {benchmarks.length === 0 && (
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-              No benchmarks yet. Click "Draft Benchmarks from Sessions 1-4" to seed a starting set.
-            </Typography>
-          )}
-        </AccordionDetails>
-      </Accordion>
-
-      <Dialog open={draftReplaceOpen} onClose={() => setDraftReplaceOpen(false)}>
-        <DialogTitle>You already have benchmarks</DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            There are {benchmarks.length} existing benchmark{benchmarks.length === 1 ? "" : "s"} in this engagement.
-            Do you want to <strong>replace</strong> them with {draftCount} fresh LLM-drafted questions,
-            or <strong>append</strong> {draftCount} new ones to what's already there?
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setDraftReplaceOpen(false)}>Cancel</Button>
-          <Button onClick={() => runDraftBenchmarks("append")}>Append</Button>
-          <Button
-            onClick={() => runDraftBenchmarks("replace")}
-            variant="contained"
-            color="warning"
-          >
-            Replace
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      {/* COE Approval Controls */}
+      {/* COE-only approval controls */}
       {isCoeMember && !readOnly && (
         <>
           <Divider sx={{ my: 3 }} />
-          <Accordion id="section-4-coe-controls" defaultExpanded>
-            <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-              <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                <Typography variant="h6">COE Review Controls</Typography>
-                <Chip label="COE Only" size="small" color="primary" />
-              </Box>
-            </AccordionSummary>
-            <AccordionDetails>
-              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                Review the analyst's work above. Approve to unlock Sessions 5 & 6,
-                or request changes with specific feedback.
-              </Typography>
-
-              {/* Analyst gap responses summary -- read-only */}
-              {currentGaps.length > 0 && (
-                <Paper variant="outlined" sx={{ p: 2, mb: 2, bgcolor: "grey.50" }}>
-                  <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5 }}>
-                    <Typography variant="subtitle2">Analyst's Responses to Flagged Gaps</Typography>
-                    <Chip
-                      label={`${respondedCount} of ${currentGaps.length} addressed`}
-                      size="small"
-                      color={respondedCount === currentGaps.length ? "success" : "default"}
-                    />
-                  </Stack>
-                  <Stack spacing={1}>
-                    {currentGaps.map((g) => {
-                      const resp = ((commentary.gap_responses || {})[g.id] || "").trim();
-                      return (
-                        <Box key={g.id} sx={{ pl: 1, borderLeft: "3px solid", borderColor: severityColor(g.severity) === "default" ? "grey.400" : `${severityColor(g.severity)}.main` }}>
-                          <Stack direction="row" alignItems="center" spacing={1}>
-                            <Chip label={g.severity} size="small" color={severityColor(g.severity)} sx={{ height: 20 }} />
-                            <Typography variant="body2" sx={{ fontWeight: 600 }}>{g.title}</Typography>
-                          </Stack>
-                          <Typography
-                            variant="body2"
-                            color={resp ? "text.primary" : "text.secondary"}
-                            sx={{ mt: 0.5, fontStyle: resp ? "normal" : "italic", whiteSpace: "pre-wrap" }}
-                          >
-                            {resp || "No response from analyst yet"}
-                          </Typography>
-                        </Box>
-                      );
-                    })}
-                  </Stack>
-                </Paper>
-              )}
-
-              <TextField
-                multiline
-                minRows={3}
-                fullWidth
-                label="Review Notes / Feedback"
-                placeholder="Provide feedback or approval notes..."
-                value={approvalNotes}
-                onChange={(e) => setApprovalNotes(e.target.value)}
-                sx={{ mb: 2 }}
-              />
-              {!canApprove && (
-                <Alert severity="warning" sx={{ mb: 2 }}>
-                  Approval is blocked until at least 5 benchmark questions are BO-approved and have expected SQL. Currently {approvedBenchmarkCount} of 5 required.
-                </Alert>
-              )}
-              <Box sx={{ display: "flex", gap: 2 }}>
-                <Tooltip title={canApprove ? "" : "Requires >=5 BO-approved benchmarks"}>
-                  <span>
-                    <Button
-                      variant="contained"
-                      color="success"
-                      onClick={() => handleApproval("approved")}
-                      disabled={!canApprove}
-                    >
-                      Approve
-                    </Button>
-                  </span>
-                </Tooltip>
-                <Button
-                  variant="outlined"
-                  color="warning"
-                  onClick={() => handleApproval("changes_requested")}
-                >
-                  Request Changes
-                </Button>
-              </Box>
-            </AccordionDetails>
-          </Accordion>
+          <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+            <Typography variant="h6">COE Review Controls</Typography>
+            <Chip label="COE Only" size="small" color="primary" />
+          </Stack>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Review the analyst's work in Sessions 1-3. Approve to mark the engagement
+            Ready for Pilot, or request changes with specific feedback.
+          </Typography>
+          <TextField
+            multiline
+            minRows={3}
+            fullWidth
+            label="Review Notes / Feedback"
+            placeholder="Provide feedback or approval notes..."
+            value={approvalNotes}
+            onChange={(e) => setApprovalNotes(e.target.value)}
+            sx={{ mb: 2 }}
+          />
+          <Box sx={{ display: "flex", gap: 2 }}>
+            <Button
+              variant="contained"
+              color="success"
+              disabled={busy}
+              onClick={() => handleApproval("approved")}
+            >
+              Approve
+            </Button>
+            <Button
+              variant="outlined"
+              color="warning"
+              disabled={busy}
+              onClick={() => handleApproval("changes_requested")}
+            >
+              Request Changes
+            </Button>
+          </Box>
         </>
       )}
     </Box>

@@ -1,68 +1,5 @@
 const BASE = "/api";
 
-export interface SqlSnippet {
-  name: string;
-  sql: string;
-  table: string;
-  display_name?: string;
-  synonyms?: string[] | string;
-  description?: string;
-}
-
-export interface ExampleQuery {
-  question: string;
-  sql: string;
-  draft?: boolean;
-  usage_guidance?: string;
-}
-
-export interface UcJoin {
-  left_table: string;
-  left_columns: string[];
-  right_table: string;
-  right_columns: string[];
-  relationship_type: string;
-  source: string;
-}
-
-export interface BenchmarkSampleResult {
-  ran_at: string;
-  columns: string[];
-  rows: unknown[][];
-  row_count: number;
-  truncated: boolean;
-  limit: number;
-  error?: string;
-}
-
-export interface BenchmarkQuestion {
-  question: string;
-  category: "Core" | "Edge Case";
-  difficulty: "Easy" | "Medium" | "Hard";
-  expected_sql: string;
-  notes?: string;
-  bo_approved?: boolean;
-  sample_result?: BenchmarkSampleResult;
-}
-
-export interface BriefGap {
-  id: string;
-  title: string;
-  severity: "Low" | "Medium" | "High";
-  summary: string;
-  citations: string[];
-}
-
-export interface AnalystCommentary {
-  gap_responses?: Record<string, string>;
-  resolved_gaps?: Record<string, { title: string; severity: string; response: string }>;
-  /**
-   * Free-form text from a pre-structured-commentary engagement, preserved
-   * verbatim so it doesn't disappear at upgrade time. Read-only.
-   */
-  legacy_notes?: string;
-}
-
 async function json<T>(url: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${url}`, {
     headers: { "Content-Type": "application/json" },
@@ -85,75 +22,8 @@ async function json<T>(url: string, opts?: RequestInit): Promise<T> {
   return res.json();
 }
 
-// --- Async job runner client helper ---
-//
-// Backend runs long LLM tasks in background threads; we kick them off via
-// startJob() then poll until done. This avoids the ~60s gateway timeout that
-// long sync HTTP requests hit.
-
-export interface JobStatus<T> {
-  state: "pending" | "done" | "failed";
-  task_type: string;
-  result: T | null;
-  error: string | null;
-  age_seconds: number;
-}
-
-export async function pollJob<T>(
-  jobId: string,
-  opts?: {
-    intervalMs?: number;
-    timeoutMs?: number;
-    onProgress?: (ageSeconds: number) => void;
-    signal?: AbortSignal;
-  },
-): Promise<T> {
-  const interval = opts?.intervalMs ?? 2000;
-  const timeout = opts?.timeoutMs ?? 600000; // 10 min ceiling
-  const start = Date.now();
-
-  while (true) {
-    if (opts?.signal?.aborted) throw new Error("Cancelled");
-    if (Date.now() - start > timeout) throw new Error("Job timed out (client-side)");
-
-    const status = await json<JobStatus<T>>(`/jobs/${jobId}`);
-    opts?.onProgress?.(status.age_seconds);
-
-    if (status.state === "done") return status.result as T;
-    if (status.state === "failed") throw new Error(status.error || "Job failed");
-
-    await new Promise<void>((resolve) => setTimeout(resolve, interval));
-  }
-}
-
-/** One-shot helper: kick off a background task and resolve when it's done.
- *  Use for any LLM call that might exceed the gateway's ~60s sync timeout.
- */
-export async function runJob<T>(
-  task_type: string,
-  payload: Record<string, unknown>,
-  opts?: {
-    onProgress?: (ageSeconds: number) => void;
-    intervalMs?: number;
-    timeoutMs?: number;
-    signal?: AbortSignal;
-  },
-): Promise<T> {
-  const { job_id } = await json<{ job_id: string }>("/jobs/start", {
-    method: "POST",
-    body: JSON.stringify({ task_type, payload }),
-  });
-  return pollJob<T>(job_id, opts);
-}
-
 export const api = {
   getUser: () => json<{ email: string }>("/user"),
-
-  startJob: (task_type: string, payload: Record<string, unknown>) =>
-    json<{ job_id: string }>("/jobs/start", {
-      method: "POST",
-      body: JSON.stringify({ task_type, payload }),
-    }),
 
   listWarehouses: () =>
     json<{ id: string; name: string; state: string; size: string; type: string }[]>("/warehouses"),
@@ -167,12 +37,6 @@ export const api = {
       coe_group_name: string;
       bo_group_name: string;
     }>("/user/role"),
-
-  setBenchmarkBoApproved: (id: string, idx: number, value: boolean) =>
-    json<{ success: boolean; idx: number; value: boolean }>(
-      `/engagements/${id}/benchmarks/bo-approved`,
-      { method: "PATCH", body: JSON.stringify({ idx, value }) },
-    ),
 
   listEngagements: () => json<Record<string, string>[]>("/engagements"),
 
@@ -232,8 +96,11 @@ export const api = {
     );
   },
 
+  /** COE review action (S4). Server-enforced COE-group only. "approved" sets
+   *  the engagement to 'ready_for_pilot'; "changes_requested" returns it to
+   *  'in_progress'. Returns updated_at so the caller can refresh its lock token. */
   coeApprove: (id: string, data: { status: string; notes: string }) =>
-    json<{ success: boolean }>(`/engagements/${id}/coe-approve`, {
+    json<{ success: boolean; updated_at?: string }>(`/engagements/${id}/coe-approve`, {
       method: "PUT",
       body: JSON.stringify(data),
     }),
@@ -245,37 +112,6 @@ export const api = {
     json<{ success: boolean; status: string }>(`/engagements/${id}/request-review`, {
       method: "PUT",
     }),
-
-  /** Production sign-off (Session 7). COE-only, enforced server-side.
-   *  Returns updated_at so the caller can refresh its optimistic-lock token. */
-  prodApprove: (id: string, data: { status: string; notes: string }) =>
-    json<{ success: boolean; updated_at?: string; engagement_status?: string }>(
-      `/engagements/${id}/prod-approve`,
-      { method: "PUT", body: JSON.stringify(data) },
-    ),
-
-  /** Record Section 5 acknowledgments (reviewed AI / won't share early /
-   *  follow best practices). Lock-free; server stamps accepted_by + accepted_at
-   *  (only when all three are true). Returns the stored acknowledgments object. */
-  acknowledge: (
-    id: string,
-    items: { reviewed_ai: boolean; no_share: boolean; best_practices: boolean },
-  ) =>
-    json<{ success: boolean; acknowledgments: Record<string, any> }>(
-      `/engagements/${id}/acknowledge`,
-      { method: "POST", body: JSON.stringify(items) },
-    ),
-
-  /** Best-effort "who has access" to the pushed Genie space (Session 7).
-   *  available=false when no space is pushed or the permissions read fails;
-   *  the UI falls back to the space_url for managing sharing in Databricks. */
-  getSpaceAccess: (id: string) =>
-    json<{
-      available: boolean;
-      reason?: string;
-      space_url?: string;
-      access?: { principal: string; levels: string[] }[];
-    }>(`/engagements/${id}/space-access`),
 
   /** Direct URL for the BO pre-work template download. Use as an href so the
    *  browser handles the file download natively (no fetch + blob dance). */
@@ -327,26 +163,20 @@ export const api = {
     return body as { success: boolean; updated_at: string; applied: string[] };
   },
 
-  /** Export selected S1/S2 sections to a populated .xlsx and trigger a browser
-   *  download. Read-only on the server (no mutation, no lock). The exported
-   *  file matches the template shape and is re-uploadable via parsePrework. */
+  /** Export selected S1/S2 sections to a populated .xlsx or .csv and trigger a
+   *  browser download. Read-only on the server (no mutation, no lock). The
+   *  .xlsx matches the template shape and is re-uploadable via parsePrework;
+   *  the .csv is a flat export for Genie Code ingestion. */
   exportPrework: async (
     id: string,
     sections: string[],
     data: Record<string, Record<string, string>[]>,
-    benchmarks?: BenchmarkQuestion[],
+    format: "xlsx" | "csv" = "xlsx",
   ) => {
-    // Benchmarks (S4) are export-only and have a different shape; the backend
-    // reads them from data.benchmarks when "benchmarks" is in sections.
-    const body: { sections: string[]; data: Record<string, unknown> } = {
-      sections,
-      data: { ...data },
-    };
-    if (benchmarks) body.data.benchmarks = benchmarks;
     const res = await fetch(`${BASE}/engagements/${id}/export-prework`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ sections, data, format }),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({} as any));
@@ -356,132 +186,11 @@ export const api = {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "genie-discovery-export.xlsx";
+    a.download = `genie-discovery-export.${format}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-  },
-
-  draftBenchmarks: (
-    id: string,
-    count?: number,
-    onProgress?: (s: number) => void,
-  ) =>
-    runJob<{ benchmarks: BenchmarkQuestion[] }>(
-      "draft_benchmarks",
-      { engagement_id: id, count: count ?? 12 },
-      { onProgress },
-    ),
-
-  draftBenchmarkSql: (
-    id: string,
-    question: string,
-    warehouse_id?: string,
-    validate?: boolean,
-    onProgress?: (s: number) => void,
-  ) =>
-    runJob<{
-      sql: string;
-      explanation?: string;
-      validation?: {
-        ran: boolean;
-        error: string | null;
-        retried: boolean;
-        sample_result: BenchmarkSampleResult | null;
-      } | null;
-    }>(
-      "draft_benchmark_sql",
-      {
-        engagement_id: id,
-        question,
-        warehouse_id: warehouse_id || "",
-        validate: !!validate,
-      },
-      { onProgress },
-    ),
-
-  draftBenchmarkSummary: (id: string, question: string, sql: string) =>
-    json<{ explanation: string }>(`/engagements/${id}/draft-benchmark-summary`, {
-      method: "POST",
-      body: JSON.stringify({ question, sql }),
-    }),
-
-  runBenchmarkSql: (id: string, sql: string, warehouse_id: string) =>
-    json<{
-      columns?: string[];
-      rows?: unknown[][];
-      row_count?: number;
-      truncated?: boolean;
-      limit?: number;
-      error?: string;
-    }>(`/engagements/${id}/run-benchmark-sql`, {
-      method: "POST",
-      body: JSON.stringify({ sql, warehouse_id }),
-    }),
-
-  generatePlan: (
-    id: string,
-    warehouse_id?: string,
-    onProgress?: (s: number) => void,
-  ) =>
-    runJob<{
-      general_instructions: string;
-      sample_questions: string[];
-      sql_filters: SqlSnippet[];
-      sql_dimensions: SqlSnippet[];
-      sql_measures: SqlSnippet[];
-      example_queries: ExampleQuery[];
-      joins: UcJoin[];
-      narrative: string;
-      warnings?: string[];
-    }>(
-      "generate_plan",
-      { engagement_id: id, warehouse_id: warehouse_id || "" },
-      { onProgress },
-    ),
-
-  draftMetricViewYaml: (
-    id: string,
-    warehouse_id?: string,
-    onProgress?: (s: number) => void,
-  ) =>
-    runJob<{ yaml: string; source_table: string; suggested_name: string; warnings?: string[] }>(
-      "draft_mv_yaml",
-      { engagement_id: id, warehouse_id: warehouse_id || "" },
-      { onProgress },
-    ),
-
-  getMvPromptPreview: (id: string) =>
-    json<{ prompt: string }>(`/engagements/${id}/mv-prompt-preview`),
-
-  createMetricView: async (
-    id: string,
-    body: {
-      catalog: string;
-      schema: string;
-      name: string;
-      yaml: string;
-      warehouse_id: string;
-      overwrite?: boolean;
-    },
-  ): Promise<
-    | { success: true; fqn: string; updated_at?: string }
-    | { success: false; exists: true; fqn: string; owner: string | null }
-  > => {
-    const res = await fetch(`${BASE}/engagements/${id}/create-metric-view`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const payload = await res.json().catch(() => ({}));
-    if (res.status === 409 && payload.exists) {
-      return { success: false, exists: true, fqn: payload.fqn, owner: payload.owner ?? null };
-    }
-    if (!res.ok) {
-      throw new Error(payload.error || `${res.status} ${res.statusText}`);
-    }
-    return { success: true, fqn: payload.fqn, updated_at: payload.updated_at };
   },
 
   listCatalogs: () => json<string[]>("/uc/catalogs"),
@@ -533,54 +242,4 @@ export const api = {
       dimensions: { name: string; display_name: string; synonyms: string[]; comment: string; data_type: string }[];
       measures:   { name: string; display_name: string; synonyms: string[]; comment: string; data_type: string }[];
     }>(`/uc/metric-view-details?fqn=${encodeURIComponent(fqn)}&warehouse_id=${encodeURIComponent(warehouseId)}`),
-
-  /** Push the engagement plan to a Genie Space. Honors If-Match optimistic
-   *  lock so a concurrent edit can't race in stale data; 409 surfaces a
-   *  stale-error the caller can show as "refresh before pushing". */
-  pushToGenie: async (
-    id: string,
-    body: {
-      mode: "existing" | "new";
-      space_id?: string;
-      warehouse_id: string;
-      new_title?: string;
-      new_description?: string;
-      new_parent_path?: string;
-      general_instructions: string;
-      sample_questions: string[];
-      sql_filters?: SqlSnippet[];
-      sql_dimensions?: SqlSnippet[];
-      sql_measures?: SqlSnippet[];
-      example_queries?: ExampleQuery[];
-      joins?: UcJoin[];
-    },
-    ifMatch?: string,
-  ) => {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (ifMatch) headers["If-Match"] = ifMatch;
-    const res = await fetch(`${BASE}/engagements/${id}/push-to-genie`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
-    const respBody = await res.json().catch(() => ({}));
-    if (res.status === 409) {
-      const err: any = new Error(
-        respBody.message || "Engagement was updated by another user. Refresh before pushing.",
-      );
-      err.stale = true;
-      err.current_updated_at = respBody.current_updated_at;
-      throw err;
-    }
-    if (!res.ok) throw new Error(respBody.error || `${res.status} ${res.statusText}`);
-    return respBody as {
-      mode: string;
-      space_id: string;
-      space_url: string;
-      created?: boolean;
-      updated?: boolean;
-      warnings?: string[];
-      updated_at?: string;
-    };
-  },
 };

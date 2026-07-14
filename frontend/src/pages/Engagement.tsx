@@ -21,21 +21,15 @@ import Session1Form from "../sessions/Session1Form";
 import Session2Form from "../sessions/Session2Form";
 import Session3Form from "../sessions/Session3Form";
 import Session4Form from "../sessions/Session4Form";
-import Session5Form from "../sessions/Session5Form";
-import Session6Form from "../sessions/Session6Form";
-import Session7Form from "../sessions/Session7Form";
 import PreworkUploadModal from "../components/PreworkUploadModal";
 import PreworkExportModal from "../components/PreworkExportModal";
 import SectionToc from "../components/SectionToc";
 
 const SESSION_LABELS = [
   "1: Business Context",
-  "2: Questions & Vocabulary",
+  "2: Key Terms & Questions",
   "3: Technical Design",
-  "4: Design Review & Approval",
-  "5: Configure Space",
-  "6: Prototype Review",
-  "7: Production Review",
+  "4: COE Review",
 ];
 
 const AUTOSAVE_DELAY_MS = 2000;
@@ -74,9 +68,9 @@ export default function Engagement({ readOnly = false }: Props) {
   const [metaError, setMetaError] = useState<string>("");
   const [isCoeMember, setIsCoeMember] = useState(false);
   const [isBoMember, setIsBoMember] = useState(false);
-  // BO-only users (BO group, NOT in COE) get the restricted view: hide
-  // S3/S5/S6 tabs, hide pencil edit, hide AI buttons in S4, etc. COE-and-BO
-  // gets full access (COE wins).
+  // BO-only users (BO group, NOT in COE) get the restricted view: they edit
+  // S1/S2, see the S4 COE review read-only, and don't see S3 (Technical
+  // Design) or the pencil edit. COE-and-BO gets full access (COE wins).
   const isBoOnly = isBoMember && !isCoeMember;
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [preworkOpen, setPreworkOpen] = useState(false);
@@ -111,9 +105,6 @@ export default function Engagement({ readOnly = false }: Props) {
         2: s["2"] || {},
         3: s["3"] || {},
         4: s["4"] || {},
-        5: s["5"] || {},
-        6: s["6"] || {},
-        7: s["7"] || {},
       });
       setMeta({
         genie_space_name: String(eng.genie_space_name || ""),
@@ -344,28 +335,21 @@ export default function Engagement({ readOnly = false }: Props) {
     readOnly,
   });
 
-  // COE approval gating
+  // COE approval status (S4 is the single terminal gate).
   const coeApprovalStatus = sessionDrafts[4]?.coe_approval_status || "";
-  const isApproved = coeApprovalStatus === "approved";
 
-  // Top-of-page status chip. Reflects the engagement's real position in the
-  // COE flow. Active review states take precedence over the raw lifecycle, so a
-  // stale "complete" can never mask "Changes Requested"/"Ready for COE Review".
-  // Two distinct approval milestones: Section 4 COE approval -> "COE Approved"
-  // (navy), and the Section 7 production sign-off -> "Production Approved"
-  // (green, status === "complete"). S7 takes precedence over S4 once signed off.
+  // Top-of-page status chip. Active review states take precedence over the raw
+  // lifecycle. COE approval is the terminal milestone: it sets the engagement to
+  // 'ready_for_pilot' (piloting happens outside the app).
   const topStatusChip = (): { label: string; color: "success" | "info" | "warning" | "error" | "primary" | "default" } => {
     if (coeApprovalStatus === "changes_requested") return { label: "Changes Requested", color: "error" };
     if (coeApprovalStatus === "ready_for_review") return { label: "Ready for COE Review", color: "info" };
-    if (data.status === "complete") return { label: "Production Approved", color: "success" };
-    if (coeApprovalStatus === "approved") return { label: "COE Approved", color: "primary" };
+    if (data.status === "ready_for_pilot" || coeApprovalStatus === "approved") return { label: "Ready for Pilot", color: "success" };
+    if (data.status === "complete") return { label: "Ready for Pilot", color: "success" };
     if (data.status === "in_progress") return { label: "In Progress", color: "warning" };
     return { label: String(data.status || "draft").replace("_", " "), color: "default" };
   };
   const topStatus = topStatusChip();
-  // Section 5 acknowledgments must be accepted before Prototype Review (S6) and
-  // Production Review (S7) unlock. accepted_at is set only when all boxes checked.
-  const ackDone = !!sessionDrafts[5]?.acknowledgments?.accepted_at;
 
   const renderSaveIndicator = () => {
     if (readOnly) return null;
@@ -490,7 +474,6 @@ export default function Engagement({ readOnly = false }: Props) {
             question_bank: (sessionDrafts[2]?.question_bank as Record<string, string>[]) || [],
             vocabulary_metrics: (sessionDrafts[2]?.vocabulary_metrics as Record<string, string>[]) || [],
           }}
-          benchmarks={(sessionDrafts[4]?.benchmark_questions as any[]) || []}
           onClose={() => setPreworkExportOpen(false)}
         />
       )}
@@ -527,10 +510,8 @@ export default function Engagement({ readOnly = false }: Props) {
         <SectionToc
           currentSession={tab}
           onSessionChange={(idx) => setTab(idx)}
-          visibleSessions={
-            isBoOnly ? [0, 1, 3] : [0, 1, 2, 3, 4, 5, 6]
-          }
-          lockedSessions={!isApproved ? [4, 5, 6] : (!ackDone ? [5, 6] : [])}
+          visibleSessions={isBoOnly ? [0, 1, 3] : [0, 1, 2, 3]}
+          lockedSessions={[]}
         />
 
         <Box sx={{ flex: 1, minWidth: 0 }}>
@@ -538,35 +519,10 @@ export default function Engagement({ readOnly = false }: Props) {
           <Paper sx={{ mb: 2 }}>
             <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="fullWidth">
               {SESSION_LABELS.map((label, i) => {
-                // BO users only see S1, S2, S4. S3, S5, S6 are hidden entirely
-                // (not just locked) so they don't see technical-design / configure-
-                // space / prototype-review surfaces.
-                if (isBoOnly && (i === 2 || i === 4 || i === 5 || i === 6)) return null;
-                // S5 unlocks on COE approval; S6/S7 additionally require the
-                // Section 5 acknowledgments to be accepted.
-                const needsApproval = (i === 4 || i === 5 || i === 6) && !isApproved;
-                const needsAck = (i === 5 || i === 6) && isApproved && !ackDone;
-                const locked = needsApproval || needsAck;
-                const lockReason = needsApproval
-                  ? "Requires COE approval"
-                  : "Complete the acknowledgments in Configure Space";
-                return (
-                  <Tab
-                    key={i}
-                    value={i}
-                    label={
-                      locked ? (
-                        <Tooltip title={lockReason}>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, opacity: 0.5 }}>
-                            <LockIcon sx={{ fontSize: 14 }} />
-                            {label}
-                          </Box>
-                        </Tooltip>
-                      ) : label
-                    }
-                    disabled={locked}
-                  />
-                );
+                // BO users edit S1/S2 and see the S4 COE review; S3 (Technical
+                // Design, index 2) is hidden from them entirely.
+                if (isBoOnly && i === 2) return null;
+                return <Tab key={i} value={i} label={label} />;
               })}
             </Tabs>
           </Paper>
@@ -580,13 +536,8 @@ export default function Engagement({ readOnly = false }: Props) {
             {...sessionProps(3)}
             session1Data={sessionDrafts[1]}
             session2Data={sessionDrafts[2]}
-            session4Data={sessionDrafts[4]}
-            onChangeSession4={(section, value) => updateDraft(4, section, value)}
-            onChangeSession5={(section, value) => updateDraft(5, section, value)}
-            warehouseId={sessionDrafts[5]?.plan_warehouse_id || ""}
             isBoOnly={isBoOnly}
             engagementId={id}
-            onMetricViewCreated={(ts) => { updatedAtRef.current = ts; }}
           />
         )}
         {tab === 3 && (
@@ -598,37 +549,16 @@ export default function Engagement({ readOnly = false }: Props) {
             engagementId={id}
             isCoeMember={isCoeMember}
             isBoOnly={isBoOnly}
-          />
-        )}
-        {tab === 4 && (
-          <Session5Form
-            {...sessionProps(5)}
-            session3Data={sessionDrafts[3]}
-            session4Data={sessionDrafts[4]}
-            engagementId={id}
-            onPushed={(ts) => { updatedAtRef.current = ts; }}
-            getUpdatedAt={() => updatedAtRef.current}
-          />
-        )}
-        {tab === 5 && <Session6Form {...sessionProps(6)} />}
-        {tab === 6 && (
-          <Session7Form
-            {...sessionProps(7)}
-            engagementId={id}
-            isCoeMember={isCoeMember}
-            session5Data={sessionDrafts[5]}
-            onApproved={(ts, engStatus) => {
-              updatedAtRef.current = ts;
-              if (engStatus) setData((prev: any) => (prev ? { ...prev, status: engStatus } : prev));
-            }}
+            onReload={load}
           />
         )}
       </Box>
 
-          {/* Save Button — BOs only see it on S1+S2 (the only sections they can write).
-              On S4, BO interactions go through the dedicated BO-Approved PATCH from
-              inside Session4Form, so no full-section save is needed. */}
-          {!readOnly && !(isBoOnly && tab === 3) && (
+          {/* Save Button — shown on S1–S3 (the editable sessions). S4 is the COE
+              review gate: its actions go through the dedicated coe-approve /
+              request-review endpoints inside Session4Form, so no full-section
+              save is offered there. */}
+          {!readOnly && tab !== 3 && (
             <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 2, mb: 4 }}>
               <Button
                 variant="contained"
