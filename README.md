@@ -245,31 +245,37 @@ Replace `<you>` with your workspace username and `<profile>` with your Databrick
 # 1. Create the workspace folder
 databricks workspace mkdirs /Workspace/Users/<you>/genie-discovery-app --profile <profile>
 
-# 2. Upload backend + config
-databricks workspace import /Workspace/Users/<you>/genie-discovery-app/app.py \
-  --file app.py --format AUTO --overwrite --profile <profile>
-databricks workspace import /Workspace/Users/<you>/genie-discovery-app/app.yaml \
-  --file app.yaml --format AUTO --overwrite --profile <profile>
-databricks workspace import /Workspace/Users/<you>/genie-discovery-app/requirements.txt \
-  --file requirements.txt --format AUTO --overwrite --profile <profile>
+# 2. Upload everything, including the frontend build.
+#    --include static is REQUIRED: static/ is gitignored, and `sync` respects
+#    .gitignore, so without this flag the compiled frontend is silently skipped
+#    and the app keeps serving the previously deployed bundle.
+databricks sync --include static . \
+  /Workspace/Users/<you>/genie-discovery-app --profile <profile>
 
-# 3. Upload frontend bundle
-databricks workspace import /Workspace/Users/<you>/genie-discovery-app/static/index.html \
-  --file static/index.html --format AUTO --overwrite --profile <profile>
-# Replace <bundle-hash> with the actual filename from static/assets/
-databricks workspace import /Workspace/Users/<you>/genie-discovery-app/static/assets/index-<bundle-hash>.js \
-  --file static/assets/index-<bundle-hash>.js --format AUTO --overwrite --profile <profile>
-
-# 4. Create the app (first time only)
+# 3. Create the app (first time only)
 databricks apps create genie-discovery --profile <profile>
 
-# 5. Deploy
+# 4. Deploy
 databricks apps deploy genie-discovery \
   --source-code-path /Workspace/Users/<you>/genie-discovery-app \
   --profile <profile>
 ```
 
-> **Do not use `databricks workspace import-dir`.** It sweeps up `node_modules` and `.git`, causing deploy timeouts. Upload files individually as shown above.
+> **`--include static` is the step everyone misses.** Because `static/` is gitignored, a plain
+> `databricks sync` uploads the backend and skips the frontend without any error — the app comes
+> back up still serving the old UI. This is the single most common cause of "I redeployed but
+> nothing changed."
+
+> **Do not use `databricks workspace import-dir`.** It sweeps up `node_modules` and `.git`,
+> causing deploy timeouts, and it overwrites the workspace `app.yaml` with the placeholder
+> version from this repo — wiping your real warehouse ID, catalog, and schema.
+
+> `databricks apps deploy` reads the **workspace** folder, not your local disk. Step 2 is what
+> moves your build; step 4 only promotes what is already in the workspace.
+
+**Redeploying later, or troubleshooting a redeploy that appears to do nothing?** See
+[DEPLOY.md](DEPLOY.md) — it covers the content-hashed bundle filenames, stale-bundle cleanup, and
+the exact commands to verify a deploy actually landed.
 
 ### Step 5 — First-run sanity check
 
